@@ -223,6 +223,25 @@ impl AgentPolicy {
         Ok(())
     }
 
+    /// Inject a verified policy fragment module into the engine so its
+    /// contents become queryable at `data.agent_fragments.<feed>`, where the
+    /// `<feed>` sub-package is declared by the fragment module itself
+    /// (`package agent_fragments.<feed>`).
+    ///
+    /// SECURITY: the caller MUST have already cryptographically verified the
+    /// fragment (COSE_Sign1 signature + DID:web issuer resolution) BEFORE
+    /// calling this. This method performs the *trusted injection* step only.
+    /// The generated `fragment_containers` rule additionally gates each
+    /// fragment by issuer + feed + minimum_svn (defence in depth), but that
+    /// authorization gate is only meaningful once the signature has been
+    /// verified here first. `name` is an opaque, unique source label for the
+    /// module (e.g. the feed name); it does not affect the Rego namespace.
+    pub fn add_fragment(&mut self, name: &str, module_rego: &str) -> Result<()> {
+        self.engine
+            .add_policy(name.to_string(), module_rego.to_string())?;
+        Ok(())
+    }
+
     async fn log_eval_input(&mut self, ep: &str, input: &str) {
         if let Some(log_file) = &mut self.log_file {
             match ep {
@@ -490,5 +509,115 @@ mod tests {
                 )
             }
         }
+    }
+}
+
+
+#[cfg(test)]
+mod fragment_tests {
+    use super::*;
+
+    // Minimal `agent_policy` policy carrying the fragment composition rules
+    // emitted by genpolicy: base containers + an SVN/issuer/feed-gated
+    // `fragment_containers` comprehension composed into `all_policy_containers`.
+    const BASE: &str = r#"
+package agent_policy
+
+import future.keywords.in
+
+policy_data := {
+    "containers": [
+        {"OCI": {"Annotations": {"name": "base-a"}}},
+        {"OCI": {"Annotations": {"name": "base-b"}}}
+    ],
+    "fragments": [
+        {"issuer": "did:web:contoso.example", "feed": "infra", "minimum_svn": 1}
+    ]
+}
+
+fragment_containers := [c |
+    some spec in policy_data.fragments
+    mod := data.agent_fragments[spec.feed]
+    mod.issuer == spec.issuer
+    to_number(mod.svn) >= spec.minimum_svn
+    some c in mod.containers
+]
+
+all_policy_containers := array.concat(policy_data.containers, fragment_containers)
+"#;
+
+    // A signed infra fragment (svn 2 >= minimum_svn 1) => accepted.
+    const FRAG_GOOD: &str = r#"
+package agent_fragments.infra
+issuer := "did:web:contoso.example"
+svn := "2"
+containers := [{"OCI": {"Annotations": {"name": "infra-sidecar"}}}]
+"#;
+
+    // An under-versioned fragment (svn 0 < minimum_svn 1) => rejected by SVN gate.
+    const FRAG_BAD: &str = r#"
+package agent_fragments.infra
+issuer := "did:web:contoso.example"
+svn := "0"
+containers := [{"OCI": {"Annotations": {"name": "infra-sidecar"}}}]
+"#;
+
+    // A fragment whose self-declared issuer does not match the policy's
+    // accepted issuer => rejected by the issuer gate (models a fragment
+    // signed by an untrusted party).
+    const FRAG_WRONG_ISSUER: &str = r#"
+package agent_fragments.infra
+issuer := "did:web:evil.example"
+svn := "5"
+containers := [{"OCI": {"Annotations": {"name": "infra-sidecar"}}}]
+"#;
+
+    fn make(base: &str) -> AgentPolicy {
+        let mut ap = AgentPolicy::new();
+        ap.engine
+            .add_policy("agent_policy".to_string(), base.to_string())
+            .unwrap();
+        ap
+    }
+
+    fn composed_count(ap: &mut AgentPolicy) -> i64 {
+        ap.engine.set_input_json("{}").unwrap();
+        let r = ap
+            .engine
+            .eval_query(
+                "count(data.agent_policy.all_policy_containers)".to_string(),
+                false,
+            )
+            .unwrap();
+        let v = &r.result[0].expressions[0].value;
+        serde_json::to_value(v).unwrap().as_i64().unwrap()
+    }
+
+    #[test]
+    fn no_fragment_is_noop() {
+        // No fragment injected => data.agent_fragments undefined => base only.
+        let mut ap = make(BASE);
+        assert_eq!(composed_count(&mut ap), 2);
+    }
+
+    #[test]
+    fn good_fragment_composes_in() {
+        let mut ap = make(BASE);
+        ap.add_fragment("infra", FRAG_GOOD).unwrap();
+        assert_eq!(composed_count(&mut ap), 3);
+    }
+
+    #[test]
+    fn under_versioned_fragment_rejected() {
+        let mut ap = make(BASE);
+        ap.add_fragment("infra", FRAG_BAD).unwrap();
+        assert_eq!(composed_count(&mut ap), 2);
+    }
+
+    #[test]
+    fn wrong_issuer_fragment_rejected() {
+        let mut ap = make(BASE);
+        ap.add_fragment("infra", FRAG_WRONG_ISSUER).unwrap();
+        assert_eq!(composed_count(&mut ap), 2);
     }
 }
