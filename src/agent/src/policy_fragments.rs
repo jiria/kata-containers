@@ -177,4 +177,93 @@ mod tests {
         let remote: Reference = "contoso.azurecr.io/frag/infra:1".parse().unwrap();
         assert!(!is_plain_http_registry(&remote));
     }
+
+    // ---------------------------------------------------------------------
+    // Live wire-path tests against a local dev registry (`localhost:5001`).
+    //
+    // These exercise the *real* `fetch_fragment` OCI pull followed by the
+    // real `verify_fragment` crypto/format check on the pulled bytes — the
+    // exact code the guest runs, minus the VM boundary (on the host,
+    // `localhost:5001` genuinely reaches the registry so the plain-HTTP dev
+    // path is taken with no hacks).
+    //
+    // They are `#[ignore]`d because they need a registry pre-loaded by
+    // `genpolicy-fragmentgen` with these tags:
+    //   frag/infra:1        GOOD   (svn 2, issuer == DID_GOOD)
+    //   frag/infra:badsvn   svn 0, issuer == DID_GOOD
+    //   frag/infra:wrongiss svn 2, issuer != DID_GOOD (different chain)
+    //
+    // Run with:
+    //   cargo test -p kata-agent --features agent-policy --release \
+    //     policy_fragments::tests::wire_ -- --ignored --nocapture
+    // ---------------------------------------------------------------------
+    use kata_agent_policy::fragment_verify::{verify_fragment, FragmentPolicy};
+
+    const DID_GOOD: &str =
+        "did:x509:0:sha256:JPwQMhqN3j-KAO6S0Ba8zBnK172iBSKZZKi5B8Qo_6k::CN:contoso-fragment-signer";
+
+    #[tokio::test]
+    #[ignore]
+    async fn wire_good_fetch_verify_ok() {
+        let feed = "localhost:5001/frag/infra:1";
+        let cose = fetch_fragment(feed).await.expect("fetch GOOD fragment");
+        let vf = verify_fragment(
+            &cose,
+            &FragmentPolicy {
+                issuer: DID_GOOD.to_string(),
+                feed: feed.to_string(),
+                minimum_svn: 1,
+            },
+        )
+        .expect("GOOD fragment must verify");
+        assert_eq!(vf.feed, feed);
+        assert_eq!(vf.issuer, DID_GOOD);
+        assert_eq!(vf.svn, 2);
+        assert!(
+            vf.namespace.starts_with("agent_fragments"),
+            "unexpected namespace: {}",
+            vf.namespace
+        );
+        assert!(vf.rego.contains("svn := 2"));
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn wire_bad_svn_rejected() {
+        let feed = "localhost:5001/frag/infra:badsvn";
+        let cose = fetch_fragment(feed).await.expect("fetch badsvn fragment");
+        let err = verify_fragment(
+            &cose,
+            &FragmentPolicy {
+                issuer: DID_GOOD.to_string(),
+                feed: feed.to_string(),
+                minimum_svn: 1,
+            },
+        )
+        .expect_err("svn 0 < minimum_svn 1 must be rejected");
+        let msg = format!("{err:#}").to_lowercase();
+        assert!(msg.contains("svn"), "expected an svn error, got: {}", msg);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn wire_wrong_issuer_rejected() {
+        let feed = "localhost:5001/frag/infra:wrongiss";
+        let cose = fetch_fragment(feed).await.expect("fetch wrongiss fragment");
+        let err = verify_fragment(
+            &cose,
+            &FragmentPolicy {
+                issuer: DID_GOOD.to_string(),
+                feed: feed.to_string(),
+                minimum_svn: 1,
+            },
+        )
+        .expect_err("issuer mismatch must be rejected");
+        let msg = format!("{err:#}").to_lowercase();
+        assert!(
+            msg.contains("issuer") || msg.contains("did"),
+            "expected an issuer error, got: {}",
+            msg
+        );
+    }
 }
