@@ -86,7 +86,7 @@ CreateContainerRequest := {"ops": ops, "allowed": true} if {
     ops_builder1 := concat_op_if_not_null(ops_builder, add_sandbox_name_to_state)
 
     # Check if any element from the policy_data.containers array allows the input request.
-    some idx, p_container in policy_data.containers
+    some idx, p_container in all_policy_containers
     print("======== CreateContainerRequest: trying next policy container")
 
     p_pidns := p_container.sandbox_pidns
@@ -1641,7 +1641,7 @@ allow_interactive_exec(p_container, i_process) if {
 
 get_state_container(container_id):= p_container if {
     idx := get_state_val(container_id)
-    p_container := policy_data.containers[idx]
+    p_container := all_policy_containers[idx]
 }
 
 ExecProcessRequest if {
@@ -1793,3 +1793,18 @@ RemoveContainerRequest:= {"ops": ops, "allowed": true} if {
 
     print("RemoveContainerRequest: true")
 }
+
+# ---- Policy fragment composition (issuer + feed + minimum SVN gate) ----
+# Fragments are separate signed modules loaded by the host into
+# data.agent_fragments after COSE/DID verification. Empty policy_data.fragments
+# (or an unloaded/under-versioned fragment) yields no extra containers => no
+# behaviour change vs. the monolithic policy.
+fragment_containers := [c |
+    some spec in policy_data.fragments
+    mod := data.agent_fragments[spec.feed]
+    mod.issuer == spec.issuer
+    to_number(mod.svn) >= spec.minimum_svn
+    some c in mod.containers
+]
+
+all_policy_containers := array.concat(policy_data.containers, fragment_containers)

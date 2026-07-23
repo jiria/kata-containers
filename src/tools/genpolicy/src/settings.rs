@@ -28,6 +28,11 @@ pub struct Settings {
     pub common: policy::CommonData,
     pub mount_destinations: Vec<String>,
     pub sandbox: policy::SandboxData,
+
+    /// Trusted policy fragments (issuer/feed/minimum_svn) composed into the
+    /// generated policy. Optional for backward compatibility.
+    #[serde(default)]
+    pub fragments: Vec<policy::FragmentSpec>,
 }
 
 /// Volume settings loaded from genpolicy-settings.json.

@@ -47,11 +47,23 @@ pub struct AgentPolicy {
     pub config: utils::Config,
 }
 
+/// A trusted policy fragment reference: composed fragments are gated by
+/// issuer, feed and a minimum acceptable security version number (SVN).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct FragmentSpec {
+    pub issuer: String,
+    pub feed: String,
+    pub minimum_svn: i64,
+}
+
 /// Representation of the policy_data field from the output policy text.
 #[derive(Debug, Serialize)]
 pub struct PolicyData {
     /// Policy properties for each container allowed to be executed in a pod.
     pub containers: Vec<ContainerPolicy>,
+
+    /// Trusted fragments composed into this policy's allowed container set.
+    pub fragments: Vec<FragmentSpec>,
 
     /// Settings read from genpolicy-settings.json.
     pub common: CommonData,
@@ -647,6 +659,7 @@ impl AgentPolicy {
 
         let policy_data = policy::PolicyData {
             containers: policy_containers,
+            fragments: self.config.settings.fragments.clone(),
             request_defaults: self.config.settings.request_defaults.clone(),
             common: self.config.settings.common.clone(),
             sandbox: self.config.settings.sandbox.clone(),
