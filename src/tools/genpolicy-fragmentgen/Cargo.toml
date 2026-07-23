@@ -1,0 +1,25 @@
+[package]
+name = "genpolicy-fragmentgen"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Offline developer tool that signs a Rego policy fragment into the COSE_Sign1
+# envelope format the kata guest verifies, and (optionally) pushes it as an OCI
+# artifact. The security-critical envelope format and verifier are shared with
+# the `kata-agent-policy` crate so producer and consumer cannot drift.
+
+[dependencies]
+anyhow.workspace = true
+clap = { version = "4.5", features = ["derive"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+kata-agent-policy = { workspace = true, features = ["fragment-gen"] }
+
+p384 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
+x509-cert = { version = "0.2", features = ["pem"] }
+
+oci-client = { version = "0.17.0", default-features = false, features = [
+    "rustls-tls",
+] }

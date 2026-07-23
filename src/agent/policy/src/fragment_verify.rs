@@ -32,9 +32,9 @@ use x509_cert::Certificate;
 /// COSE algorithm identifier for ECDSA w/ SHA-384 (P-384).
 const ES384: iana::Algorithm = iana::Algorithm::ES384;
 /// Expected COSE content type for the raw-Rego payload.
-const CTY_REGO: &str = "application/unknown+rego";
+pub(crate) const CTY_REGO: &str = "application/unknown+rego";
 /// COSE protected-header label carrying the DER certificate chain.
-const X5CHAIN_LABEL: i64 = 33;
+pub(crate) const X5CHAIN_LABEL: i64 = 33;
 /// OID for X.520 Common Name (2.5.4.3).
 const OID_COMMON_NAME: &str = "2.5.4.3";
 
@@ -263,7 +263,7 @@ fn recompute_did_x509(root: &Certificate, leaf: &Certificate) -> Result<String> 
 }
 
 /// Extract the first Common Name (OID 2.5.4.3) from a certificate subject.
-fn subject_common_name(cert: &Certificate) -> Result<String> {
+pub(crate) fn subject_common_name(cert: &Certificate) -> Result<String> {
     let cn_oid = const_oid::ObjectIdentifier::new(OID_COMMON_NAME)
         .map_err(|e| anyhow!("bad CN OID constant: {e}"))?;
     for rdn in cert.tbs_certificate.subject.0.iter() {
