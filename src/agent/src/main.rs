@@ -85,6 +85,8 @@ mod tracer;
 
 #[cfg(feature = "agent-policy")]
 mod policy;
+#[cfg(feature = "agent-policy")]
+mod policy_fragments;
 
 cfg_if! {
     if #[cfg(target_arch = "s390x")] {
@@ -436,6 +438,21 @@ async fn start_sandbox(
                 .await
                 .context("Failed to set policy from initdata")?;
         }
+    }
+
+    // Runtime-pull, cryptographically verify, and inject any signed policy
+    // fragments the (now-loaded, measured) base policy declares. This runs
+    // after the base policy is in place so `fragment_specs()` reflects the
+    // attested `policy_data.fragments[]`. It is fail-closed: a declared
+    // fragment that cannot be fetched/verified/injected aborts the VM rather
+    // than booting with an incompletely-composed policy.
+    #[cfg(feature = "agent-policy")]
+    if let Err(e) = policy_fragments::load_declared_fragments().await {
+        error!(logger, "Failed to load signed policy fragments: {:?}", e);
+        // A declared fragment failing to verify is a security-relevant event;
+        // do not continue with a partial policy. Flush logs, then abort the VM.
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        std::process::abort();
     }
 
     let mut oma = None;

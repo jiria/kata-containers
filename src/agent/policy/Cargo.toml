@@ -48,3 +48,19 @@ slog-scope.workspace = true
 # Internal dependencies
 
 protocols = { workspace = true, features = ["with-serde"] }
+
+# Policy-fragment COSE_Sign1 verification (ACI-compatible: ES384 / x5chain /
+# did:x509). Pure-Rust so the guest agent needs no C toolchain / `ring`.
+# SECURITY: this is the crypto trust boundary for runtime-pulled fragments;
+# security-review-gated before it lands in the shipped guest.
+coset = "0.3"
+p384 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+x509-cert = "0.2"
+const-oid = "0.9"
+sha2 = { workspace = true }
+base64 = { workspace = true }
+
+[dev-dependencies]
+# Test-only: generate a P-384 root+leaf chain and sign fixtures. Not compiled
+# into the agent.
+rcgen = { version = "0.13", features = ["pem", "crypto"] }

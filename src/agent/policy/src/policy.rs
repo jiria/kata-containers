@@ -242,6 +242,65 @@ impl AgentPolicy {
         Ok(())
     }
 
+    /// Read the fragment specs the measured base policy declares in
+    /// `policy_data.fragments[]`. Each entry names an issuer + feed + minimum
+    /// SVN the guest is willing to accept a fragment for. Returns an empty
+    /// vector when the base policy declares no fragments.
+    ///
+    /// Because these values live inside the base policy — which is measured
+    /// into the TEE launch attestation — they are the trust anchor the runtime
+    /// pulls and verifies fragments against.
+    pub fn fragment_specs(&mut self) -> Result<Vec<crate::fragment_verify::FragmentPolicy>> {
+        let query = "data.agent_policy.policy_data.fragments".to_string();
+        let results = self.engine.eval_query(query, false)?;
+
+        // No `fragments` field (or it's undefined) -> nothing to load.
+        if results.result.is_empty() {
+            return Ok(Vec::new());
+        }
+        if results.result[0].expressions.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        match &results.result[0].expressions[0].value {
+            regorus::Value::Undefined => Ok(Vec::new()),
+            value @ regorus::Value::Array(_) => {
+                let json = serde_json::to_string(value)?;
+                let specs: Vec<crate::fragment_verify::FragmentPolicy> =
+                    serde_json::from_str(&json)?;
+                Ok(specs)
+            }
+            other => bail!("policy_data.fragments has unexpected type: {other:?}"),
+        }
+    }
+
+    /// Cryptographically verify a COSE_Sign1 fragment envelope against a base
+    /// policy `spec`, and — only on success — inject the verified Rego module
+    /// into the engine.
+    ///
+    /// SECURITY: this is fail-closed. If verification fails for ANY reason
+    /// (bad signature, untrusted issuer, wrong feed, stale SVN, malformed
+    /// payload) the module is NOT injected and the error is propagated so the
+    /// caller can abort the boot. The `spec` MUST originate from the measured
+    /// base policy (see [`Self::fragment_specs`]).
+    pub fn load_verified_fragment(
+        &mut self,
+        cose: &[u8],
+        spec: &crate::fragment_verify::FragmentPolicy,
+    ) -> Result<()> {
+        let verified = crate::fragment_verify::verify_fragment(cose, spec)?;
+        info!(
+            sl!(),
+            "policy: injecting verified fragment";
+            "feed" => &verified.feed,
+            "issuer" => &verified.issuer,
+            "svn" => verified.svn,
+            "namespace" => &verified.namespace,
+        );
+        // Use the feed as the opaque module source label (unique per fragment).
+        self.add_fragment(&verified.feed, &verified.rego)
+    }
+
     async fn log_eval_input(&mut self, ep: &str, input: &str) {
         if let Some(log_file) = &mut self.log_file {
             match ep {
