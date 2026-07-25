@@ -28,15 +28,18 @@ const POLICY_MAX_FILE_BYTES: usize = 16 * 1024 * 1024; // 16 MiB per file
 const POLICY_MAX_LINES: usize = 200_000;
 
 static POLICY_LOG_FILE: &str = "/tmp/policy.jsonl";
+#[cfg(not(feature = "strict-policy"))]
 static POLICY_DEFAULT_FILE: &str = "/etc/kata-opa/default-policy.rego";
 
-/// Closed-door baseline used in strict builds when no explicit policy is provided.
-/// It denies every security-relevant request (every endpoint is left undefined, so
-/// policy evaluation fails closed) except `SetPolicyRequest`, which is the channel
-/// through which an authorized policy is delivered.
+/// Closed-door baseline used in strict builds. Every endpoint is left undefined, so policy
+/// evaluation fails closed and every request is denied.
+///
+/// Unlike upstream this does not carve out `SetPolicyRequest`: strict builds deliver policy
+/// exclusively through initdata, which is bound to the launch measurement, and the
+/// `SetPolicy` RPC is compiled out. There is therefore no request the guest should accept
+/// before an authorized policy is installed.
 #[cfg(feature = "strict-policy")]
-static STRICT_DEFAULT_POLICY: &str =
-    "package agent_policy\n\ndefault SetPolicyRequest := true\n";
+static STRICT_DEFAULT_POLICY: &str = "package agent_policy\n";
 
 /// Convenience macro to obtain the scope logger
 macro_rules! sl {
@@ -143,22 +146,47 @@ impl AgentPolicy {
             debug!(sl!(), "policy: log file: {}", log_file_path);
         }
 
-        // Strict builds never fall back to a permissive default shipped in the guest
-        // image: if no explicit (attested) policy was provided, install the compiled-in
-        // closed-door baseline so the guest denies all security-relevant requests until
-        // an authorized policy is delivered.
-        #[cfg(feature = "strict-policy")]
+        self.load_initial_policy(default_policy_file).await
+    }
+
+    /// Strict builds never load a policy from the guest filesystem: the compiled-in
+    /// closed-door baseline is installed unconditionally, so the guest denies all
+    /// security-relevant requests until an authorized policy is delivered through an
+    /// attested channel (initdata, or a `SetPolicy` bound to the launch measurement).
+    ///
+    /// `default_policy_file` is deliberately ignored. It is host-influenceable: it is
+    /// populated from the `KATA_AGENT_POLICY_FILE` environment variable and from the agent
+    /// config file, which the kernel command line can select via `agent.config_file=`.
+    /// Honouring it would let a non-empty value skip the baseline and load a permissive
+    /// policy from the image instead.
+    #[cfg(feature = "strict-policy")]
+    async fn load_initial_policy(&mut self, default_policy_file: String) -> Result<()> {
         if default_policy_file.is_empty() {
             info!(
                 sl!(),
                 "strict-policy: no explicit policy provided; loading closed-door baseline"
             );
-            self.engine
-                .add_policy("strict-default.rego".to_string(), STRICT_DEFAULT_POLICY.to_string())?;
-            self.update_allow_failures_flag().await?;
-            return Ok(());
+        } else {
+            warn!(
+                sl!(),
+                "strict-policy: ignoring configured policy file; the closed-door baseline is \
+                 always used until an authorized policy is delivered";
+                "ignored-policy-file" => &default_policy_file
+            );
         }
 
+        self.engine.add_policy(
+            "strict-default.rego".to_string(),
+            STRICT_DEFAULT_POLICY.to_string(),
+        )?;
+        self.update_allow_failures_flag().await?;
+        Ok(())
+    }
+
+    /// Non-strict builds keep the historical behaviour: load the configured policy file, or
+    /// fall back to the default policy shipped in the guest image.
+    #[cfg(not(feature = "strict-policy"))]
+    async fn load_initial_policy(&mut self, default_policy_file: String) -> Result<()> {
         let mut default_policy_file = default_policy_file;
         if default_policy_file.is_empty() {
             default_policy_file = POLICY_DEFAULT_FILE.to_string();
@@ -557,6 +585,106 @@ mod tests {
             r.result.first().and_then(|x| x.expressions.first()).map(|e| &e.value),
             Some(regorus::Value::Bool(true))
         )
+    }
+
+    /// Endpoints a closed-door baseline must refuse. `SetPolicyRequest` is deliberately in
+    /// this list: strict builds deliver policy through initdata only.
+    #[cfg(feature = "strict-policy")]
+    const CLOSED_DOOR_ENDPOINTS: &[&str] = &[
+        "CreateContainerRequest",
+        "StartContainerRequest",
+        "ExecProcessRequest",
+        "ReadStreamRequest",
+        "WriteStreamRequest",
+        "CopyFileRequest",
+        "CreateSandboxRequest",
+        "GetOOMEventRequest",
+        "SetPolicyRequest",
+    ];
+
+    /// A request is refused either by evaluating to `false` or by failing to evaluate at
+    /// all (an undefined rule yields an empty result, which `allow_request` turns into an
+    /// error). Both are denials; the agent maps `Err` to a refused request.
+    #[cfg(feature = "strict-policy")]
+    fn is_denied(outcome: Result<(bool, String)>) -> bool {
+        !matches!(outcome, Ok((true, _)))
+    }
+
+    /// A3: the compiled-in baseline denies every endpoint, including `SetPolicyRequest`.
+    /// Guards against reintroducing a carve-out.
+    #[cfg(feature = "strict-policy")]
+    #[tokio::test]
+    async fn strict_baseline_denies_every_endpoint() {
+        let mut p = AgentPolicy::new();
+        p.engine
+            .add_policy("strict-default.rego".to_string(), STRICT_DEFAULT_POLICY.to_string())
+            .unwrap();
+
+        for ep in CLOSED_DOOR_ENDPOINTS {
+            assert!(
+                is_denied(p.allow_request(ep, "{}").await),
+                "closed-door baseline allowed {}",
+                ep
+            );
+        }
+    }
+
+    /// A1: in a strict build a configured policy file is ignored and the closed-door
+    /// baseline is installed anyway. This is the regression test for the rootfs
+    /// policy-file override: on the pre-fix agent the permissive file below is loaded and
+    /// `CreateContainerRequest` is allowed.
+    #[cfg(feature = "strict-policy")]
+    #[tokio::test]
+    async fn strict_initialize_ignores_configured_policy_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let permissive = dir.path().join("allow-all.rego");
+        std::fs::write(
+            &permissive,
+            "package agent_policy\ndefault CreateContainerRequest := true\n",
+        )
+        .unwrap();
+
+        let mut p = AgentPolicy::new();
+        p.initialize(0, permissive.to_string_lossy().into_owned(), None)
+            .await
+            .unwrap();
+
+        assert!(
+            is_denied(p.allow_request("CreateContainerRequest", "{}").await),
+            "a policy file on the guest filesystem overrode the closed-door baseline"
+        );
+    }
+
+    /// A1b: the same holds when no policy file is configured at all.
+    #[cfg(feature = "strict-policy")]
+    #[tokio::test]
+    async fn strict_initialize_without_policy_file_is_closed() {
+        let mut p = AgentPolicy::new();
+        p.initialize(0, String::new(), None).await.unwrap();
+
+        assert!(is_denied(p.allow_request("CreateContainerRequest", "{}").await));
+    }
+
+    /// A2: non-strict builds keep the historical behaviour -- the configured policy file
+    /// wins. Ensures the strict hardening did not change the default build.
+    #[cfg(not(feature = "strict-policy"))]
+    #[tokio::test]
+    async fn non_strict_initialize_loads_configured_policy_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let permissive = dir.path().join("allow-all.rego");
+        std::fs::write(
+            &permissive,
+            "package agent_policy\ndefault CreateContainerRequest := true\n",
+        )
+        .unwrap();
+
+        let mut p = AgentPolicy::new();
+        p.initialize(0, permissive.to_string_lossy().into_owned(), None)
+            .await
+            .unwrap();
+
+        let (allowed, _) = p.allow_request("CreateContainerRequest", "{}").await.unwrap();
+        assert!(allowed, "non-strict build should honour the configured policy file");
     }
 
     /// BL-8: the boot-time fragment declarations are read from

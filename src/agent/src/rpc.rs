@@ -102,7 +102,9 @@ use crate::trace_rpc_call;
 use crate::tracer::extract_carrier_from_ttrpc;
 
 #[cfg(feature = "agent-policy")]
-use crate::policy::{do_set_policy, is_allowed};
+use crate::policy::is_allowed;
+#[cfg(all(feature = "agent-policy", not(feature = "strict-policy")))]
+use crate::policy::do_set_policy;
 #[cfg(not(feature = "strict-policy"))]
 use crate::policy::is_allowed_with_entrypoint;
 
@@ -2161,7 +2163,13 @@ impl agent_ttrpc::AgentService for AgentService {
         Ok(Empty::new())
     }
 
-    #[cfg(feature = "agent-policy")]
+    // Policy delivery in strict builds is exclusively through initdata, which is bound to
+    // the launch measurement. The `SetPolicy` RPC is a host-facing mutation channel with no
+    // remaining consumer, so it is compiled out entirely rather than merely denied by the
+    // baseline: a strict agent returns the ttRPC default (unimplemented). Note this removes
+    // only the RPC surface -- `AgentPolicy::set_policy()` is still what installs the policy
+    // carried in initdata (see `main.rs`).
+    #[cfg(all(feature = "agent-policy", not(feature = "strict-policy")))]
     async fn set_policy(
         &self,
         ctx: &TtrpcContext,
