@@ -101,10 +101,10 @@ use kata_types::dmverity::cleanup_dmverity_devices;
 use crate::trace_rpc_call;
 use crate::tracer::extract_carrier_from_ttrpc;
 
-#[cfg(feature = "agent-policy")]
-use crate::policy::is_allowed;
 #[cfg(all(feature = "agent-policy", not(feature = "strict-policy")))]
 use crate::policy::do_set_policy;
+#[cfg(feature = "agent-policy")]
+use crate::policy::is_allowed;
 #[cfg(not(feature = "strict-policy"))]
 use crate::policy::is_allowed_with_entrypoint;
 
@@ -1123,7 +1123,9 @@ impl agent_ttrpc::AgentService for AgentService {
     ) -> ttrpc::Result<Empty> {
         trace_rpc_call!(ctx, "remove_container", req);
         is_allowed(&req).await?;
-        self.do_remove_container(req.clone()).await.map_ttrpc_err(same)?;
+        self.do_remove_container(req.clone())
+            .await
+            .map_ttrpc_err(same)?;
 
         // FR-9: retire the occurrence. Its alias may not be operated on again until a
         // fresh create re-mints it with a new generation.
@@ -2200,7 +2202,10 @@ impl agent_ttrpc::AgentService for AgentService {
             None
         } else {
             Some(String::from_utf8(req.policy_module.clone()).map_err(|e| {
-                ttrpc_error(ttrpc::Code::INVALID_ARGUMENT, format!("policy_module not UTF-8: {e}"))
+                ttrpc_error(
+                    ttrpc::Code::INVALID_ARGUMENT,
+                    format!("policy_module not UTF-8: {e}"),
+                )
             })?)
         };
         let fragment = kata_security_reference_monitor::PolicyFragment {
@@ -2252,9 +2257,7 @@ impl agent_ttrpc::AgentService for AgentService {
                 }
             } else if store.require_x509()
                 || (store.has_did_x509_anchors()
-                    && kata_security_reference_monitor::did_x509::cose_has_x5chain(
-                        &req.cose_sign1,
-                    ))
+                    && kata_security_reference_monitor::did_x509::cose_has_x5chain(&req.cose_sign1))
             {
                 store.verify_cose_x509(&fragment, &req.cose_sign1)
             } else {
