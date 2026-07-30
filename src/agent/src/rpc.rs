@@ -1027,7 +1027,7 @@ impl agent_ttrpc::AgentService for AgentService {
         {
             use kata_security_reference_monitor::Prepared;
 
-            let op_id = req.container_id.clone();
+            let op_id = srm_op_id("create", &[&req.container_id]);
             let digest = plan_digest(&req);
             {
                 let mut srm = crate::SRM.lock().await;
@@ -1141,9 +1141,9 @@ impl agent_ttrpc::AgentService for AgentService {
         {
             use kata_security_reference_monitor::Prepared;
 
-            // Namespaced: `create_container` uses the bare container id as its operation
-            // id, so an un-namespaced removal would collide with the create it undoes.
-            let op_id = format!("remove:{}", req.container_id);
+            // Namespaced by kind: `create_container` builds its id the same way, so an
+            // un-kinded removal would collide with the create it undoes.
+            let op_id = srm_op_id("remove", &[&req.container_id]);
             let digest = plan_digest(&req);
             {
                 let mut srm = crate::SRM.lock().await;
@@ -1190,7 +1190,8 @@ impl agent_ttrpc::AgentService for AgentService {
                         // The container id is now free again. Retire both transactions so
                         // a later create for the same id is a genuinely new operation
                         // rather than an idempotent replay of the create just undone.
-                        for id in [&req.container_id, &op_id] {
+                        let create_op_id = srm_op_id("create", &[&req.container_id]);
+                        for id in [&create_op_id, &op_id] {
                             retire_or_warn(&mut srm, id);
                         }
                     }
@@ -1271,7 +1272,7 @@ impl agent_ttrpc::AgentService for AgentService {
                 .require_running(&req.container_id, "exec")
                 .map_err(|e| ttrpc_error(ttrpc::Code::FAILED_PRECONDITION, e))?;
 
-            let op_id = format!("{}:{}", req.container_id, req.exec_id);
+            let op_id = srm_op_id("exec", &[&req.container_id, &req.exec_id]);
             let digest = plan_digest(&req);
             {
                 let mut srm = crate::SRM.lock().await;
@@ -1358,7 +1359,10 @@ impl agent_ttrpc::AgentService for AgentService {
         {
             use kata_security_reference_monitor::Prepared;
 
-            let op_id = format!("{}:{}:sig:{}", req.container_id, req.exec_id, req.signal);
+            let op_id = srm_op_id(
+                "signal",
+                &[&req.container_id, &req.exec_id, &req.signal.to_string()],
+            );
             let digest = plan_digest(&req);
             {
                 let mut srm = crate::SRM.lock().await;
@@ -2641,6 +2645,34 @@ async fn rollback_policy_state(snapshot: &Option<String>, context: &str) {
             .await
             .quarantine(format!("policy state rollback failed after {context}"));
     }
+}
+
+/// FR-6 / RM-4: build an operation id that no other operation can be confused with.
+///
+/// Operation ids are assembled from container and exec ids, and under this threat model
+/// both are supplied by the untrusted host. Joining them with a separator is therefore
+/// not injective: `format!("{cid}:{exec}")` maps `("a:b", "c")` and `("a", "b:c")` to the
+/// same id, and the bare container id used for a create collides with an exec id whose
+/// container and exec parts happen to concatenate to it.
+///
+/// That matters because a committed transaction is retained as an idempotent replay
+/// cache. Two different operations sharing an id means the second one is answered from
+/// the first one's cached result -- the agent returns success for work it never did, which
+/// is exactly the divergence FR-6 exists to prevent, reachable by a host that merely
+/// chooses its own container and exec ids.
+///
+/// Each part is length-prefixed, so the encoding is unambiguous regardless of what
+/// characters the host puts in a name. `kind` is a fixed literal and contains no `/`.
+#[cfg(feature = "strict-policy")]
+fn srm_op_id(kind: &str, parts: &[&str]) -> String {
+    let mut id = String::from(kind);
+    for part in parts {
+        id.push('/');
+        id.push_str(&part.len().to_string());
+        id.push(':');
+        id.push_str(part);
+    }
+    id
 }
 
 /// FR-6: record a successful operation, quarantining the monitor if that fails.
@@ -4859,6 +4891,180 @@ COMMIT
                 panic!("{}: unexpected do_copy_file result: {:?}", tc.name, res)
             }
             (tc.assertions)(&base).context(tc.name).unwrap()
+        }
+    }
+
+    // RM-6: the reference-monitor integration lives here in `rpc.rs`, but every test for
+    // it lived in the `kata-security-reference-monitor` crate. That crate is well covered,
+    // and the defects still found in FR-6 -- removal never wrapped in a transaction, the
+    // replay cache applied to repeatable operations, commit results discarded -- were all
+    // wiring defects at this layer, which crate-level tests cannot see. These cover the
+    // decisions this file makes.
+    #[cfg(feature = "strict-policy")]
+    mod srm_integration {
+        use super::*;
+        use kata_security_reference_monitor::{Prepared, ReferenceMonitor, SrmError, TxnState};
+
+        /// The four operation ids `rpc.rs` builds, as the call sites build them.
+        fn all_op_ids(cid: &str, exec: &str, signal: u32) -> Vec<String> {
+            vec![
+                srm_op_id("create", &[cid]),
+                srm_op_id("remove", &[cid]),
+                srm_op_id("exec", &[cid, exec]),
+                srm_op_id("signal", &[cid, exec, &signal.to_string()]),
+            ]
+        }
+
+        #[test]
+        fn the_four_operation_kinds_never_share_an_id() {
+            let ids = all_op_ids("ctr1", "exec1", 15);
+            let unique: std::collections::HashSet<_> = ids.iter().collect();
+            assert_eq!(
+                unique.len(),
+                ids.len(),
+                "operation kinds must not collide: {ids:?}"
+            );
+        }
+
+        #[test]
+        fn host_chosen_names_cannot_forge_another_operations_id() {
+            // Container and exec ids come from the host, which is untrusted. With a plain
+            // separator join these pairs all produce the same id, so a committed
+            // transaction for one operation would be replayed as the result of another --
+            // the agent returning success for work it never performed.
+            //
+            // Each case is a (container, exec) pair that a naive `{cid}:{exec}` encoding
+            // maps onto the same string.
+            let collisions = [(("a:b", "c"), ("a", "b:c")), (("x:", "y"), ("x", ":y"))];
+            for ((c1, e1), (c2, e2)) in collisions {
+                assert_ne!(
+                    srm_op_id("exec", &[c1, e1]),
+                    srm_op_id("exec", &[c2, e2]),
+                    "({c1:?}, {e1:?}) and ({c2:?}, {e2:?}) must not share an operation id"
+                );
+            }
+
+            // A container literally named so that its create id spells another kind's id.
+            assert_ne!(
+                srm_op_id("create", &[&srm_op_id("remove", &["victim"])]),
+                srm_op_id("remove", &["victim"]),
+            );
+
+            // An exec id chosen to look like a signal operation on the same container.
+            assert_ne!(
+                srm_op_id("exec", &["ctr1", "e/1:9"]),
+                srm_op_id("signal", &["ctr1", "e", "9"]),
+            );
+        }
+
+        #[test]
+        fn a_colliding_id_would_be_answered_from_the_replay_cache() {
+            // Demonstrates why the above matters, using the monitor itself. A create
+            // transaction is retained (it is only retired when the container is removed),
+            // so any later operation that resolves to the same id is short-circuited.
+            // Both `exec_process` and `signal_process` return `Ok(Empty)` on
+            // `AlreadyCommitted` without running anything.
+            let mut m = ReferenceMonitor::new();
+            let create = srm_op_id("create", &["a:b"]);
+            m.prepare(create.clone(), 0, "d1").unwrap();
+            m.execute(&create, "d1").unwrap();
+            m.commit(&create, "container-created").unwrap();
+
+            // The exec that a separator-joined encoding would have aliased onto it.
+            let exec = srm_op_id("exec", &["a", "b"]);
+            assert_ne!(exec, create);
+            assert_eq!(
+                m.prepare(exec, m.state_version(), "d2").unwrap(),
+                Prepared::New,
+                "a distinct operation must not be answered from another's result"
+            );
+        }
+
+        #[test]
+        fn commit_or_quarantine_records_success_and_leaves_the_monitor_usable() {
+            let mut m = ReferenceMonitor::new();
+            let op = srm_op_id("create", &["ctr1"]);
+            m.prepare(op.clone(), 0, "d").unwrap();
+            m.execute(&op, "d").unwrap();
+
+            commit_or_quarantine(&mut m, &op, "container-created", "create_container");
+
+            assert_eq!(m.transaction(&op).unwrap().state, TxnState::Committed);
+            assert!(
+                m.prepare(srm_op_id("create", &["ctr2"]), m.state_version(), "d")
+                    .is_ok(),
+                "a successful commit must not quarantine the monitor"
+            );
+        }
+
+        #[test]
+        fn commit_or_quarantine_quarantines_when_the_record_cannot_be_made() {
+            // The runtime operation has already succeeded by the time this runs, so a
+            // failed commit means the monitor is silently wrong about a real effect.
+            // Nothing may be admitted afterwards on state it cannot vouch for.
+            let mut m = ReferenceMonitor::new();
+            let op = srm_op_id("signal", &["ctr1", "", "15"]);
+
+            // Never prepared: the shape an operation-id collision produces.
+            commit_or_quarantine(&mut m, &op, "signal-delivered", "signal_process");
+
+            assert!(matches!(
+                m.prepare(srm_op_id("create", &["ctr2"]), m.state_version(), "d"),
+                Err(SrmError::Quarantined(_))
+            ));
+        }
+
+        #[test]
+        fn retire_or_warn_frees_the_id_and_tolerates_an_unknown_one() {
+            let mut m = ReferenceMonitor::new();
+            let op = srm_op_id("signal", &["ctr1", "", "1"]);
+            m.prepare(op.clone(), 0, "d").unwrap();
+            m.execute(&op, "d").unwrap();
+            m.commit(&op, "signal-delivered").unwrap();
+
+            retire_or_warn(&mut m, &op);
+            assert!(m.transaction(&op).is_none());
+
+            // A repeated signal is a legitimate request, not a replay, and must be
+            // admitted rather than answered from the retained result.
+            assert_eq!(
+                m.prepare(op, m.state_version(), "d").unwrap(),
+                Prepared::New
+            );
+
+            // Retiring something unknown must not panic or quarantine: the operation it
+            // followed already succeeded.
+            retire_or_warn(&mut m, "never-existed");
+            assert!(m
+                .prepare(srm_op_id("create", &["ctr2"]), m.state_version(), "d")
+                .is_ok());
+        }
+
+        #[test]
+        fn removing_a_container_frees_the_id_its_create_reserved() {
+            // The sequence `remove_container` performs on success: commit the removal,
+            // then retire both transactions so the container id is genuinely reusable.
+            let mut m = ReferenceMonitor::new();
+            let create = srm_op_id("create", &["ctr1"]);
+            let remove = srm_op_id("remove", &["ctr1"]);
+
+            m.prepare(create.clone(), 0, "d1").unwrap();
+            m.execute(&create, "d1").unwrap();
+            m.commit(&create, "container-created").unwrap();
+
+            m.prepare(remove.clone(), m.state_version(), "d2").unwrap();
+            m.execute(&remove, "d2").unwrap();
+            commit_or_quarantine(&mut m, &remove, "container-removed", "remove_container");
+            for id in [&create, &remove] {
+                retire_or_warn(&mut m, id);
+            }
+
+            // Without retiring the create, this would be an idempotent replay and the new
+            // container would never be created.
+            assert_eq!(
+                m.prepare(create, m.state_version(), "d3").unwrap(),
+                Prepared::New
+            );
         }
     }
 }
