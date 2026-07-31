@@ -51,7 +51,7 @@ implement it, the security guarantee it introduces, and how it was validated.
 |---|---|---|
 | FR-2 | Closed-door default policy (fail closed) | `0a538d111` |
 | FR-12 | One-shot policy activation + strict capability advertisement | `85b3ce3f7`, `ad01dd311`, `8424e7e08` |
-| FR-6 | Two-phase transaction manager (SRM substrate) | `b10ffc663`, `b88ff8e51`, `e4d6c8c97`, `dfac4bd7a` |
+| FR-6 | Two-phase transaction manager (SRM substrate) | `b10ffc663`, `b88ff8e51`, `e4d6c8c97`, `dfac4bd7a`, this PR |
 | FR-3 | Canonical object: authorized == executed | `61ee0ca0d`, `5a736c4a8`, `798301421` |
 | FR-9 | Container occurrence + lifecycle state machine | `96a0d641c`, `2434d3ef2` |
 | FR-7 | Complete-mediation manifest + CI coverage | `d68c96708` |
@@ -167,16 +167,64 @@ bypassed, plus a missing binding. All four are addressed on `fr2-strict-policy-h
 ### FR-6 — Two-phase transaction manager (Security Reference Monitor)
 - **Gap:** policy state and runtime state could diverge on partial failure, leaving the
   enforcer believing a container/mount/identity exists (or not) when the opposite is true.
-- **Fix:** a universal `ReferenceMonitor` models every mutating operation as
+- **Fix:** a universal `ReferenceMonitor` models a mutating operation as
   `prepare → execute → commit`/`abort`, with idempotent replay, anti-replay via a monotonic
-  state version, and a fail-closed `quarantine`. `CreateContainer`, `ExecProcess`, and
-  `SignalProcess` run as SRM transactions; policy state is snapshotted before authorization
-  and restored on abort.
+  state version, and a fail-closed `quarantine`. `CreateContainer`, `ExecProcess`,
+  `SignalProcess`, and `RemoveContainer` run as SRM transactions. Policy state is bracketed
+  around authorization and the request's **own delta** is reverted on abort, rather than a
+  whole-document snapshot being restored: ttrpc dispatches each request on its own task and
+  the policy lock is released while the runtime operation runs, so restoring a snapshot
+  would silently discard state committed by a concurrent request. A failed revert, or a
+  missing bracket, quarantines the monitor rather than continuing on unprovable state.
+  Every transaction is covered by a `TxnGuard` taken **under the same lock acquisition as
+  `prepare`**, so a request cancelled at any suspension point — including one cancelled
+  before it reaches its first `.await` — leaves a reclaimable record rather than a
+  transaction wedged in `Prepared` forever; orphans are drained at the head of the next
+  `prepare`/`execute`. Every early return between `prepare` and the runtime call reverts
+  the policy delta, so a refused or duplicate operation cannot leave a phantom container
+  in the enforcer's state. On a successful removal the container's transactions are
+  **retired**, so a later create for the same id is a new operation rather than an
+  idempotent replay of the create just undone. `prepare` refuses a duplicate for an
+  operation that is still in flight rather than overwriting the live transaction. Aborted
+  transactions are dropped from the map rather than parked in a terminal state, so a host
+  that can drive aborts on demand cannot grow guest agent memory without bound. Every
+  `commit` and `abort` result is acted on: a failure at either point means the monitor
+  cannot account for an operation that already ran, so it quarantines rather than
+  continuing on state it cannot vouch for. Operation ids are built by a length-prefixed
+  encoder rather than by joining host-supplied names with a separator, so no two
+  operations can resolve to the same id.
 - **Guarantee:** policy and runtime state commit together or are reconciled/rolled back;
   an unprovable state quarantines the monitor (never fails open).
+- **Scope — which RPCs are transactions, and why:** only two policy rules mutate persisted
+  policy state (`pstate`): `CreateContainerRequest` (adds the container) and
+  `RemoveContainerRequest` (deletes it). Both are covered, so the state that authorization
+  actually mutates can always be rolled back. `ExecProcess` and `SignalProcess` are covered
+  as well, though under the reference policy they emit no state ops. The remaining mutating
+  RPCs in the complete-mediation manifest (FR-7) are policy-gated but **not** transactional;
+  extending coverage to them is tracked in `docs/cc/backlog.md`.
+- **Limits:** the plan digest passed to `execute` is the same value computed for `prepare`
+  at each call site, and the `expected_state_version` is read from the monitor and handed
+  straight back, so `PlanMismatch` and `StaleStateVersion` are properties of the crate
+  rather than of the integration. Meaningful anti-replay would require the version to be
+  pinned by the initiator, which is outside FR-6's agent-internal scope. Quarantine blocks
+  further SRM-gated operations; it does not halt the guest, but because `SignalProcess` and
+  `RemoveContainer` are among those operations it does block graceful container teardown
+  (see RM-7/RM-8 in `docs/cc/backlog.md`). Replay protection is also not
+  uniform across the four transactions: the retained-result cache is only sound when the
+  operation id names a unique object, which holds for a container id but not for a signal
+  (`(container, exec, signal)` names a repeatable event) or for an exec id (reusable once
+  the exec is deleted). Those two therefore retire on commit, which scopes their replay
+  protection to duplicates arriving while the first is still in flight; a retry issued
+  after the original committed will execute again.
 - **Commits:** `b10ffc663` (crate), `b88ff8e51` (create), `e4d6c8c97` (exec/signal),
-  `dfac4bd7a` (policy-state rollback).
-- **Validated:** unit (transaction manager tests) + matrix no-regression.
+  `dfac4bd7a` (policy-state rollback), this PR (removal + rollback failure handling).
+- **Validated:** unit (transaction manager tests, including transaction retirement,
+  refusal of in-flight duplicates under thread contention, the orphan reaper, bounded
+  growth under repeated aborts, and what a failed commit leaves behind) + fault-injection
+  and randomized-sequence invariant tests + `rpc`-level integration tests covering
+  operation-id injectivity and the commit/retire helpers + policy tests covering removal
+  rollback via delta revert, including that a concurrent request's state change survives
+  another request's rollback + matrix no-regression.
 
 ### FR-3 — Canonical object (authorized == executed)
 - **Gap:** the agent mutates the authorized request before executing it (effective signal
@@ -502,7 +550,7 @@ pre-hardened deployment a few are parity or additional defense-in-depth.
 
 - **Confirmed structural gaps closed here (independent of any product-layer hardening):**
   FR-4A (ordered/bijective resource graph), FR-9 (occurrence/cardinality), FR-1 (signed
-  policy fragments), FR-6 (universal transactional rollback), FR-7 (total-mediation
+  policy fragments), FR-6 (transactional rollback of authorization state), FR-7 (total-mediation
   manifest + gating the always-allowed lifecycle RPCs), FR-11 (trusted CDI/device
   resolution), FR-14 (network phase binding + route allowlist), FR-10 (CopyFile content),
   and FR-8/FR-15 (auditability + the model-checked equivalence proof). These are not

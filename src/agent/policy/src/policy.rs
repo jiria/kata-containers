@@ -227,11 +227,43 @@ impl AgentPolicy {
     }
 
     /// FR-6: restore policy state captured by `snapshot_state` (transaction rollback).
+    ///
+    /// Replaces the whole data document, so it is only safe when no other request can have
+    /// mutated policy state in the meantime. Prefer [`AgentPolicy::revert_state_delta`] on
+    /// any path that awaits between the snapshot and the rollback.
     #[cfg(feature = "strict-policy")]
     pub fn restore_state(&mut self, snapshot: &str) -> Result<()> {
         self.engine.clear_data();
         self.engine
             .add_data(regorus::Value::from_json_str(snapshot)?)?;
+        Ok(())
+    }
+
+    /// FR-6: undo only the state mutations made by one request, leaving concurrent ones
+    /// intact.
+    ///
+    /// Restoring a whole-document snapshot rolls back *every* change made since it was
+    /// taken, not just this request's. ttrpc dispatches each request on its own task and
+    /// the policy lock is released while the runtime operation runs, so the interleaving
+    /// is reachable: `remove(A)` snapshots, `create(B)` commits `B` into `pstate`, then
+    /// `remove(A)` fails and restores a snapshot that predates `B`. Container `B` is now
+    /// running but absent from the enforcer's state — it can never be authorized for
+    /// removal, which is the divergence FR-6 exists to prevent.
+    ///
+    /// `before` and `after` bracket this request's own authorization, so their difference
+    /// is exactly the set of keys it touched. Reverting only those keys, against whatever
+    /// the current state happens to be, leaves everyone else's changes alone.
+    #[cfg(feature = "strict-policy")]
+    pub fn revert_state_delta(&mut self, before: &str, after: &str) -> Result<()> {
+        let before: serde_json::Value = serde_json::from_str(before)?;
+        let after: serde_json::Value = serde_json::from_str(after)?;
+        let mut current: serde_json::Value = serde_json::to_value(self.engine.get_data())?;
+
+        revert_delta(&mut current, &before, &after);
+
+        self.engine.clear_data();
+        self.engine
+            .add_data(regorus::Value::from_json_str(&current.to_string())?)?;
         Ok(())
     }
 
@@ -488,6 +520,62 @@ impl AgentPolicy {
     }
 }
 
+/// Undo, in `current`, exactly the differences between `before` and `after`.
+///
+/// A key whose value is identical in `before` and `after` was not touched by the request
+/// being rolled back, so whatever `current` holds for it — including a change another
+/// request made in the meantime — is left alone. Only keys the request actually added,
+/// removed or modified are put back the way it found them, recursing into nested objects
+/// so that two requests touching sibling entries of the same map do not clobber each
+/// other.
+#[cfg(feature = "strict-policy")]
+fn revert_delta(
+    current: &mut serde_json::Value,
+    before: &serde_json::Value,
+    after: &serde_json::Value,
+) {
+    use serde_json::Value;
+
+    if before == after {
+        return;
+    }
+
+    let (Value::Object(before_map), Value::Object(after_map)) = (before, after) else {
+        // Not a map on at least one side, so there is no finer granularity to exploit.
+        *current = before.clone();
+        return;
+    };
+    let Value::Object(current_map) = current else {
+        // The shape changed underneath us; the request's own view is the best we have.
+        *current = before.clone();
+        return;
+    };
+
+    let keys: std::collections::BTreeSet<&String> =
+        before_map.keys().chain(after_map.keys()).collect();
+    for key in keys {
+        match (before_map.get(key), after_map.get(key)) {
+            // Untouched by this request.
+            (Some(b), Some(a)) if b == a => {}
+            (Some(b), Some(a)) => match current_map.get_mut(key) {
+                Some(c) => revert_delta(c, b, a),
+                None => {
+                    current_map.insert(key.clone(), b.clone());
+                }
+            },
+            // The request removed it; put it back.
+            (Some(b), None) => {
+                current_map.insert(key.clone(), b.clone());
+            }
+            // The request added it; take it away.
+            (None, Some(_)) => {
+                current_map.remove(key);
+            }
+            (None, None) => unreachable!("key came from one of the two maps"),
+        }
+    }
+}
+
 /// FileType represents the S_IFMT part of the POSIX file mode such that it's easier to check in
 /// Rego.
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug, Default, PartialEq)]
@@ -579,6 +667,66 @@ mod tests {
     use std::convert::TryInto;
 
     use protocols::agent::CopyFileRequest;
+
+    /// FR-6: a rollback must undo only its own request's mutations.
+    ///
+    /// The interleaving this guards against: `remove(A)` snapshots `{A}`, `create(B)`
+    /// commits `{A, B}`, then `remove(A)` fails. A whole-document restore would write back
+    /// `{A}` and lose `B` — leaving `B` running but invisible to the enforcer, hence
+    /// unremovable. Reverting the delta must leave `B` in place.
+    #[cfg(feature = "strict-policy")]
+    #[test]
+    fn reverting_a_delta_keeps_concurrent_changes() {
+        let before = serde_json::json!({"pstate": {"A": {"running": true}}});
+        // This request removed A.
+        let after = serde_json::json!({"pstate": {}});
+        // Meanwhile another request added B and committed it.
+        let mut current = serde_json::json!({"pstate": {"B": {"running": true}}});
+
+        revert_delta(&mut current, &before, &after);
+
+        assert_eq!(
+            current,
+            serde_json::json!({"pstate": {"A": {"running": true}, "B": {"running": true}}}),
+            "rollback must restore A without erasing the concurrently created B"
+        );
+    }
+
+    /// The mirror case: a request that *added* state has that addition taken away again,
+    /// and nothing else is disturbed.
+    #[cfg(feature = "strict-policy")]
+    #[test]
+    fn reverting_a_delta_removes_only_what_the_request_added() {
+        let before = serde_json::json!({"pstate": {"A": {"running": true}}});
+        let after = serde_json::json!({"pstate": {"A": {"running": true}, "B": {"n": 1}}});
+        let mut current =
+            serde_json::json!({"pstate": {"A": {"running": true}, "B": {"n": 1}, "C": {"n": 2}}});
+
+        revert_delta(&mut current, &before, &after);
+
+        assert_eq!(
+            current,
+            serde_json::json!({"pstate": {"A": {"running": true}, "C": {"n": 2}}})
+        );
+    }
+
+    /// A key the request never touched must survive even when another request changed its
+    /// value after the snapshot was taken.
+    #[cfg(feature = "strict-policy")]
+    #[test]
+    fn reverting_a_delta_leaves_untouched_keys_alone() {
+        let before = serde_json::json!({"pstate": {"A": 1}, "other": "old"});
+        let after = serde_json::json!({"pstate": {"A": 2}, "other": "old"});
+        let mut current =
+            serde_json::json!({"pstate": {"A": 2}, "other": "changed-by-someone-else"});
+
+        revert_delta(&mut current, &before, &after);
+
+        assert_eq!(
+            current,
+            serde_json::json!({"pstate": {"A": 1}, "other": "changed-by-someone-else"})
+        );
+    }
 
     // FR-1a helper: evaluate `data.agent_policy.<ep>` on a policy's engine and return
     // whether it is boolean-true. Synchronous (no async runtime needed).
@@ -877,6 +1025,193 @@ mod tests {
         assert!(p
             .apply_fragment_module("m", mount_ns, &["mount".to_string()])
             .is_ok());
+    }
+
+    /// A miniature policy that reproduces the `pstate` mechanics of the generated
+    /// `rules.rego`: the helper functions verbatim, a `RemoveContainerRequest` rule that
+    /// deletes the container from `pstate` as its authorization `ops`, and a
+    /// `SignalProcessRequest` rule that is undefined for a container missing from
+    /// `pstate`. It is deliberately self-contained so the test does not depend on a
+    /// generated policy_data blob.
+    #[cfg(feature = "strict-policy")]
+    const POLICY_PSTATE_LIFECYCLE: &str = r#"package agent_policy
+
+import future.keywords.if
+
+default RemoveContainerRequest := false
+default SignalProcessRequest := false
+default CreateContainerRequest := false
+
+get_state() = state if { state := data["pstate"] }
+get_state_val(key) = value if { state := get_state(); value := state[key] }
+get_state_path(key) = path if { path := concat("/", ["/pstate", key]) }
+
+state_del_key(key) = action if {
+  get_state()
+  path := get_state_path(key)
+  action := {"op": "remove", "path": path}
+}
+
+state_add_key(key) = action if {
+  get_state()
+  path := get_state_path(key)
+  action := {"op": "add", "path": path, "value": 0}
+}
+
+concat_op_if_not_null(ops, op) = result if { op == null; result := ops }
+concat_op_if_not_null(ops, op) = result if { op != null; result := array.concat(ops, [op]) }
+
+CreateContainerRequest := {"ops": ops, "allowed": true} if {
+  not get_state_val(input.container_id)
+  ops := concat_op_if_not_null([], state_add_key(input.container_id))
+}
+
+RemoveContainerRequest := {"ops": ops, "allowed": true} if {
+  get_state_val(input.container_id)
+  ops := concat_op_if_not_null([], state_del_key(input.container_id))
+}
+
+SignalProcessRequest if {
+  get_state_val(input.container_id)
+}
+"#;
+
+    /// Build a policy with the lifecycle rules above and one container already recorded in
+    /// `pstate`, as a successful `CreateContainerRequest` would have left it.
+    #[cfg(feature = "strict-policy")]
+    fn pstate_policy_with_container(cid: &str) -> AgentPolicy {
+        let mut p = AgentPolicy::new();
+        p.engine
+            .add_policy(
+                "pstate-lifecycle.rego".to_string(),
+                POLICY_PSTATE_LIFECYCLE.to_string(),
+            )
+            .unwrap();
+        // AgentPolicy::new() already seeds an empty `pstate`, so replace the data wholesale
+        // rather than adding a second binding for the same key.
+        p.restore_state(&format!(r#"{{"pstate": {{"{cid}": 0}}}}"#))
+            .unwrap();
+        p
+    }
+
+    /// F-19: authorizing a `RemoveContainerRequest` deletes the container from `pstate`
+    /// before the teardown runs. If the teardown then fails and that mutation is not rolled
+    /// back, the container is still running but the policy no longer knows about it, so
+    /// every later signal and every retried removal is denied by the fail-closed default.
+    ///
+    /// This asserts the damage exists, which is what makes the rollback in
+    /// `remove_container` load-bearing rather than defensive.
+    #[cfg(feature = "strict-policy")]
+    #[tokio::test]
+    async fn remove_authorization_alone_strands_the_container() {
+        let cid = "ctr1";
+        let req = format!(r#"{{"container_id": "{cid}"}}"#);
+        let mut p = pstate_policy_with_container(cid);
+
+        assert!(
+            matches!(
+                p.allow_request("SignalProcessRequest", &req).await,
+                Ok((true, _))
+            ),
+            "a container in pstate must be signallable to begin with"
+        );
+
+        // Authorization applies the pstate deletion. Imagine do_remove_container failing here.
+        assert!(matches!(
+            p.allow_request("RemoveContainerRequest", &req).await,
+            Ok((true, _))
+        ));
+
+        assert!(
+            is_denied(p.allow_request("SignalProcessRequest", &req).await),
+            "container is unreachable by signal once removed from pstate"
+        );
+        assert!(
+            is_denied(p.allow_request("RemoveContainerRequest", &req).await),
+            "and the removal cannot be retried either -- the container is stranded"
+        );
+    }
+
+    /// F-19: reverting this request's own `pstate` delta undoes the removal's deletion, so
+    /// a container whose teardown failed stays signallable and the removal stays retryable.
+    /// This is the regression test for the rollback that `remove_container` performs on the
+    /// failure path -- it exercises `revert_state_delta`, which is what the handler calls.
+    #[cfg(feature = "strict-policy")]
+    #[tokio::test]
+    async fn rollback_after_failed_remove_keeps_the_container_reachable() {
+        let cid = "ctr1";
+        let req = format!(r#"{{"container_id": "{cid}"}}"#);
+        let mut p = pstate_policy_with_container(cid);
+
+        // What remove_container does: bracket authorization with before/after, then
+        // revert only this request's delta on failure.
+        let before = p.snapshot_state().unwrap();
+        assert!(matches!(
+            p.allow_request("RemoveContainerRequest", &req).await,
+            Ok((true, _))
+        ));
+        let after = p.snapshot_state().unwrap();
+        p.revert_state_delta(&before, &after).unwrap();
+
+        assert!(
+            matches!(
+                p.allow_request("SignalProcessRequest", &req).await,
+                Ok((true, _))
+            ),
+            "after rollback the still-running container must remain signallable"
+        );
+        assert!(
+            matches!(
+                p.allow_request("RemoveContainerRequest", &req).await,
+                Ok((true, _))
+            ),
+            "after rollback the failed removal must be retryable"
+        );
+    }
+
+    /// F-19: the reason the rollback is a *delta* revert and not a snapshot restore.
+    /// A concurrent request commits its own `pstate` change while the failing removal is
+    /// awaiting the runtime; the rollback must not take that change with it.
+    #[cfg(feature = "strict-policy")]
+    #[tokio::test]
+    async fn rollback_preserves_concurrent_state_changes() {
+        let (a, b) = ("ctr1", "ctr2");
+        let req_a = format!(r#"{{"container_id": "{a}"}}"#);
+        let req_b = format!(r#"{{"container_id": "{b}"}}"#);
+        let mut p = pstate_policy_with_container(a);
+
+        // remove(A) brackets its own authorization...
+        let before = p.snapshot_state().unwrap();
+        assert!(matches!(
+            p.allow_request("RemoveContainerRequest", &req_a).await,
+            Ok((true, _))
+        ));
+        let after = p.snapshot_state().unwrap();
+
+        // ...then B is created and committed while remove(A) awaits the runtime.
+        assert!(matches!(
+            p.allow_request("CreateContainerRequest", &req_b).await,
+            Ok((true, _))
+        ));
+
+        // remove(A) fails and rolls back. A whole-document restore of `before` would
+        // erase B; reverting only A's delta must not.
+        p.revert_state_delta(&before, &after).unwrap();
+
+        assert!(
+            matches!(
+                p.allow_request("RemoveContainerRequest", &req_b).await,
+                Ok((true, _))
+            ),
+            "a concurrently created container must survive another request's rollback"
+        );
+        assert!(
+            matches!(
+                p.allow_request("SignalProcessRequest", &req_a).await,
+                Ok((true, _))
+            ),
+            "the rolled-back container must still be reachable"
+        );
     }
 
     struct TestCase {
