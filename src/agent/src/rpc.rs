@@ -5,7 +5,6 @@
 
 use async_trait::async_trait;
 #[cfg(feature = "agent-policy")]
-#[cfg(not(feature = "strict-policy"))]
 use kata_agent_policy::policy::PolicyCopyFileRequest;
 use pathrs::flags::OpenFlags;
 use rustjail::{pipestream::PipeStream, process::StreamType};
@@ -15,7 +14,6 @@ use tokio::time::{timeout, Duration};
 
 use std::convert::TryFrom;
 #[cfg(feature = "agent-policy")]
-#[cfg(not(feature = "strict-policy"))]
 use std::convert::TryInto as _;
 use std::ffi::{CString, OsStr};
 use std::fmt::Debug;
@@ -36,7 +34,6 @@ use cgroups::FreezerState;
 use oci::{Hooks, LinuxNamespace, Spec};
 use oci_spec::runtime as oci;
 #[cfg(feature = "agent-policy")]
-#[cfg(not(feature = "strict-policy"))]
 use protobuf::MessageDyn;
 use protobuf::MessageField;
 use protocols::agent::{
@@ -105,7 +102,6 @@ use crate::tracer::extract_carrier_from_ttrpc;
 use crate::policy::do_set_policy;
 #[cfg(feature = "agent-policy")]
 use crate::policy::is_allowed;
-#[cfg(not(feature = "strict-policy"))]
 use crate::policy::is_allowed_with_entrypoint;
 
 use opentelemetry::global;
@@ -272,6 +268,11 @@ impl AgentService {
         // transformer runs, so we can compare it to the executed spec after resolution.
         #[cfg(feature = "strict-policy")]
         let authorized_oci_digest = plan_digest(&oci);
+        // Retain the authorized object itself, not just its digest: a digest can only
+        // report *that* the plan changed, and FR-3 needs to decide whether the specific
+        // change was one the resolution chain is permitted to make.
+        #[cfg(feature = "strict-policy")]
+        let authorized_oci = oci.clone();
 
         info!(sl(), "receive createcontainer, spec: {:?}", &oci);
         info!(
@@ -357,14 +358,18 @@ impl AgentService {
         // write spec to bundle path, hooks might
         // read ocispec
         let olddir = setup_bundle(&cid, &mut oci)?;
-        // restore the cwd for kata-agent process.
+        // restore the cwd for kata-agent process. Registered immediately, so that an
+        // early return from the checks below cannot leave the agent process parked in
+        // the container bundle directory.
+        defer!(unistd::chdir(&olddir).unwrap());
 
         // FR-3 (canonical object): the OCI spec is now fully resolved (devices, CDI,
         // storage, sealed secrets, namespaces, guest hooks). Bind the digest of this
         // executed object to the create transaction and compare it to the digest of the
         // authorized spec captured before transformation. Divergence is expected (trusted
-        // in-guest transforms) and is recorded for audit; the executed object is bound to
-        // the transaction so the authorized->executed relationship is explicit.
+        // in-guest transforms) but is not unlimited: it is checked against the bounds the
+        // resolution chain is allowed to move within, so that "the plan the policy
+        // authorized" and "the plan the runtime executes" remain the same plan.
         //
         // The binding is only meaningful against the transaction the caller actually
         // prepared, so the caller passes its operation id down rather than this code
@@ -377,25 +382,32 @@ impl AgentService {
                 .lock()
                 .await
                 .attach_executed(op_id, executed_oci_digest.clone())
+                // Keep the SrmError typed rather than stringifying it: this call is a
+                // quarantine gate (F-40), and create_container maps the error back to a
+                // ttrpc code with `srm_code` by downcasting. An `anyhow!` here would
+                // flatten a quarantine into INTERNAL, which the shim reads as "bad
+                // request" and retries — the exact confusion RM-7's DATA_LOSS code exists
+                // to prevent.
                 .map_err(|e| {
-                    anyhow!(
-                        "FR-3: failed to bind executed OCI object to {}: {:?}",
-                        op_id,
-                        e
-                    )
+                    anyhow::Error::new(e).context(format!(
+                        "FR-3: failed to bind executed OCI object to {}",
+                        op_id
+                    ))
                 })?;
-            if authorized_oci_digest != executed_oci_digest {
-                info!(
-                    sl(),
-                    "FR-3: executed OCI object differs from authorized spec (trusted \
-                     in-guest transforms applied); canonical-object binding recorded";
-                    "container-id" => &cid,
-                    "authorized-oci-digest" => &authorized_oci_digest,
-                    "executed-oci-digest" => &executed_oci_digest,
-                );
-            }
+            // The digests routinely differ, which on its own says nothing: the
+            // resolution chain legitimately rewrites parts of the spec. What must
+            // not differ is anything the policy actually decided on. C-ACI/hcsshim
+            // obtains this property by ordering -- it evaluates policy on the
+            // already transformed spec -- so authorizing first, as we do, means the
+            // relationship has to be re-established explicitly here.
+            enforce_plan_binding(
+                &cid,
+                &authorized_oci,
+                &authorized_oci_digest,
+                &oci,
+                &executed_oci_digest,
+            )?;
         }
-        defer!(unistd::chdir(&olddir).unwrap());
 
         // determine which cgroup driver to take and then assign to use_systemd_cgroup
         // systemd: "[slice]:[prefix]:[name]"
@@ -464,12 +476,41 @@ impl AgentService {
         // FR-9/FR-11: the container now exists. Record its occurrence in the `created`
         // state and bind the trusted-resolved CDI devices to it, so lifecycle and device
         // handles are tracked against the enforcer's own occurrence (not the host alias).
+        //
+        // F-35: these results must not be discarded. A failure here means the occurrence
+        // registry has diverged from the sandbox, and the container is already started and
+        // registered while `create_container`'s error arm does not tear it down -- so
+        // returning an error on its own would leave a running, untracked container.
+        // Quarantining first is what makes the error safe to return: no further SRM-gated
+        // operation is authorized afterwards, so the untracked container cannot be exec'd
+        // into, signalled or given new devices, and the shim is told DATA_LOSS (RM-7)
+        // rather than a retryable INTERNAL.
+        //
+        // No production path reaches this today: a duplicate create is answered from the
+        // SRM replay cache before it gets here. This is defence in depth against a future
+        // divergence between the transaction log and the occurrence registry.
+        //
+        // The occurrence lock is taken as a temporary inside the `let`, so it is released
+        // before the monitor lock is acquired below. Nothing in this file ever holds both,
+        // and nothing should start to.
         #[cfg(feature = "strict-policy")]
         {
-            let mut occ = crate::OCCURRENCES.lock().await;
-            let _ = occ.create(&cid, None, None);
-            for d in &verified_cdi_devices {
-                let _ = occ.bind_device(&cid, &d.device, &d.spec_digest);
+            let outcome = record_occurrence(
+                &mut *crate::OCCURRENCES.lock().await,
+                &cid,
+                &verified_cdi_devices,
+            );
+            if let Err(e) = outcome {
+                let reason = format!(
+                    "occurrence registry diverged while recording container {}: {}",
+                    cid, e
+                );
+                error!(sl(), "{}", reason);
+                crate::SRM.lock().await.quarantine(reason.clone());
+                return Err(anyhow::Error::new(
+                    kata_security_reference_monitor::SrmError::Quarantined(reason),
+                )
+                .context("failed to record the container occurrence"));
             }
         }
 
@@ -583,8 +624,13 @@ impl AgentService {
     // FR-3: compute the signal that will actually be delivered, matching the rewrite in
     // do_signal_process (a container init process with no SIGTERM handler receives SIGKILL).
     // Called before authorization so the policy authorizes the effective signal.
+    //
+    // RM-8: also reports whether that delivery is *lethal* — i.e. it terminates the target
+    // without running any guest-defined handler. Only a lethal delivery is teardown. A
+    // SIGTERM that will be caught by a handler asks a running workload to run new code,
+    // which is exactly the property used to exclude SIGHUP/SIGUSR1 from the exemption.
     #[cfg(feature = "strict-policy")]
-    async fn effective_signal(&self, cid: &str, eid: &str, requested: u32) -> u32 {
+    async fn effective_signal(&self, cid: &str, eid: &str, requested: u32) -> (u32, bool) {
         let sig: libc::c_int = requested as libc::c_int;
         let all = eid.is_empty() && sig == libc::SIGKILL;
         if !all {
@@ -595,11 +641,14 @@ impl AgentService {
                     && sig == libc::SIGTERM
                     && !is_signal_handled(&proc_status_file, sig as u32)
                 {
-                    return libc::SIGKILL as u32;
+                    return (libc::SIGKILL as u32, true);
                 }
             }
         }
-        requested
+        // SIGKILL is uncatchable, so it is always lethal. Everything else — including a
+        // SIGTERM that reached here unrewritten, meaning it is either handled or targets a
+        // non-init process — may run guest code and is not teardown.
+        (requested, sig == libc::SIGKILL)
     }
 
     async fn do_signal_process(&self, req: protocols::agent::SignalProcessRequest) -> Result<()> {
@@ -1031,6 +1080,21 @@ impl agent_ttrpc::AgentService for AgentService {
     ) -> ttrpc::Result<Empty> {
         trace_rpc_call!(ctx, "create_container", req);
 
+        // BL-8 fail-closed gate. The measured base policy may declare policy fragments that
+        // the host is responsible for delivering (the guest has no network of its own — see
+        // policy_fragments.rs). Refuse to create anything while a declaration the policy
+        // marked `required: true` is undelivered, otherwise a host that simply never pushes
+        // would get the workload running under a policy missing grants it was measured to
+        // include. Declarations without that flag are lazy (C-ACI/hcsshim behaviour) and do
+        // not gate: an undelivered fragment grants nothing, so it cannot widen what runs.
+        //
+        // Before is_allowed(), because the point is that the active policy is not yet the
+        // policy that was measured — its verdict is not the one to act on.
+        #[cfg(feature = "strict-policy")]
+        crate::policy_fragments::assert_all_declared_satisfied()
+            .await
+            .map_err(|e| ttrpc_error(ttrpc::Code::FAILED_PRECONDITION, e))?;
+
         // FR-6: snapshot policy state before authorization. The policy applies its
         // pstate mutations during is_allowed; if the create fails we restore this
         // snapshot so no committed enforcer state survives a failed operation.
@@ -1071,7 +1135,7 @@ impl agent_ttrpc::AgentService for AgentService {
                         // pstate. Without this the enforcer keeps a phantom entry for a
                         // container that was never created.
                         rollback_policy_state(&policy_snapshot, "create_container prepare").await;
-                        return Err(ttrpc_error(ttrpc::Code::FAILED_PRECONDITION, e));
+                        return Err(ttrpc_error(srm_code(&e), e));
                     }
                 }
                 // From here on every exit must resolve the transaction; the guard covers
@@ -1081,7 +1145,7 @@ impl agent_ttrpc::AgentService for AgentService {
                     drop(srm);
                     guard.disarm();
                     rollback_policy_state(&policy_snapshot, "create_container execute").await;
-                    return Err(ttrpc_error(ttrpc::Code::INTERNAL, e));
+                    return Err(ttrpc_error(srm_code(&e), e));
                 }
                 guard
             };
@@ -1103,7 +1167,14 @@ impl agent_ttrpc::AgentService for AgentService {
                     txn_guard.disarm();
                     // Roll back the policy pstate mutations applied during authorization.
                     rollback_policy_state(&policy_snapshot, "create_container").await;
-                    Err(ttrpc_error(ttrpc::Code::INTERNAL, e))
+                    // RM-7: an SrmError that reached us from inside do_create_container
+                    // (the FR-3 executed-object binding) keeps its own terminal code, so a
+                    // quarantine arrives as DATA_LOSS rather than as an INTERNAL the shim
+                    // would retry.
+                    let code = e
+                        .downcast_ref::<kata_security_reference_monitor::SrmError>()
+                        .map_or(ttrpc::Code::INTERNAL, srm_code);
+                    Err(ttrpc_error(code, e))
                 }
             };
         }
@@ -1123,31 +1194,124 @@ impl agent_ttrpc::AgentService for AgentService {
         req: protocols::agent::StartContainerRequest,
     ) -> ttrpc::Result<Empty> {
         trace_rpc_call!(ctx, "start_container", req);
+
+        // FR-6: bracket authorization with a policy-state snapshot, as the other gated
+        // handlers do. `StartContainerRequest` emits no `ops` under the reference policy,
+        // so there is normally nothing to revert -- but that is a property of one policy,
+        // not of the request, so every failure path below unwinds it.
+        #[cfg(feature = "strict-policy")]
+        let policy_before = crate::AGENT_POLICY.lock().await.snapshot_state().ok();
+
         is_allowed(&req).await?;
+
+        #[cfg(feature = "strict-policy")]
+        let policy_snapshot = capture_policy_snapshot(policy_before).await;
 
         // FR-9: a container may only be started from the `created` state. This rejects
         // start-before-create and double-start against the enforcer's own occurrence
         // record (the host container_id is an untrusted alias).
         #[cfg(feature = "strict-policy")]
-        crate::OCCURRENCES
-            .lock()
-            .await
-            .start(&req.container_id)
-            .map_err(|e| ttrpc_error(ttrpc::Code::FAILED_PRECONDITION, e))?;
+        if let Err(e) = crate::OCCURRENCES.lock().await.start(&req.container_id) {
+            rollback_policy_state(&policy_snapshot, "start_container occurrence").await;
+            return Err(ttrpc_error(ttrpc::Code::FAILED_PRECONDITION, e));
+        }
 
+        // FR-6: start is the point at which a container's capability actually
+        // materialises -- until then it is a bundle on disk with no process. Leaving it
+        // ungated meant a quarantined monitor still admitted it, so the set of operations
+        // reachable from a degraded guest was not purely destructive, and it was the only
+        // edge in create -> start -> signal -> remove with no audit record and no refusal
+        // of a duplicate in flight.
         #[cfg(feature = "strict-policy")]
         {
+            use kata_security_reference_monitor::Prepared;
+
+            // Namespaced by kind: the create for this container is keyed `create/<cid>`,
+            // and an un-kinded start would collide with the create it follows.
+            let op_id = srm_op_id("start", &[&req.container_id]);
+            let digest = plan_digest(&req);
+            let txn_guard = {
+                let mut srm = crate::SRM.lock().await;
+                let version = srm.state_version();
+                // Deliberately `prepare`, not `prepare_teardown`: a start builds
+                // capability, so it must be refused while the monitor is quarantined.
+                let prepared = srm.prepare(op_id.clone(), version, digest.clone());
+                let guard = srm.guard(&op_id);
+                drop(srm);
+                match prepared {
+                    Ok(Prepared::New) => {}
+                    // A double start is already refused by the occurrence registry above,
+                    // so a committed transaction here means the operation id was reused
+                    // rather than that this is a legitimate replay. Refuse instead of
+                    // reporting a start that did not happen. Reaching this arm should be
+                    // impossible: the transaction is retired the moment the start commits.
+                    Ok(Prepared::AlreadyCommitted(_)) => {
+                        guard.disarm();
+                        unstart_or_warn(&req.container_id).await;
+                        rollback_policy_state(&policy_snapshot, "duplicate start_container").await;
+                        return Err(ttrpc_error(
+                            ttrpc::Code::FAILED_PRECONDITION,
+                            format!("start transaction {op_id} already committed"),
+                        ));
+                    }
+                    Err(e) => {
+                        guard.disarm();
+                        unstart_or_warn(&req.container_id).await;
+                        rollback_policy_state(&policy_snapshot, "start_container prepare").await;
+                        return Err(ttrpc_error(srm_code(&e), e));
+                    }
+                }
+                let mut srm = crate::SRM.lock().await;
+                if let Err(e) = srm.execute(&op_id, &digest) {
+                    abort_or_quarantine(&mut srm, &op_id, "start_container execute");
+                    drop(srm);
+                    guard.disarm();
+                    unstart_or_warn(&req.container_id).await;
+                    rollback_policy_state(&policy_snapshot, "start_container execute").await;
+                    return Err(ttrpc_error(srm_code(&e), e));
+                }
+                guard
+            };
+
             return match self.do_start_container(req.clone()).await {
                 Ok(_) => {
                     // FR-14: a workload container is now running; freeze the network so
-                    // post-start network mutation is refused.
+                    // post-start network mutation is refused. Do this before recording the
+                    // commit: a freeze without a commit costs availability, a commit
+                    // without a freeze costs containment, and the host controls when this
+                    // future is cancelled (ttrpc honours its `timeout_nano`).
                     crate::NET_PHASE.lock().await.to_workload_running();
+                    {
+                        let mut srm = crate::SRM.lock().await;
+                        commit_or_quarantine(
+                            &mut srm,
+                            &op_id,
+                            "container-started",
+                            "start_container",
+                        );
+                        // Retire immediately, as `exec_process` does. A committed
+                        // transaction is a replay-cache entry, and this one would buy
+                        // nothing -- a double start is already refused by the occurrence
+                        // registry -- while `remove_container` is the only other place
+                        // that could free it. Retiring there instead is not sound: a
+                        // removal racing this start finds the transaction still `Executed`,
+                        // its retire fails, and the id is then stranded `Committed` with no
+                        // owner left, making the container id permanently unstartable.
+                        retire_or_warn(&mut srm, &op_id);
+                    }
+                    txn_guard.disarm();
                     Ok(Empty::new())
                 }
                 Err(e) => {
+                    {
+                        let mut srm = crate::SRM.lock().await;
+                        abort_or_quarantine(&mut srm, &op_id, "start_container");
+                    }
+                    txn_guard.disarm();
                     // Runtime start failed: roll the occurrence back to `created` so the
                     // trusted state matches reality and a legitimate retry is possible.
-                    let _ = crate::OCCURRENCES.lock().await.remove(&req.container_id);
+                    unstart_or_warn(&req.container_id).await;
+                    rollback_policy_state(&policy_snapshot, "start_container").await;
                     Err(ttrpc_error(ttrpc::Code::INTERNAL, e))
                 }
             };
@@ -1196,7 +1360,10 @@ impl agent_ttrpc::AgentService for AgentService {
             let txn_guard = {
                 let mut srm = crate::SRM.lock().await;
                 let version = srm.state_version();
-                let prepared = srm.prepare(op_id.clone(), version, digest.clone());
+                let prepared = srm.prepare_teardown(op_id.clone(), version, digest.clone());
+                // RM-8: removal only tears capability down, so it stays available while
+                // the monitor is quarantined; otherwise a degraded sandbox cannot be
+                // cleaned up at all and the host's only recourse is sandbox-level destroy.
                 // Take the guard under the same lock acquisition that prepared the
                 // transaction. The lock has to be released before `rollback_policy_state`
                 // (which acquires AGENT_POLICY then SRM, so holding SRM here would invert
@@ -1226,7 +1393,7 @@ impl agent_ttrpc::AgentService for AgentService {
                         // `prepare` failed, so no transaction of ours is in flight.
                         guard.disarm();
                         rollback_policy_state(&policy_snapshot, "remove_container prepare").await;
-                        return Err(ttrpc_error(ttrpc::Code::FAILED_PRECONDITION, e));
+                        return Err(ttrpc_error(srm_code(&e), e));
                     }
                 }
                 let mut srm = crate::SRM.lock().await;
@@ -1235,7 +1402,7 @@ impl agent_ttrpc::AgentService for AgentService {
                     drop(srm);
                     guard.disarm();
                     rollback_policy_state(&policy_snapshot, "remove_container execute").await;
-                    return Err(ttrpc_error(ttrpc::Code::INTERNAL, e));
+                    return Err(ttrpc_error(srm_code(&e), e));
                 }
                 guard
             };
@@ -1250,9 +1417,12 @@ impl agent_ttrpc::AgentService for AgentService {
                             "container-removed",
                             "remove_container",
                         );
-                        // The container id is now free again. Retire both transactions so
-                        // a later create for the same id is a genuinely new operation
-                        // rather than an idempotent replay of the create just undone.
+                        // The container id is now free again. Retire every transaction
+                        // keyed on it -- the create and the removal itself -- so a later
+                        // create for the same id is a genuinely new operation rather than
+                        // an idempotent replay of the one just undone. The start
+                        // transaction is retired by `start_container` on commit and so is
+                        // never outstanding here.
                         let create_op_id = srm_op_id("create", &[&req.container_id]);
                         for id in [&create_op_id, &op_id] {
                             retire_or_warn(&mut srm, id);
@@ -1261,7 +1431,23 @@ impl agent_ttrpc::AgentService for AgentService {
                     txn_guard.disarm();
                     // FR-9: retire the occurrence. Its alias may not be operated on again
                     // until a fresh create re-mints it with a new generation.
-                    let _ = crate::OCCURRENCES.lock().await.remove(&req.container_id);
+                    //
+                    // F-35: log-and-continue rather than propagate or quarantine. `remove`
+                    // returns `Err` only when there was no live occurrence to retire in the
+                    // first place -- every non-removed state is an allowed source -- so a
+                    // failure here strands nothing, and a later create for this alias mints
+                    // a fresh generation regardless. The result is still not discarded: it
+                    // is the only signal that the registry and the transaction log disagree
+                    // about whether this container ever existed.
+                    if let Err(e) = crate::OCCURRENCES.lock().await.remove(&req.container_id) {
+                        error!(
+                            sl(),
+                            "no live occurrence to retire for {} after removing the container: \
+                             {:?}; the occurrence registry disagrees with the transaction log",
+                            req.container_id,
+                            e
+                        );
+                    }
                     Ok(Empty::new())
                 }
                 Err(e) => {
@@ -1356,7 +1542,7 @@ impl agent_ttrpc::AgentService for AgentService {
                         drop(srm);
                         guard.disarm();
                         rollback_policy_state(&policy_snapshot, "exec_process prepare").await;
-                        return Err(ttrpc_error(ttrpc::Code::FAILED_PRECONDITION, e));
+                        return Err(ttrpc_error(srm_code(&e), e));
                     }
                 }
                 // From here on every exit must resolve the transaction; the guard covers
@@ -1366,7 +1552,7 @@ impl agent_ttrpc::AgentService for AgentService {
                     drop(srm);
                     guard.disarm();
                     rollback_policy_state(&policy_snapshot, "exec_process execute").await;
-                    return Err(ttrpc_error(ttrpc::Code::INTERNAL, e));
+                    return Err(ttrpc_error(srm_code(&e), e));
                 }
                 guard
             };
@@ -1410,12 +1596,13 @@ impl agent_ttrpc::AgentService for AgentService {
         // authorizes (and the transaction digests) the signal that is actually delivered
         // (authorized == executed), rather than the requested one.
         #[cfg(feature = "strict-policy")]
-        let req = {
+        let (req, lethal) = {
             let mut req = req;
-            req.signal = self
+            let (sig, lethal) = self
                 .effective_signal(&req.container_id, &req.exec_id, req.signal)
                 .await;
-            req
+            req.signal = sig;
+            (req, lethal)
         };
 
         is_allowed(&req).await?;
@@ -1455,13 +1642,28 @@ impl agent_ttrpc::AgentService for AgentService {
             // back, and snapshotting on every signal would serialize the whole enforcer
             // data blob twice on a hot path. If a future policy revision starts mutating
             // state in this rule, bracket it the way `exec_process` does.
+            //
+            // RM-8: a stop signal only tears capability down, so it stays available while
+            // the monitor is quarantined -- otherwise a degraded sandbox cannot be stopped
+            // gracefully and the host's only recourse is sandbox-level destroy. The test is
+            // *lethal delivery*, not the signal number: `effective_signal` reports whether
+            // the signal terminates the target without running guest code (SIGKILL, or a
+            // SIGTERM it rewrote to SIGKILL for an unhandled init). A SIGTERM that will be
+            // caught by a handler, like SIGHUP or SIGUSR1, asks a running workload to do
+            // something new, so it stays gated.
+            let teardown = lethal && is_teardown_signal(req.signal);
             let txn_guard = {
                 let mut srm = crate::SRM.lock().await;
                 let version = srm.state_version();
-                match srm.prepare(op_id.clone(), version, digest.clone()) {
+                let prepared = if teardown {
+                    srm.prepare_teardown(op_id.clone(), version, digest.clone())
+                } else {
+                    srm.prepare(op_id.clone(), version, digest.clone())
+                };
+                match prepared {
                     Ok(Prepared::AlreadyCommitted(_)) => return Ok(Empty::new()),
                     Ok(Prepared::New) => {}
-                    Err(e) => return Err(ttrpc_error(ttrpc::Code::FAILED_PRECONDITION, e)),
+                    Err(e) => return Err(ttrpc_error(srm_code(&e), e)),
                 }
                 // From here on every exit must resolve the transaction; the guard covers
                 // the paths that never run, i.e. this future being dropped mid-flight.
@@ -1470,7 +1672,7 @@ impl agent_ttrpc::AgentService for AgentService {
                     abort_or_quarantine(&mut srm, &op_id, "signal_process execute");
                     drop(srm);
                     guard.disarm();
-                    return Err(ttrpc_error(ttrpc::Code::INTERNAL, e));
+                    return Err(ttrpc_error(srm_code(&e), e));
                 }
                 guard
             };
@@ -2221,24 +2423,11 @@ impl agent_ttrpc::AgentService for AgentService {
     ) -> ttrpc::Result<Empty> {
         trace_rpc_call!(ctx, "copy_file", req);
 
-        // FR-10: a generic host->guest file copy lands host-chosen bytes at a host-chosen
-        // path with no content-addressing or execution-integrity guarantee. Strict builds
-        // refuse it outright (the safe default); trusted artifacts must instead arrive
-        // through a content-addressed, destination-classed channel. Advertised as
-        // "no-generic-copyfile" in the agent build features.
-        #[cfg(feature = "strict-policy")]
-        {
-            let _ = &req;
-            return Err(ttrpc_error(
-                ttrpc::Code::PERMISSION_DENIED,
-                anyhow!(
-                    "CopyFile is disabled in strict mode (no execution-integrity guarantee \
-                     for generic host-delivered files)"
-                ),
-            ));
-        }
-
-        #[cfg(not(feature = "strict-policy"))]
+        // F-42 step-1 experiment: strict builds no longer deny CopyFile outright. The
+        // request is routed through the policy gate that already existed on the non-strict
+        // path. PolicyCopyFileRequest exposes path, file_type, symlink_target, file_size,
+        // file_mode, dir_mode, uid, gid and offset to Rego -- strictly more than C-ACI's
+        // plan9_mount, which sees only the destination path.
         {
             #[cfg(feature = "agent-policy")]
             {
@@ -2415,35 +2604,59 @@ impl agent_ttrpc::AgentService for AgentService {
                 )
             })?)
         };
-        let fragment = kata_security_reference_monitor::PolicyFragment {
-            issuer: req.issuer.clone(),
-            feed: req.feed.clone(),
-            svn: req.svn,
-            grants: req.grants.to_vec(),
-            policy_module: policy_module.clone(),
-            includes: req.includes.to_vec(),
-            requires: req.requires.to_vec(),
-            receipt: if req.receipt.is_empty() {
-                None
-            } else {
-                Some(req.receipt.clone())
-            },
-            receipt_ledger: if req.receipt_ledger.is_empty() {
-                None
-            } else {
-                Some(req.receipt_ledger.clone())
-            },
-            prev_log_head: if req.prev_log_head.is_empty() {
-                None
-            } else {
-                Some(req.prev_log_head.clone())
-            },
-            receipt_proof: if req.receipt_proof.is_empty() {
-                None
-            } else {
-                Some(req.receipt_proof.clone())
-            },
-            signature: req.signature.clone(),
+        // BL-8: an hcsshim-shaped push carries only the COSE envelope — the host fetched
+        // bytes it cannot read. Derive the signed fields from the envelope itself rather
+        // than making the caller restate them. Verification binds the two either way
+        // (`verify_cose` requires the payload to equal `signing_bytes()`), so this removes
+        // a needless failure mode, not a check. The receipt fields are not covered by the
+        // issuer signature, so they must still come from the request.
+        let fragment = if req.issuer.is_empty() && !req.cose_sign1.is_empty() {
+            let mut f = kata_security_reference_monitor::PolicyFragment::from_cose_envelope(
+                &req.cose_sign1,
+            )
+            .ok_or_else(|| {
+                ttrpc_error(
+                    ttrpc::Code::INVALID_ARGUMENT,
+                    "cose_sign1 is not a decodable policy-fragment envelope".to_string(),
+                )
+            })?;
+            f.receipt = (!req.receipt.is_empty()).then(|| req.receipt.clone());
+            f.receipt_ledger = (!req.receipt_ledger.is_empty()).then(|| req.receipt_ledger.clone());
+            f.receipt_proof = (!req.receipt_proof.is_empty()).then(|| req.receipt_proof.clone());
+            f.extra_receipts = parse_extra_receipts(&req.extra_receipts)?;
+            f
+        } else {
+            kata_security_reference_monitor::PolicyFragment {
+                issuer: req.issuer.clone(),
+                feed: req.feed.clone(),
+                svn: req.svn,
+                grants: req.grants.to_vec(),
+                policy_module: policy_module.clone(),
+                includes: req.includes.to_vec(),
+                requires: req.requires.to_vec(),
+                receipt: if req.receipt.is_empty() {
+                    None
+                } else {
+                    Some(req.receipt.clone())
+                },
+                receipt_ledger: if req.receipt_ledger.is_empty() {
+                    None
+                } else {
+                    Some(req.receipt_ledger.clone())
+                },
+                prev_log_head: if req.prev_log_head.is_empty() {
+                    None
+                } else {
+                    Some(req.prev_log_head.clone())
+                },
+                receipt_proof: if req.receipt_proof.is_empty() {
+                    None
+                } else {
+                    Some(req.receipt_proof.clone())
+                },
+                signature: req.signature.clone(),
+                extra_receipts: parse_extra_receipts(&req.extra_receipts)?,
+            }
         };
 
         // FR-1a: verify → apply → commit, atomically. Verification does not mutate the
@@ -2473,17 +2686,50 @@ impl agent_ttrpc::AgentService for AgentService {
             r.map_err(|e| ttrpc_error(ttrpc::Code::FAILED_PRECONDITION, e))?
         };
 
-        if let Some(module) = &verified.policy_module {
-            crate::AGENT_POLICY
-                .lock()
-                .await
-                .apply_fragment_module(
-                    &format!("fragment:{}:{}", verified.issuer, verified.svn),
-                    module,
+        // FR-1c: the fragment's own `includes` says where it *wants* to contribute; the
+        // measured policy says where it *may*. Take the intersection, so neither side can
+        // widen the other, and honour a grant that withholds module injection entirely.
+        //
+        // Without this the fragment was the sole authority over its own namespace, which
+        // let any trust-root-authorized issuer populate a namespace the base policy meant a
+        // different issuer to fill (F-62). hcsshim reads `includes` off the matched
+        // candidate declaration for exactly this reason.
+        let scope = {
+            let store = crate::FRAGMENTS.lock().await;
+            store.module_scope(&verified.issuer, &verified.feed)
+        };
+
+        let fragment_package = match &verified.policy_module {
+            Some(module) if scope.allow_module => {
+                let effective = crate::policy_fragments::effective_namespaces(
+                    &scope.namespaces,
                     &verified.includes,
+                );
+                Some(
+                    crate::AGENT_POLICY
+                        .lock()
+                        .await
+                        .apply_fragment_module(
+                            &format!("fragment:{}:{}", verified.issuer, verified.svn),
+                            module,
+                            &verified.feed,
+                            &effective,
+                            scope.parameters.as_deref(),
+                        )
+                        .map_err(|e| ttrpc_error(ttrpc::Code::FAILED_PRECONDITION, e))?,
                 )
-                .map_err(|e| ttrpc_error(ttrpc::Code::FAILED_PRECONDITION, e))?;
-        }
+            }
+            Some(_) => {
+                info!(
+                    sl(),
+                    "policy-fragments: fragment {} accepted but its module was not applied — \
+                     the measured grant for this feed sets allow_module = false",
+                    verified.feed
+                );
+                None
+            }
+            None => None,
+        };
 
         // FR-1i: persist the SVN high-water marks after commit so an agent restart cannot
         // reopen a rollback window. The store on the (encrypted-scratch / sealed) path is
@@ -2493,6 +2739,43 @@ impl agent_ttrpc::AgentService for AgentService {
             store.commit(&verified);
             crate::persist_fragment_svn_state(&store.export_svn_state());
         }
+
+        // BL-8: this delivery may satisfy a fragment the measured base policy declared.
+        // Cross-check it against that declaration — a valid signature over the wrong issuer,
+        // or an SVN under the measured per-feed floor, must not clear the requirement.
+        // Deliberately after commit, so the SVN/ordering chain still advances exactly as it
+        // does for any other verified fragment; this gate governs whether containers may
+        // start, not whether the fragment was genuine.
+        crate::policy_fragments::satisfy_declared_fragment(
+            &verified.issuer,
+            &verified.feed,
+            verified.svn,
+        )
+        .await
+        .map_err(|e| ttrpc_error(ttrpc::Code::FAILED_PRECONDITION, e))?;
+
+        // BL-8: a fragment may carry fragment declarations of its own, in its signed module.
+        // They are honoured only if the declaration that authorized *this* fragment enabled
+        // delegation, and only within the issuer scope it set; everything else is dropped.
+        //
+        // Read after commit and injection so the declarations come from the module the
+        // engine actually accepted, and so a fragment that failed verification never gets to
+        // influence the feed allow-list.
+        if let Some(pkg) = fragment_package {
+            let nested = crate::AGENT_POLICY
+                .lock()
+                .await
+                .nested_fragment_specs(&pkg)
+                .map_err(|e| ttrpc_error(ttrpc::Code::FAILED_PRECONDITION, e))?;
+            crate::policy_fragments::register_nested_fragments(
+                &verified.issuer,
+                &verified.feed,
+                nested,
+            )
+            .await
+            .map_err(|e| ttrpc_error(ttrpc::Code::FAILED_PRECONDITION, e))?;
+        }
+
         Ok(Empty::new())
     }
 
@@ -2612,6 +2895,35 @@ impl health_ttrpc::Health for HealthService {
     }
 }
 
+/// FR-1f (trust list): parse `extra_receipts` wire entries of the form `<ledger>=<hex sig>`.
+///
+/// Ledger and signature are carried in one string rather than as parallel lists so the two
+/// cannot be misaligned by a truncated or reordered request — a mismatch would silently
+/// check a signature against the wrong ledger's keys. A malformed entry is rejected rather
+/// than skipped: dropping it would quietly weaken a conjunctive requirement into one the
+/// remaining receipts happen to satisfy.
+#[cfg(feature = "strict-policy")]
+fn parse_extra_receipts(entries: &[String]) -> ttrpc::Result<Vec<(String, String)>> {
+    entries
+        .iter()
+        .map(|e| {
+            let (ledger, sig) = e.split_once('=').ok_or_else(|| {
+                ttrpc_error(
+                    ttrpc::Code::INVALID_ARGUMENT,
+                    "extra_receipts entry must be <ledger>=<hex signature>".to_string(),
+                )
+            })?;
+            if ledger.is_empty() || sig.is_empty() {
+                return Err(ttrpc_error(
+                    ttrpc::Code::INVALID_ARGUMENT,
+                    "extra_receipts entry has an empty ledger or signature".to_string(),
+                ));
+            }
+            Ok((ledger.to_string(), sig.to_string()))
+        })
+        .collect()
+}
+
 fn get_memory_info(
     block_size: bool,
     hotplug: bool,
@@ -2719,10 +3031,11 @@ fn plan_digest<T: serde::Serialize>(req: &T) -> String {
 /// the agent quarantines the reference monitor instead, which refuses all further
 /// transactions.
 ///
-/// Note that this is not as gentle as it sounds. `SignalProcess` and `RemoveContainer` are
-/// both transactions, so a quarantined monitor cannot gracefully stop or remove a
-/// container; only sandbox-level teardown, which is not SRM-gated, still works. See RM-8
-/// in `docs/cc/backlog.md`.
+/// Note that this is not as gentle as it sounds. Every SRM-gated RPC that builds or alters
+/// capability is refused from here on, and the shim learns of it on its next such call --
+/// as `DATA_LOSS` (RM-7), so it can tell a degraded guest from a bad request. RM-8 keeps
+/// teardown working: `RemoveContainer` and a stop signal prepare as teardown transactions,
+/// so the sandbox can still be shut down gracefully rather than only destroyed wholesale.
 #[cfg(feature = "strict-policy")]
 async fn rollback_policy_state(snapshot: &Option<PolicySnapshot>, context: &str) {
     let Some(snap) = snapshot else {
@@ -2799,6 +3112,52 @@ fn abort_or_quarantine(
     }
 }
 
+/// FR-9: roll a container's occurrence back to `created` after a failed start.
+///
+/// `remove()` must not be used here -- it is terminal, and would leave the container
+/// permanently unstartable while releasing its cardinality slot (F-34).
+#[cfg(feature = "strict-policy")]
+async fn unstart_or_warn(container_id: &str) {
+    if let Err(e) = crate::OCCURRENCES.lock().await.unstart(container_id) {
+        error!(
+            sl(),
+            "failed to roll occurrence {} back to created after a failed start: {:?}; \
+             the container is left unstartable",
+            container_id,
+            e
+        );
+    }
+}
+
+/// FR-9/FR-11: record a freshly created container's occurrence and bind its devices.
+///
+/// Split out of `do_create_container` so the failure ordering is directly testable.
+///
+/// The ordering is the point. `create` failing means an occurrence is already live for
+/// this alias, so binding into it anyway would attribute *this* container's devices to the
+/// previous one and `devices()` would report the union of two containers' grants -- an
+/// FR-11 integrity break. The loop is therefore skipped entirely when `create` fails.
+///
+/// The `?` on `bind_device` is defence in depth rather than a live guard: against today's
+/// registry it cannot fire, because `bind_device` refuses only an absent or already-removed
+/// alias and a successful `create` guarantees neither. It is there so that a future
+/// registry whose binds *can* fail stops at the first one instead of walking the rest.
+/// Note that no unwinding happens on that path: the occurrence is left partially bound and
+/// the caller quarantines, which is what stops anything further being authorized against
+/// an occurrence that under-reports what its container holds.
+#[cfg(feature = "strict-policy")]
+fn record_occurrence(
+    occ: &mut kata_security_reference_monitor::OccurrenceRegistry,
+    cid: &str,
+    devices: &[kata_security_reference_monitor::VerifiedCdiDevice],
+) -> Result<(), kata_security_reference_monitor::OccurrenceError> {
+    occ.create(cid, None, None)?;
+    for d in devices {
+        occ.bind_device(cid, &d.device, &d.spec_digest)?;
+    }
+    Ok(())
+}
+
 /// FR-6 / RM-4: build an operation id that no other operation can be confused with.
 ///
 /// Operation ids are assembled from container and exec ids, and under this threat model
@@ -2825,6 +3184,40 @@ fn srm_op_id(kind: &str, parts: &[&str]) -> String {
         id.push_str(part);
     }
     id
+}
+
+/// RM-8: is this (already effective) signal number a stop signal?
+///
+/// A *necessary* condition for teardown, not a sufficient one: the caller must also
+/// establish that the delivery is lethal (see `effective_signal`), because a SIGTERM with a
+/// handler installed runs guest code rather than terminating the target. Everything else --
+/// SIGHUP to reload, SIGUSR1 to rotate -- asks a running workload to do something new,
+/// which is exactly what a quarantine must keep refusing.
+#[cfg(feature = "strict-policy")]
+fn is_teardown_signal(signal: u32) -> bool {
+    signal == libc::SIGTERM as u32 || signal == libc::SIGKILL as u32
+}
+
+/// RM-7: map an SRM failure onto a ttrpc status code.
+///
+/// `Quarantined` gets its own terminal code so the shim can tell "this request was
+/// invalid" from "this guest is degraded and no SRM-gated request will ever succeed
+/// again". Every other `SrmError` is a per-request precondition failure and stays
+/// `FAILED_PRECONDITION`, which the shim may reasonably retry after fixing the request.
+///
+/// Because a commit failure quarantines while still returning success to its caller (see
+/// [`commit_or_quarantine`]), the shim's first sight of a degraded guest is the *next*
+/// SRM-gated call. Without a distinct code that arrives as an opaque
+/// `FAILED_PRECONDITION`, indistinguishable from a malformed request, and the shim keeps
+/// retrying. `DATA_LOSS` says what actually happened: state the monitor was tracking is no
+/// longer provable. The correct response is to tear the sandbox down, and RM-8 keeps
+/// teardown available for exactly that.
+#[cfg(feature = "strict-policy")]
+fn srm_code(e: &kata_security_reference_monitor::SrmError) -> ttrpc::Code {
+    match e {
+        kata_security_reference_monitor::SrmError::Quarantined(_) => ttrpc::Code::DATA_LOSS,
+        _ => ttrpc::Code::FAILED_PRECONDITION,
+    }
 }
 
 /// FR-6: record a successful operation, quarantining the monitor if that fails.
@@ -3338,6 +3731,69 @@ async fn do_add_swap_path(req: &AddSwapPathRequest) -> Result<()> {
     Ok(())
 }
 
+/// The rootfs the guest prepares for `cid`, and the only path a created
+/// container may be rooted at.
+///
+/// `setup_bundle` rebinds the host-supplied rootfs here, and the FR-3 plan
+/// binding pins the executed spec's `/root/path` to this value. Both derive it
+/// from this one function so they cannot drift apart: a change to the bundle
+/// layout that bypassed the pin would silently re-open the re-rooting gap.
+pub fn container_rootfs_path(cid: &str) -> PathBuf {
+    Path::new(CONTAINER_BASE).join(cid).join("rootfs")
+}
+
+/// FR-3: decide whether the plan about to be executed is still the plan the
+/// policy authorized, and deny the operation if it is not.
+///
+/// This lives apart from `do_create_container` so the agent's own enforcement
+/// decision can be exercised directly. `plan_binding`'s unit tests only ever see
+/// specs a test hands them; they cannot see which expected rootfs `rpc.rs`
+/// passes, that the denial is returned rather than logged, or that the check is
+/// reached at all. A regression that downgraded this to an audit-only `info!`
+/// would leave every one of those tests green.
+///
+/// The check runs unconditionally: a spec whose digest is unchanged still has to
+/// satisfy the pinned-root invariant rather than inheriting a pass from equality.
+#[cfg(feature = "strict-policy")]
+fn enforce_plan_binding(
+    cid: &str,
+    authorized_oci: &Spec,
+    authorized_oci_digest: &str,
+    executed_oci: &Spec,
+    executed_oci_digest: &str,
+) -> Result<()> {
+    crate::plan_binding::assert_within_resolution_bounds(
+        authorized_oci,
+        executed_oci,
+        &container_rootfs_path(cid),
+    )
+    .inspect_err(|e| {
+        error!(
+            sl(),
+            "FR-3: refusing to create container; the executed OCI object escapes \
+             the bounds of the authorized plan";
+            "container-id" => cid,
+            "authorized-oci-digest" => authorized_oci_digest,
+            "executed-oci-digest" => executed_oci_digest,
+            "violation" => e.to_string(),
+        );
+    })?;
+
+    if authorized_oci_digest != executed_oci_digest {
+        info!(
+            sl(),
+            "FR-3: executed OCI object differs from authorized spec (trusted \
+             in-guest transforms applied, within resolution bounds); \
+             canonical-object binding recorded";
+            "container-id" => cid,
+            "authorized-oci-digest" => authorized_oci_digest,
+            "executed-oci-digest" => executed_oci_digest,
+        );
+    }
+
+    Ok(())
+}
+
 // Setup container bundle under CONTAINER_BASE, which is cleaned up
 // before removing a container.
 // - bundle path is /<CONTAINER_BASE>/<cid>/
@@ -3353,7 +3809,7 @@ pub fn setup_bundle(cid: &str, spec: &mut Spec) -> Result<PathBuf> {
 
     let bundle_path = Path::new(CONTAINER_BASE).join(cid);
     let config_path = bundle_path.join("config.json");
-    let rootfs_path = bundle_path.join("rootfs");
+    let rootfs_path = container_rootfs_path(cid);
     let spec_root_path = spec_root.path();
 
     let rootfs_exists = Path::new(&rootfs_path).exists();
@@ -4613,6 +5069,19 @@ COMMIT
         }
     }
 
+    // Only runs without `agent-policy`, where `is_allowed` is the no-op stub.
+    //
+    // `get_oom_event` calls `is_allowed` as its first statement, and a freshly constructed
+    // `AgentPolicy` has an empty engine with `allow_failures = false`, so in any policy build
+    // the query returns no results and the handler fails before it reaches the `recv()` this
+    // test is exercising. That is a defect in the *test*, not the handler: the lock discipline
+    // under test lives after the policy gate and is configuration-independent.
+    //
+    // The correct fix is to install a permissive policy on `AGENT_POLICY` before spawning the
+    // handlers, which would let this run under `strict-policy` too. Deferred (F-22): note that
+    // `AgentPolicy::set_policy` is one-shot under `strict-policy`, so that fix wants a shared
+    // one-time helper rather than an inline call, or a second such test will fail closed.
+    #[cfg(not(feature = "agent-policy"))]
     #[tokio::test]
     async fn test_get_oom_event_no_deadlock() {
         let logger = slog::Logger::root(slog::Discard, o!());
@@ -5055,20 +5524,209 @@ COMMIT
     #[cfg(feature = "strict-policy")]
     mod srm_integration {
         use super::*;
-        use kata_security_reference_monitor::{Prepared, ReferenceMonitor, SrmError, TxnState};
+        use kata_security_reference_monitor::{
+            OccurrenceError, OccurrenceRegistry, Prepared, ReferenceMonitor, SrmError, TxnState,
+            VerifiedCdiDevice,
+        };
 
-        /// The four operation ids `rpc.rs` builds, as the call sites build them.
+        /// The five operation ids `rpc.rs` builds, as the call sites build them.
         fn all_op_ids(cid: &str, exec: &str, signal: u32) -> Vec<String> {
             vec![
                 srm_op_id("create", &[cid]),
+                srm_op_id("start", &[cid]),
                 srm_op_id("remove", &[cid]),
                 srm_op_id("exec", &[cid, exec]),
                 srm_op_id("signal", &[cid, exec, &signal.to_string()]),
             ]
         }
 
+        const BOUND_CID: &str = "bound-ctr";
+
+        /// A spec as the host supplies it, rooted where the host asked.
+        fn authorized_spec() -> serde_json::Value {
+            serde_json::json!({
+                "ociVersion": "1.0.2",
+                "root": { "path": "/host/supplied/rootfs", "readonly": true },
+                "mounts": [{ "destination": "/proc", "type": "proc", "source": "proc" }],
+                "process": {
+                    "args": ["/bin/sh", "-c", "echo hello"],
+                    "cwd": "/",
+                    "user": { "uid": 1000, "gid": 1000 }
+                },
+                "linux": { "namespaces": [{ "type": "pid" }] }
+            })
+        }
+
+        /// The same spec after the in-guest chain has run: `setup_bundle` has
+        /// rebound the rootfs to the path the guest derived.
+        fn executed_spec() -> serde_json::Value {
+            let mut spec = authorized_spec();
+            spec["root"]["path"] =
+                serde_json::json!(container_rootfs_path(BOUND_CID).to_str().unwrap());
+            spec
+        }
+
+        fn spec_of(value: serde_json::Value) -> Spec {
+            serde_json::from_value(value).expect("test spec should deserialize")
+        }
+
+        /// Run the binding exactly as `do_create_container` does, digests included.
+        fn bind(authorized: serde_json::Value, executed: serde_json::Value) -> Result<()> {
+            let authorized = spec_of(authorized);
+            let executed = spec_of(executed);
+            enforce_plan_binding(
+                BOUND_CID,
+                &authorized,
+                &plan_digest(&authorized),
+                &executed,
+                &plan_digest(&executed),
+            )
+        }
+
+        /// FR-3: the resolved plan reaches the runtime only if it is still the
+        /// plan the policy authorized.
+        ///
+        /// `plan_binding`'s own tests compare specs a test hands them; they never
+        /// see the expected rootfs `rpc.rs` derives, nor whether the verdict is
+        /// returned or merely logged. These exercise the agent's decision.
         #[test]
-        fn the_four_operation_kinds_never_share_an_id() {
+        fn the_resolved_plan_is_admitted_when_only_trusted_transforms_ran() {
+            let mut executed = executed_spec();
+            // update_container_namespaces rewrites namespaces; storage and device
+            // handling append mounts.
+            executed["linux"]["namespaces"] = serde_json::json!([{ "type": "ipc" }]);
+            executed["mounts"] = serde_json::json!([
+                { "destination": "/proc", "type": "proc", "source": "proc" },
+                { "destination": "/dev/shm", "type": "tmpfs", "source": "shm" }
+            ]);
+
+            bind(authorized_spec(), executed)
+                .expect("trusted in-guest transforms must not fail the create");
+        }
+
+        #[test]
+        fn a_plan_mutated_outside_the_resolution_bounds_fails_the_create() {
+            let mut executed = executed_spec();
+            executed["process"]["args"] = serde_json::json!(["/bin/sh", "-c", "exfiltrate"]);
+
+            // The verdict must be returned. An audit-only downgrade here would
+            // leave every `plan_binding` unit test green.
+            let err = bind(authorized_spec(), executed)
+                .expect_err("a plan the policy never authorized must fail the create");
+            assert!(
+                err.to_string().contains("plan binding violation"),
+                "unexpected error: {}",
+                err
+            );
+        }
+
+        #[test]
+        fn the_created_container_is_rooted_only_where_the_guest_prepared() {
+            let mut executed = executed_spec();
+            executed["root"]["path"] = serde_json::json!("/run/kata-containers/other/rootfs");
+
+            let err = bind(authorized_spec(), executed)
+                .expect_err("a re-rooted container must fail the create");
+            assert!(
+                err.to_string().contains("is rooted at"),
+                "unexpected error: {}",
+                err
+            );
+        }
+
+        /// The binding is not conditional on the digests differing: a plan that
+        /// survived resolution untouched still has to be rooted where the guest
+        /// prepared, or the host's own rootfs would pass unexamined.
+        #[test]
+        fn an_unchanged_plan_is_still_held_to_the_pinned_rootfs() {
+            let host_rooted = authorized_spec();
+            assert_eq!(
+                plan_digest(&spec_of(host_rooted.clone())),
+                plan_digest(&spec_of(host_rooted.clone())),
+                "the two sides of this case must be digest-identical"
+            );
+
+            let err = bind(host_rooted.clone(), host_rooted)
+                .expect_err("an unmodified but host-rooted plan must fail the create");
+            assert!(
+                err.to_string().contains("is rooted at"),
+                "unexpected error: {}",
+                err
+            );
+        }
+
+        /// FR-3: the binding is only sound if the two objects it compares are
+        /// captured at the right moments, and that is a property of the *order*
+        /// of statements in `do_create_container`, not of any value the tests
+        /// above can observe.
+        ///
+        /// The tests above prove that `enforce_plan_binding` decides correctly
+        /// once it is called with an authorized object and an executed one. They
+        /// cannot see (a) that `authorized_oci` is cloned before the first
+        /// in-guest transformer runs, nor (b) that the check is reached after
+        /// `setup_bundle` has rebound the rootfs. A regression that moved the
+        /// clone below `add_devices` would authorize an already-transformed
+        /// spec against itself; one that moved the check above `setup_bundle`
+        /// would compare the plan before the rebinding it exists to police.
+        /// Either leaves every other test in this module green.
+        ///
+        /// Asserting this end to end means driving `do_create_container`, which
+        /// needs `baremount` and therefore root — it would be `skip_if_not_root!`
+        /// gated and skipped in ordinary runs, i.e. no coverage where the
+        /// regression would actually land. Reading the ordering out of the source
+        /// is coarse, but it runs everywhere and fails loudly on exactly the
+        /// rearrangement described above.
+        #[test]
+        fn the_authorized_object_is_captured_before_the_guest_transforms_it() {
+            const SOURCE: &str = include_str!("rpc.rs");
+
+            // Bound the search to the body of `do_create_container`, so that the
+            // anchors this test names in its own source cannot satisfy it.
+            let start = SOURCE
+                .find("    async fn do_create_container(")
+                .expect("do_create_container should be present");
+            let end = start
+                + SOURCE[start + 1..]
+                    .find("\n    async fn ")
+                    .expect("do_create_container should be followed by another method");
+            let body = &SOURCE[start..end];
+
+            let offset_of = |anchor: &str| -> usize {
+                assert_eq!(
+                    body.matches(anchor).count(),
+                    1,
+                    "anchor is no longer unique within do_create_container, so this \
+                     test can no longer tell where it sits: {}",
+                    anchor
+                );
+                body.find(anchor).unwrap()
+            };
+
+            let clone_of_authorized = offset_of("let authorized_oci = oci.clone();");
+            let first_transform =
+                offset_of("add_devices(&cid, &sl(), &req.devices, &mut oci, &self.sandbox)");
+            let rootfs_rebinding = offset_of("let olddir = setup_bundle(&cid, &mut oci)?;");
+            let binding_check = offset_of("enforce_plan_binding(");
+
+            // (a) Nothing may transform `oci` between the host handing it over and
+            // the clone, or the "authorized" object is one the guest already edited.
+            assert!(
+                clone_of_authorized < first_transform,
+                "authorized_oci is cloned after add_devices: the object being \
+                 authorized has already been transformed in-guest"
+            );
+
+            // (b) The executed object must be the fully resolved one, which is only
+            // true once setup_bundle has rebound the rootfs.
+            assert!(
+                rootfs_rebinding < binding_check,
+                "enforce_plan_binding runs before setup_bundle: it would compare \
+                 the plan before the rootfs rebinding it exists to police"
+            );
+        }
+
+        #[test]
+        fn the_operation_kinds_never_share_an_id() {
             let ids = all_op_ids("ctr1", "exec1", 15);
             let unique: std::collections::HashSet<_> = ids.iter().collect();
             assert_eq!(
@@ -5286,6 +5944,266 @@ COMMIT
                 m.prepare(create, m.state_version(), "d3").unwrap(),
                 Prepared::New
             );
+        }
+
+        /// RM-7: a quarantine must be distinguishable from a bad request. Everything else
+        /// stays `FAILED_PRECONDITION`, which the shim may retry after fixing the request.
+        #[test]
+        fn only_a_quarantine_maps_to_data_loss() {
+            assert_eq!(
+                srm_code(&SrmError::Quarantined("unprovable".into())),
+                ttrpc::Code::DATA_LOSS
+            );
+            for e in [
+                SrmError::StaleStateVersion {
+                    expected: 1,
+                    current: 2,
+                },
+                SrmError::UnknownOperation("op".into()),
+                SrmError::InvalidState {
+                    op: "op".into(),
+                    state: TxnState::Prepared,
+                },
+                SrmError::PlanMismatch {
+                    authorized: "a".into(),
+                    presented: "b".into(),
+                },
+                SrmError::ExecutedDigestAlreadyBound {
+                    op: "op".into(),
+                    bound: "a".into(),
+                    presented: "b".into(),
+                },
+            ] {
+                assert_eq!(
+                    srm_code(&e),
+                    ttrpc::Code::FAILED_PRECONDITION,
+                    "{} is a per-request failure, not a degraded guest",
+                    e
+                );
+            }
+        }
+
+        /// RM-7 regression: `do_create_container` performs the FR-3 executed-object
+        /// binding, which is quarantine-gated (F-40). It is the only SRM call that
+        /// returns its error through `anyhow` rather than being mapped by `srm_code` at
+        /// the call site, so `create_container`'s error arm recovers the code by
+        /// downcasting. Stringifying the error there — which is what the code used to do —
+        /// flattens a quarantine into INTERNAL, and the shim reads INTERNAL as "malformed
+        /// request" and retries a guest that can never succeed again.
+        #[test]
+        fn an_srm_error_keeps_its_code_through_the_create_container_boundary() {
+            let wrapped = anyhow::Error::new(SrmError::Quarantined("unprovable".into()))
+                .context("FR-3: failed to bind executed OCI object to op");
+
+            let code = wrapped
+                .downcast_ref::<SrmError>()
+                .map_or(ttrpc::Code::INTERNAL, srm_code);
+
+            assert_eq!(
+                code,
+                ttrpc::Code::DATA_LOSS,
+                "a quarantine raised inside do_create_container must not reach the shim \
+                 as a retryable INTERNAL"
+            );
+
+            let opaque = anyhow!("some unrelated create failure");
+            assert_eq!(
+                opaque
+                    .downcast_ref::<SrmError>()
+                    .map_or(ttrpc::Code::INTERNAL, srm_code),
+                ttrpc::Code::INTERNAL,
+                "non-SRM failures must keep the original INTERNAL mapping"
+            );
+        }
+
+        /// F-35: an occurrence that could not be created must not be bound into.
+        ///
+        /// `create` fails only when a live occurrence already holds the alias. The old
+        /// code discarded that error and ran the bind loop anyway, appending the new
+        /// container's devices to the *stale* occurrence — so `devices()` returned the
+        /// union of two containers' grants, which is an FR-11 integrity break.
+        #[test]
+        fn a_failed_occurrence_create_binds_no_devices() {
+            let mut occ = OccurrenceRegistry::default();
+            occ.create("ctr1", None, None).unwrap();
+            occ.bind_device("ctr1", "vendor.com/gpu=0", "sha256:aaa")
+                .unwrap();
+
+            let devices = vec![VerifiedCdiDevice {
+                device: "vendor.com/gpu=1".into(),
+                spec_digest: "sha256:bbb".into(),
+            }];
+
+            assert_eq!(
+                record_occurrence(&mut occ, "ctr1", &devices),
+                Err(OccurrenceError::AliasInUse("ctr1".into())),
+                "a second create for a live alias must be refused, not silently ignored"
+            );
+            assert_eq!(
+                occ.devices("ctr1").map(<[_]>::to_vec),
+                Some(vec![(
+                    "vendor.com/gpu=0".to_string(),
+                    "sha256:aaa".to_string()
+                )]),
+                "the incoming container's devices must not be attributed to the \
+                 occurrence that already held the alias"
+            );
+        }
+
+        /// F-35: the happy path still binds every verified device.
+        #[test]
+        fn a_successful_occurrence_create_binds_every_device() {
+            let mut occ = OccurrenceRegistry::default();
+            let devices = vec![
+                VerifiedCdiDevice {
+                    device: "vendor.com/gpu=0".into(),
+                    spec_digest: "sha256:aaa".into(),
+                },
+                VerifiedCdiDevice {
+                    device: "vendor.com/gpu=1".into(),
+                    spec_digest: "sha256:bbb".into(),
+                },
+            ];
+
+            assert_eq!(record_occurrence(&mut occ, "ctr1", &devices), Ok(()));
+            assert_eq!(
+                occ.devices("ctr1").map(<[_]>::len),
+                Some(2),
+                "every trusted-resolved device must be bound to the new occurrence"
+            );
+        }
+
+        /// F-35: a bind failure cannot be reached through today's registry, and the test
+        /// suite should say so rather than pretend otherwise.
+        ///
+        /// `bind_device` refuses only an absent or already-removed alias, and a successful
+        /// `create` leaves the alias present and `Created`. So the `?` in
+        /// `record_occurrence`'s loop is unreachable by construction. This test pins that
+        /// premise: if a later change makes a bind fail mid-loop, this assertion breaks and
+        /// forces the loop-break behaviour to be given a real test.
+        #[test]
+        fn no_bind_can_fail_once_the_occurrence_was_created() {
+            let mut occ = OccurrenceRegistry::default();
+            occ.create("ctr1", None, None).unwrap();
+            for i in 0..3 {
+                assert_eq!(
+                    occ.bind_device("ctr1", format!("vendor.com/gpu={}", i), "sha256:aaa"),
+                    Ok(()),
+                    "binding into a freshly created occurrence must not fail; if this ever \
+                     regresses, record_occurrence's loop-break needs a real test"
+                );
+            }
+        }
+
+        /// RM-8: only stop signals are teardown. Misclassifying, say, SIGHUP would let a
+        /// quarantined monitor be told to reload a running workload.
+        #[test]
+        fn only_stop_signals_count_as_teardown() {
+            for sig in [libc::SIGTERM, libc::SIGKILL] {
+                assert!(is_teardown_signal(sig as u32), "signal {} tears down", sig);
+            }
+            for sig in [libc::SIGHUP, libc::SIGUSR1, libc::SIGUSR2, libc::SIGINT] {
+                assert!(
+                    !is_teardown_signal(sig as u32),
+                    "signal {} keeps the workload running and must stay gated",
+                    sig
+                );
+            }
+        }
+
+        /// RM-8 end to end at this layer: the ids and call order `remove_container` and
+        /// `signal_process` use must still work once the monitor is quarantined, while the
+        /// build-up paths (`create_container`, `exec_process`) stay refused.
+        #[test]
+        fn a_quarantined_monitor_can_still_be_torn_down() {
+            let mut m = ReferenceMonitor::new();
+            let create = srm_op_id("create", &["ctr1"]);
+            m.prepare(create.clone(), 0, "d1").unwrap();
+            m.execute(&create, "d1").unwrap();
+            m.commit(&create, "container-created").unwrap();
+
+            m.quarantine("policy state rollback failed after exec_process");
+
+            for gated in [
+                srm_op_id("create", &["ctr2"]),
+                srm_op_id("exec", &["ctr1", "e1"]),
+            ] {
+                assert!(
+                    matches!(
+                        m.prepare(gated.clone(), m.state_version(), "d"),
+                        Err(SrmError::Quarantined(_))
+                    ),
+                    "{} builds capability and must stay refused",
+                    gated
+                );
+            }
+
+            // A non-teardown signal is still gated ...
+            let hup = srm_op_id(
+                "signal",
+                &["ctr1", "e1", &(libc::SIGHUP as u32).to_string()],
+            );
+            assert!(matches!(
+                m.prepare(hup, m.state_version(), "d"),
+                Err(SrmError::Quarantined(_))
+            ));
+
+            // ... but SIGKILL then removal complete, the same way the handlers drive them.
+            let kill = srm_op_id(
+                "signal",
+                &["ctr1", "e1", &(libc::SIGKILL as u32).to_string()],
+            );
+            m.prepare_teardown(kill.clone(), m.state_version(), "d2")
+                .unwrap();
+            m.execute(&kill, "d2").unwrap();
+            commit_or_quarantine(&mut m, &kill, "signal-delivered", "signal_process");
+            retire_or_warn(&mut m, &kill);
+
+            let remove = srm_op_id("remove", &["ctr1"]);
+            m.prepare_teardown(remove.clone(), m.state_version(), "d3")
+                .unwrap();
+            m.execute(&remove, "d3").unwrap();
+            commit_or_quarantine(&mut m, &remove, "container-removed", "remove_container");
+            assert_eq!(
+                m.transaction(&remove).map(|t| t.state.clone()),
+                Some(TxnState::Committed),
+                "teardown must commit even while quarantined"
+            );
+        }
+
+        /// F-39: a start builds capability, so a quarantined monitor must refuse it --
+        /// even for a container whose create committed before the quarantine. This asserts
+        /// the *monitor* property the handler now relies on: that `prepare` (as opposed to
+        /// `prepare_teardown`) is refused under quarantine for an already-created
+        /// container. It does not exercise `start_container` itself -- see the F-39 notes
+        /// for why a handler-level barrier is not available here.
+        #[test]
+        fn a_quarantined_monitor_refuses_to_start_an_already_created_container() {
+            let mut m = ReferenceMonitor::new();
+            let create = srm_op_id("create", &["ctr1"]);
+            m.prepare(create.clone(), 0, "d1").unwrap();
+            m.execute(&create, "d1").unwrap();
+            m.commit(&create, "container-created").unwrap();
+
+            // The container exists and is startable at this point.
+            let start = srm_op_id("start", &["ctr1"]);
+            assert!(m.prepare(start.clone(), m.state_version(), "d2").is_ok());
+            m.abort(&start).unwrap();
+
+            m.quarantine("policy state rollback failed after exec_process");
+
+            assert!(
+                matches!(
+                    m.prepare(start.clone(), m.state_version(), "d2"),
+                    Err(SrmError::Quarantined(_))
+                ),
+                "start materialises the container's capability and must be refused"
+            );
+
+            // Teardown of the same container is still admitted, so the sandbox can be
+            // cleaned up rather than left with a created-but-unstartable container.
+            let remove = srm_op_id("remove", &["ctr1"]);
+            assert!(m.prepare_teardown(remove, m.state_version(), "d3").is_ok());
         }
     }
 }

@@ -78,6 +78,15 @@ pub struct PolicyFragment {
     /// the previously-seen tree head. Verified against the transparency trust list; proves
     /// the fragment is recorded in — and the log has only grown since the last — tree head.
     pub receipt_proof: Option<String>,
+    /// FR-1f (trust list): additional Stage-1 countersignatures, as `(ledger, signature)`
+    /// pairs, each a detached signature over [`PolicyFragment::signing_bytes`].
+    ///
+    /// A scope's requirement list is a conjunction, so "countersigned by the vendor *and*
+    /// logged publicly" needs more than one receipt to be satisfiable at all. Like the
+    /// primary `receipt`, these are not part of the signed statement — a receipt is a
+    /// countersignature *over* the statement and so cannot be inside it — which is why
+    /// carrying several needs no statement-format bump.
+    pub extra_receipts: Vec<(String, String)>,
     /// Detached Ed25519 signature (by the issuer) over [`PolicyFragment::signing_bytes`].
     pub signature: Vec<u8>,
 }
@@ -157,6 +166,7 @@ impl PolicyFragment {
             receipt_ledger: None,
             prev_log_head,
             receipt_proof: None,
+            extra_receipts: Vec::new(),
             signature: Vec::new(),
         })
     }
@@ -269,6 +279,11 @@ pub enum FragmentError {
     /// FR-1f (trust list): a receipt is required from a specific ledger for this scope, but
     /// the presented receipt originates from a different (or unspecified) ledger.
     ReceiptFromDisallowedLedger { required: String, presented: String },
+    /// FR-1f (trust list): a scope requirement entry (`*` or `TTL:<subject>`) was not met by
+    /// any validated receipt. Ledger-name entries report as
+    /// [`ReceiptFromDisallowedLedger`](FragmentError::ReceiptFromDisallowedLedger) instead,
+    /// so existing single-ledger configurations keep the error they had.
+    UnsatisfiedReceiptRequirement { requirement: String },
     /// FR-1e: the fragment's `(issuer, feed)` pair is not declared/accepted.
     UndeclaredFeed { issuer: String, feed: String },
     /// FR-1g: a required (dependency) fragment has not been loaded.
@@ -325,6 +340,10 @@ impl fmt::Display for FragmentError {
                 f,
                 "receipt required from ledger {required:?}, but presented from {presented:?}"
             ),
+            FragmentError::UnsatisfiedReceiptRequirement { requirement } => write!(
+                f,
+                "no validated transparency receipt satisfies requirement {requirement:?}"
+            ),
             FragmentError::UndeclaredFeed { issuer, feed } => {
                 write!(f, "undeclared fragment feed: issuer {issuer}, feed {feed:?}")
             }
@@ -375,7 +394,7 @@ pub struct FragmentStore {
     /// non-empty, a fragment's receipt is cryptographically verified against the selected
     /// ledger's keys. BL-2: each key carries its algorithm (EdDSA/ES256/ES384/PS256/RS256),
     /// so a ledger may sign receipts/tree-heads with any supported scheme.
-    transparency_trust_list: HashMap<String, Vec<(PublicKey, CoseAlg)>>,
+    transparency_trust_list: HashMap<String, Vec<TrustListKey>>,
     /// FR-1f (trust list): per-`(issuer, feed)` allow-list of ledger ids. A receipt whose
     /// ledger is not in this list (when the list is non-empty) is rejected.
     allowed_ledgers: HashMap<(String, String), Vec<String>>,
@@ -405,6 +424,154 @@ pub struct FragmentStore {
     /// Monotonic (raise-only by size) and persisted, so the external log cannot be rewound
     /// across a restart.
     ttl_heads: HashMap<String, (u64, [u8; 32])>,
+    /// FR-1c: per-`(issuer, feed)` grant of *which* policy namespaces a fragment may
+    /// contribute a module to, and whether its module may be applied at all.
+    ///
+    /// The measured policy owns this, not the fragment. See [`ModuleScope`].
+    module_scope: HashMap<(String, String), ModuleScope>,
+}
+
+/// FR-1f (trust list): a verification key for a transparency ledger, together with the
+/// Trust List subject(s) that vouched for it.
+///
+/// The provenance matters because a policy may want to require not merely "a receipt from
+/// ledger L" but "a receipt validated by a key that Trust List S vouched for". A ledger can
+/// hold keys contributed by more than one Trust List, and the two requirements are not the
+/// same: the ledger id is self-asserted metadata carried on the receipt, whereas the subject
+/// is a property of the measured key material that actually validated it. Mirrors hcsshim's
+/// `TTL:<subject>` receipt requirement form.
+#[derive(Clone)]
+pub struct TrustListKey {
+    pub key: PublicKey,
+    pub alg: CoseAlg,
+    /// Trust List subjects that supplied this key. Empty when the key came from a plain
+    /// ledger configuration with no Trust List provenance recorded.
+    pub ttl_subjects: Vec<String>,
+}
+
+impl core::fmt::Debug for TrustListKey {
+    /// Elides the key material itself — only its algorithm and provenance are of diagnostic
+    /// interest, and log lines carrying key bytes are a needless disclosure.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("TrustListKey")
+            .field("alg", &self.alg)
+            .field("ttl_subjects", &self.ttl_subjects)
+            .finish_non_exhaustive()
+    }
+}
+
+/// FR-1f (trust list): one entry of a scope's receipt requirement list.
+///
+/// The grammar matches hcsshim's, and so does the conjunction: the list is satisfied only
+/// when **every** entry is, though one receipt may satisfy several entries. Requiring all of
+/// them is the point — a list is how a policy says "countersigned by the vendor *and* logged
+/// publicly", which an any-of reading would silently downgrade to "either will do".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReceiptRequirement {
+    /// `*` — any validated receipt. Still requires a receipt to exist and to have verified.
+    Any,
+    /// `TTL:<subject>` — a receipt validated by a key the named Trust List vouched for.
+    TrustList(String),
+    /// A literal ledger id — a receipt presented under, and validated by, that ledger.
+    Ledger(String),
+}
+
+impl ReceiptRequirement {
+    /// Parse one entry. Anything without a recognised prefix is a ledger id, so existing
+    /// single-ledger configurations read exactly as they did.
+    pub fn parse(s: &str) -> Self {
+        if s == "*" {
+            ReceiptRequirement::Any
+        } else if let Some(subject) = s.strip_prefix("TTL:") {
+            ReceiptRequirement::TrustList(subject.to_string())
+        } else {
+            ReceiptRequirement::Ledger(s.to_string())
+        }
+    }
+
+    fn satisfied_by(&self, validated: &[ValidatedReceipt]) -> bool {
+        match self {
+            ReceiptRequirement::Any => !validated.is_empty(),
+            ReceiptRequirement::Ledger(l) => validated.iter().any(|r| &r.ledger == l),
+            ReceiptRequirement::TrustList(s) => validated
+                .iter()
+                .any(|r| r.ttl_subjects.iter().any(|sub| sub == s)),
+        }
+    }
+}
+
+/// A receipt that has been cryptographically verified against the trust list, recorded so a
+/// scope's requirements can be evaluated over the whole set rather than one at a time.
+#[derive(Clone, Debug)]
+struct ValidatedReceipt {
+    ledger: String,
+    ttl_subjects: Vec<String>,
+}
+
+/// Verify a detached signature against every key of a ledger, returning the union of the
+/// Trust List subjects that vouched for the keys which accepted it, or `None` if none did.
+///
+/// The union, rather than the first match, is what makes `TTL:<subject>` mean what it says:
+/// the same key material may be contributed by several Trust Lists, and a ledger may hold
+/// both vouched and unvouched copies of a key. Stopping at the first acceptance would make
+/// the outcome depend on insertion order.
+fn validating_subjects(keys: &[TrustListKey], msg: &[u8], sig: &[u8]) -> Option<Vec<String>> {
+    let mut subjects: Vec<String> = Vec::new();
+    let mut any = false;
+    for k in keys {
+        if k.key.verify_cose(k.alg, msg, sig).is_ok() {
+            any = true;
+            for s in &k.ttl_subjects {
+                if !subjects.contains(s) {
+                    subjects.push(s.clone());
+                }
+            }
+        }
+    }
+    any.then_some(subjects)
+}
+
+/// FR-1c: what a fragment for a given `(issuer, feed)` is permitted to contribute.
+///
+/// The fragment statement carries its own `includes` list, but that is the fragment
+/// *asking*, not being granted: it is signed by the fragment's issuer, so it says only what
+/// that issuer intended, and every authorized issuer would otherwise be able to claim any
+/// namespace — including one the base policy meant a different issuer to fill. The grant
+/// here comes from measured state (a `policy_fragments[]` declaration, or the trust root's
+/// feed entry), which is the same authority that decided the issuer was trusted at all.
+/// This mirrors hcsshim, where `load_fragment` passes `fragment.includes` from the matched
+/// *candidate declaration* into `update_issuer`, never the delivered fragment's own.
+///
+/// The effective scope is the intersection of the grant and the fragment's own request, so
+/// neither side can widen the other.
+#[derive(Clone, Debug)]
+pub struct ModuleScope {
+    /// Namespaces under `agent_policy.fragments.` this feed may contribute to. Empty means
+    /// only the shared `agent_policy.fragments` package is available.
+    pub namespaces: Vec<String>,
+    /// Whether the fragment's Rego module may be applied at all. `false` accepts the
+    /// fragment for its SVN, receipt and ordering record while contributing no rules —
+    /// hcsshim's `add_module` behaviour, useful for pinning a version or recording an
+    /// attestation without granting policy surface.
+    pub allow_module: bool,
+    /// FR-1k: parameter values to instantiate the fragment's Rego with, as a JSON object.
+    ///
+    /// A parameterised fragment reads these via `parameter("name")` instead of hard-coding
+    /// values, so one signed artefact can serve several deployments without being re-signed
+    /// per value. They are authority-bearing — a parameter can decide which env var value or
+    /// command a rule admits — so like the namespace grant they come from measured state,
+    /// never from the host or from the fragment itself.
+    pub parameters: Option<String>,
+}
+
+impl Default for ModuleScope {
+    fn default() -> Self {
+        Self {
+            namespaces: Vec::new(),
+            allow_module: true,
+            parameters: None,
+        }
+    }
 }
 
 impl FragmentStore {
@@ -452,6 +619,43 @@ impl FragmentStore {
         self.feeds.insert((issuer.into(), feed.into()), min_svn);
     }
 
+    /// FR-1c: grant the policy namespaces a `(issuer, feed)` may contribute a module to,
+    /// and whether its module may be applied at all.
+    ///
+    /// Called from measured state only — the BL-8 declaration in the base policy, or the
+    /// trust root's feed entry. See [`ModuleScope`] for why the fragment's own `includes`
+    /// is not sufficient authority.
+    pub fn grant_module_scope(
+        &mut self,
+        issuer: impl Into<String>,
+        feed: impl Into<String>,
+        namespaces: &[String],
+        allow_module: bool,
+        parameters: Option<String>,
+    ) {
+        self.module_scope.insert(
+            (issuer.into(), feed.into()),
+            ModuleScope {
+                namespaces: namespaces.to_vec(),
+                allow_module,
+                parameters,
+            },
+        );
+    }
+
+    /// FR-1c: the module scope granted to a `(issuer, feed)`.
+    ///
+    /// Defaults to "shared namespace only, module allowed" when nothing was granted. That
+    /// default is deliberate: it keeps a fragment that predates the grant working in the
+    /// shared `agent_policy.fragments` package, while denying it the named namespaces it
+    /// could previously have claimed for itself.
+    pub fn module_scope(&self, issuer: &str, feed: &str) -> ModuleScope {
+        self.module_scope
+            .get(&(issuer.to_string(), feed.to_string()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// FR-1f (trust list): load the Transparency Trust List — a set of `(ledger_id, keys)`
     /// entries of Ed25519 keys from measured state. Each ledger may carry multiple keys to
     /// support rotation (a receipt verifies against any current key). Invalid keys are
@@ -466,8 +670,40 @@ impl FragmentStore {
                 self.transparency_trust_list
                     .entry(id.clone())
                     .or_default()
-                    .push((pk, CoseAlg::EdDsa));
+                    .push(TrustListKey {
+                        key: pk,
+                        alg: CoseAlg::EdDsa,
+                        ttl_subjects: Vec::new(),
+                    });
             }
+        }
+        Ok(())
+    }
+
+    /// FR-1f (trust list): record which Trust List subject(s) vouched for a ledger key.
+    ///
+    /// Separate from [`load_transparency_trust_list`](Self::load_transparency_trust_list)
+    /// so that a configuration with no Trust List provenance keeps working unchanged: keys
+    /// loaded without subjects satisfy `*` and ledger-name requirements but never a
+    /// `TTL:<subject>` one, which is the correct fail-closed reading — a requirement naming
+    /// a subject nothing vouched for is unmet, not vacuously true.
+    pub fn load_trust_list_with_subjects(
+        &mut self,
+        ledger: impl Into<String>,
+        keys: &[[u8; 32]],
+        ttl_subjects: &[String],
+    ) -> Result<(), FragmentError> {
+        let ledger = ledger.into();
+        for k in keys {
+            let pk = PublicKey::from_ed25519_bytes(k).ok_or(FragmentError::InvalidSignature)?;
+            self.transparency_trust_list
+                .entry(ledger.clone())
+                .or_default()
+                .push(TrustListKey {
+                    key: pk,
+                    alg: CoseAlg::EdDsa,
+                    ttl_subjects: ttl_subjects.to_vec(),
+                });
         }
         Ok(())
     }
@@ -476,10 +712,26 @@ impl FragmentStore {
     /// SubjectPublicKeyInfo DER for EC/RSA, or an Ed25519 key). Multiple keys per ledger
     /// support rotation and mixed algorithms.
     pub fn add_ledger_key(&mut self, ledger: impl Into<String>, key: PublicKey, alg: CoseAlg) {
+        self.add_ledger_key_from_ttl(ledger, key, alg, &[]);
+    }
+
+    /// BL-2 + FR-1f: as [`add_ledger_key`](Self::add_ledger_key), recording the Trust List
+    /// subject(s) that vouched for the key.
+    pub fn add_ledger_key_from_ttl(
+        &mut self,
+        ledger: impl Into<String>,
+        key: PublicKey,
+        alg: CoseAlg,
+        ttl_subjects: &[String],
+    ) {
         self.transparency_trust_list
             .entry(ledger.into())
             .or_default()
-            .push((key, alg));
+            .push(TrustListKey {
+                key,
+                alg,
+                ttl_subjects: ttl_subjects.to_vec(),
+            });
     }
 
     /// FR-1f (trust list): scope the ledgers a receipt may originate from for a given
@@ -600,9 +852,23 @@ impl FragmentStore {
 
     /// The minimum SVN the next fragment for `(issuer, feed)` must carry (declarative floor
     /// combined with the monotonic high-water mark of accepted fragments).
+    ///
+    /// FR-1i: a named feed's floor never sinks below its issuer's. The issuer-wide floor
+    /// from the measured trust root is held at `(issuer, "")`, and a named feed carries its
+    /// own entry, so consulting only the named key let a per-feed `min_svn = 0` override a
+    /// trust root demanding 5 — accepting a fragment the attested floor forbids. Take the
+    /// stricter of the two: a per-feed floor may raise the bar, never lower it.
     fn min_required(&self, issuer: &str, feed: &str) -> u64 {
         let key = (issuer.to_string(), feed.to_string());
-        let floor = self.feeds.get(&key).copied().unwrap_or(0);
+        let mut floor = self.feeds.get(&key).copied().unwrap_or(0);
+        if !feed.is_empty() {
+            let issuer_floor = self
+                .feeds
+                .get(&(issuer.to_string(), String::new()))
+                .copied()
+                .unwrap_or(0);
+            floor = floor.max(issuer_floor);
+        }
         match self.last_svn.get(&key) {
             Some(last) => (last + 1).max(floor),
             None => floor,
@@ -738,6 +1004,11 @@ impl FragmentStore {
         let scope_requires = required.map(|r| !r.is_empty()).unwrap_or(false);
 
         let mut ttl_head: Option<(String, u64, [u8; 32])> = None;
+        // Every receipt that actually verified, with the provenance of the key that
+        // validated it. The scope's requirement list is evaluated over this set at the end,
+        // so a conjunction like ["vendor", "TTL:public-log"] can be satisfied by two
+        // different receipts.
+        let mut validated: Vec<ValidatedReceipt> = Vec::new();
 
         if !has_receipt {
             if scope_requires || self.require_receipt {
@@ -754,13 +1025,22 @@ impl FragmentStore {
                     });
                 }
             }
-            // If the scope requires a receipt from a specific ledger, enforce it.
-            if let Some(req_ledgers) = required {
-                if !req_ledgers.is_empty() && !req_ledgers.iter().any(|l| l == ledger) {
-                    return Err(FragmentError::ReceiptFromDisallowedLedger {
-                        required: req_ledgers.join(","),
-                        presented: ledger.to_string(),
-                    });
+            // With a single receipt in play, a ledger requirement it cannot possibly satisfy
+            // is reported as such up front, rather than surfacing as an `InvalidReceipt`
+            // from verifying against keys of the wrong ledger. Purely diagnostic: the
+            // conjunction below would reject these cases anyway.
+            if fragment.extra_receipts.is_empty() {
+                if let Some(req_ledgers) = required {
+                    let named: Vec<&String> = req_ledgers
+                        .iter()
+                        .filter(|r| matches!(ReceiptRequirement::parse(r), ReceiptRequirement::Ledger(_)))
+                        .collect();
+                    if !named.is_empty() && !named.iter().any(|l| l.as_str() == ledger) {
+                        return Err(FragmentError::ReceiptFromDisallowedLedger {
+                            required: req_ledgers.join(","),
+                            presented: ledger.to_string(),
+                        });
+                    }
                 }
             }
             let keys = self
@@ -773,12 +1053,12 @@ impl FragmentStore {
             // (rotation) using that key's algorithm (BL-2 multi-alg).
             if !receipt.is_empty() && !self.transparency_trust_list.is_empty() {
                 let bytes = hex_to_bytes(receipt).map_err(|_| FragmentError::InvalidReceipt)?;
-                if !keys
-                    .iter()
-                    .any(|(k, alg)| k.verify_cose(*alg, statement, &bytes).is_ok())
-                {
-                    return Err(FragmentError::InvalidReceipt);
-                }
+                let subjects = validating_subjects(keys, statement, &bytes)
+                    .ok_or(FragmentError::InvalidReceipt)?;
+                validated.push(ValidatedReceipt {
+                    ledger: ledger.to_string(),
+                    ttl_subjects: subjects,
+                });
             }
 
             // Stage 2: transparency inclusion + consistency proof.
@@ -793,12 +1073,12 @@ impl FragmentStore {
                     let stmt_hash: [u8; 32] = Sha256::digest(statement).into();
                     let root = crate::ccf::verify_ccf_inclusion(&ccf.proof_cbor, &stmt_hash)
                         .ok_or(FragmentError::InvalidInclusionProof)?;
-                    if !keys
-                        .iter()
-                        .any(|(k, alg)| k.verify_cose(*alg, &root, &ccf.sig).is_ok())
-                    {
-                        return Err(FragmentError::InvalidReceipt);
-                    }
+                    let subjects = validating_subjects(keys, &root, &ccf.sig)
+                        .ok_or(FragmentError::InvalidReceipt)?;
+                    validated.push(ValidatedReceipt {
+                        ledger: ledger.to_string(),
+                        ttl_subjects: subjects,
+                    });
                     // CCF receipts satisfy the transparency gate on their own; the native
                     // RFC 6962 tree-head/consistency checks below are skipped, and no native
                     // `ttl_head` is recorded (external ledger owns its own consistency).
@@ -807,12 +1087,12 @@ impl FragmentStore {
                         .ok_or(FragmentError::InvalidInclusionProof)?;
                     // (a) the signed tree head must be signed by a current ledger key.
                     let sth = sth_signing_bytes(ledger, tp.size, &tp.root);
-                    if !keys
-                        .iter()
-                        .any(|(k, alg)| k.verify_cose(*alg, &sth, &tp.sig).is_ok())
-                    {
-                        return Err(FragmentError::InvalidReceipt);
-                    }
+                    let subjects = validating_subjects(keys, &sth, &tp.sig)
+                        .ok_or(FragmentError::InvalidReceipt)?;
+                    validated.push(ValidatedReceipt {
+                        ledger: ledger.to_string(),
+                        ttl_subjects: subjects,
+                    });
                     // (b) the statement must be included in the tree at that head.
                     let leaf = crate::merkle::leaf_hash(statement);
                     if !crate::merkle::verify_inclusion(tp.index, tp.size, leaf, &tp.incl, &tp.root)
@@ -847,6 +1127,60 @@ impl FragmentStore {
                         }
                     }
                     ttl_head = Some((ledger.to_string(), tp.size, tp.root));
+                }
+            }
+        }
+
+        // 5b. FR-1f: additional Stage-1 countersignatures. Each must verify against a key of
+        //     the ledger it names, and that ledger must satisfy the same allow-list as the
+        //     primary receipt — an extra receipt is a receipt, not a way around the scope.
+        for (extra_ledger, extra_sig) in &fragment.extra_receipts {
+            if let Some(allowed) = self.allowed_ledgers.get(&feed_key) {
+                if !allowed.is_empty() && !allowed.iter().any(|l| l == extra_ledger) {
+                    return Err(FragmentError::LedgerNotAllowed {
+                        issuer: fragment.issuer.clone(),
+                        feed: fragment.feed.clone(),
+                        ledger: extra_ledger.clone(),
+                    });
+                }
+            }
+            let bytes = hex_to_bytes(extra_sig).map_err(|_| FragmentError::InvalidReceipt)?;
+            let keys = self
+                .transparency_trust_list
+                .get(extra_ledger)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+            let matched = validating_subjects(keys, statement, &bytes)
+                .ok_or(FragmentError::InvalidReceipt)?;
+            validated.push(ValidatedReceipt {
+                ledger: extra_ledger.clone(),
+                ttl_subjects: matched,
+            });
+        }
+
+        // 5c. FR-1f: the scope's requirement list is a conjunction — *every* entry must be
+        //     met by some validated receipt. Matches hcsshim's `fragment_receipts_ok`, which
+        //     uses `every` over `required_receipts`. A bare ledger id keeps its old meaning,
+        //     so single-entry configurations are unaffected.
+        if let Some(reqs) = required {
+            for r in reqs {
+                let req = ReceiptRequirement::parse(r);
+                if !req.satisfied_by(&validated) {
+                    return match req {
+                        ReceiptRequirement::Ledger(l) => {
+                            Err(FragmentError::ReceiptFromDisallowedLedger {
+                                required: l,
+                                presented: validated
+                                    .iter()
+                                    .map(|v| v.ledger.clone())
+                                    .collect::<Vec<_>>()
+                                    .join(","),
+                            })
+                        }
+                        _ => Err(FragmentError::UnsatisfiedReceiptRequirement {
+                            requirement: r.clone(),
+                        }),
+                    };
                 }
             }
         }
@@ -1565,11 +1899,131 @@ mod tests {
         );
     }
 
+    /// Helper: append an additional ledger-signed Stage-1 receipt, then re-sign as issuer.
+    /// Order matters: `extra_receipts` is not part of `signing_bytes`, but the issuer
+    /// signature is recomputed here so the helper is safe to call at any point.
+    fn add_extra_receipt(
+        issuer_sk: &SigningKey,
+        f: &mut PolicyFragment,
+        ledger: &str,
+        ledger_sk: &SigningKey,
+    ) {
+        let sig = ledger_sk.sign(&f.signing_bytes());
+        let hex: String = sig.to_bytes().iter().map(|b| format!("{:02x}", b)).collect();
+        f.extra_receipts.push((ledger.to_string(), hex));
+        f.signature = issuer_sk.sign(&f.signing_bytes()).to_bytes().to_vec();
+    }
+
+    /// FR-1f (trust list): `required_receipts` is a conjunction, matching hcsshim's `every`
+    /// over the list. Two named ledgers need two validated receipts; one is not enough.
+    #[test]
+    fn required_receipts_are_conjunctive() {
+        let (issuer_sk, issuer_pk) = keypair(1);
+        let (ledger_a_sk, ledger_a_pk) = keypair(20);
+        let (ledger_b_sk, ledger_b_pk) = keypair(21);
+        let mut store = FragmentStore::new(false);
+        store.authorize_issuer("issuerA", &issuer_pk).unwrap();
+        store.declare_feed("issuerA", "prod", 0);
+        store
+            .load_transparency_trust_list(&[
+                ("ledgerA".into(), vec![ledger_a_pk]),
+                ("ledgerB".into(), vec![ledger_b_pk]),
+            ])
+            .unwrap();
+        store.require_receipt_for("issuerA", "prod", &["ledgerA".into(), "ledgerB".into()]);
+
+        // Only ledgerA's receipt -> the ledgerB entry is unmet.
+        let mut one = frag_feed("issuerA", "prod", 1);
+        signed_with_receipt(&issuer_sk, &mut one, "ledgerA", &ledger_a_sk);
+        assert!(matches!(
+            store.verify(&one).unwrap_err(),
+            FragmentError::ReceiptFromDisallowedLedger { .. }
+        ));
+
+        // Both -> accepted.
+        let mut both = frag_feed("issuerA", "prod", 1);
+        signed_with_receipt(&issuer_sk, &mut both, "ledgerA", &ledger_a_sk);
+        add_extra_receipt(&issuer_sk, &mut both, "ledgerB", &ledger_b_sk);
+        assert!(store.verify(&both).is_ok(), "{:?}", store.verify(&both));
+    }
+
+    /// FR-1f (trust list): an extra receipt must itself verify — presenting a second ledger
+    /// id signed by the wrong key does not launder the requirement.
+    #[test]
+    fn extra_receipt_must_verify() {
+        let (issuer_sk, issuer_pk) = keypair(1);
+        let (ledger_a_sk, ledger_a_pk) = keypair(20);
+        let (_, ledger_b_pk) = keypair(21);
+        let mut store = FragmentStore::new(false);
+        store.authorize_issuer("issuerA", &issuer_pk).unwrap();
+        store.declare_feed("issuerA", "prod", 0);
+        store
+            .load_transparency_trust_list(&[
+                ("ledgerA".into(), vec![ledger_a_pk]),
+                ("ledgerB".into(), vec![ledger_b_pk]),
+            ])
+            .unwrap();
+        store.require_receipt_for("issuerA", "prod", &["ledgerA".into(), "ledgerB".into()]);
+
+        let mut f = frag_feed("issuerA", "prod", 1);
+        signed_with_receipt(&issuer_sk, &mut f, "ledgerA", &ledger_a_sk);
+        // ledgerB's slot is signed by ledgerA's key.
+        add_extra_receipt(&issuer_sk, &mut f, "ledgerB", &ledger_a_sk);
+        assert_eq!(store.verify(&f).unwrap_err(), FragmentError::InvalidReceipt);
+    }
+
+    /// FR-1f (trust list): `"*"` requires *a* validated receipt without naming a ledger,
+    /// and `"TTL:<subject>"` requires one validated by a key that Trust List subject
+    /// vouched for — a key with no recorded provenance does not satisfy it.
+    #[test]
+    fn wildcard_and_ttl_receipt_requirements() {
+        let (issuer_sk, issuer_pk) = keypair(1);
+        let (ledger_a_sk, ledger_a_pk) = keypair(20);
+        let mut store = FragmentStore::new(false);
+        store.authorize_issuer("issuerA", &issuer_pk).unwrap();
+        store.declare_feed("issuerA", "prod", 0);
+        store.declare_feed("issuerA", "ttl", 0);
+        // ledgerA has no Trust List provenance recorded.
+        store
+            .load_transparency_trust_list(&[("ledgerA".into(), vec![ledger_a_pk])])
+            .unwrap();
+        store.require_receipt_for("issuerA", "prod", &["*".into()]);
+        store.require_receipt_for("issuerA", "ttl", &["TTL:vendor".into()]);
+
+        // "*" is met by any validated receipt, whatever its ledger.
+        let mut any = frag_feed("issuerA", "prod", 1);
+        signed_with_receipt(&issuer_sk, &mut any, "ledgerA", &ledger_a_sk);
+        assert!(store.verify(&any).is_ok());
+
+        // "*" still requires a receipt to exist.
+        let mut none = frag_feed("issuerA", "prod", 1);
+        none.receipt = None;
+        sign(&issuer_sk, &mut none);
+        assert_eq!(
+            store.verify(&none).unwrap_err(),
+            FragmentError::MissingReceipt
+        );
+
+        // "TTL:vendor" is unmet while no key claims that subject.
+        let mut ttl = frag_feed("issuerA", "ttl", 1);
+        signed_with_receipt(&issuer_sk, &mut ttl, "ledgerA", &ledger_a_sk);
+        assert!(matches!(
+            store.verify(&ttl).unwrap_err(),
+            FragmentError::UnsatisfiedReceiptRequirement { .. }
+        ));
+
+        // Record the provenance and the same fragment is accepted.
+        let (_, ledger_a_pk2) = keypair(20);
+        store
+            .load_trust_list_with_subjects("ledgerA", &[ledger_a_pk2], &["vendor".to_string()])
+            .unwrap();
+        assert!(store.verify(&ttl).is_ok(), "{:?}", store.verify(&ttl));
+    }
+
     /// TC-F1.24 (FR-1f trust list): policy-driven `required_receipts` per feed — feed
     /// "prod" requires a receipt from a specific ledger; feed "dev" requires none.
     #[test]
-    fn per_feed_required_receipts_enforced() {
-        let (issuer_sk, issuer_pk) = keypair(1);
+    fn per_feed_required_receipts_enforced() {        let (issuer_sk, issuer_pk) = keypair(1);
         let (ledger_a_sk, ledger_a_pk) = keypair(20);
         // Global receipt requirement off; requirement is expressed per-scope instead.
         let mut store = FragmentStore::new(false);
@@ -1708,6 +2162,49 @@ mod tests {
         let mut p = frag_feed("issuerA", "prod", 10);
         sign(&sk, &mut p);
         assert!(store.load(&p).is_ok());
+    }
+
+    /// TC-F1.24 (FR-1i): a per-feed floor may raise the issuer-wide floor but never lower
+    /// it. `set_min_svn` records the trust root's issuer-wide floor under `(issuer, "")`,
+    /// while a named feed carries its own entry; consulting only the named entry let a
+    /// feed declared with `min_svn = 0` accept a fragment the attested floor forbids.
+    #[test]
+    fn per_feed_floor_cannot_sink_below_the_issuer_floor() {
+        let (sk, pk) = keypair(1);
+        let mut store = FragmentStore::new(true);
+        store.authorize_issuer("issuerA", &pk).unwrap();
+        store.set_min_svn("issuerA", 5);
+        // A laxer per-feed floor must not win.
+        store.declare_feed("issuerA", "prod", 0);
+
+        let mut below = frag_feed("issuerA", "prod", 4);
+        sign(&sk, &mut below);
+        assert!(matches!(
+            store.load(&below).unwrap_err(),
+            FragmentError::RolledBackSvn { min_required: 5, .. }
+        ));
+
+        let mut at_floor = frag_feed("issuerA", "prod", 5);
+        sign(&sk, &mut at_floor);
+        assert!(store.load(&at_floor).is_ok());
+    }
+
+    /// TC-F1.25 (FR-1i): a per-feed floor above the issuer-wide floor still binds, so the
+    /// stricter-of-the-two rule does not weaken an explicitly raised bar.
+    #[test]
+    fn per_feed_floor_above_the_issuer_floor_still_binds() {
+        let (sk, pk) = keypair(1);
+        let mut store = FragmentStore::new(true);
+        store.authorize_issuer("issuerA", &pk).unwrap();
+        store.set_min_svn("issuerA", 2);
+        store.declare_feed("issuerA", "prod", 9);
+
+        let mut below = frag_feed("issuerA", "prod", 8);
+        sign(&sk, &mut below);
+        assert!(matches!(
+            store.load(&below).unwrap_err(),
+            FragmentError::RolledBackSvn { min_required: 9, .. }
+        ));
     }
 
     /// TC-F1.15 / TC-F1.16 (FR-1f): with a transparency anchor configured, a fragment whose

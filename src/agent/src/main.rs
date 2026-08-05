@@ -87,8 +87,9 @@ mod tracer;
 #[cfg(feature = "agent-policy")]
 mod policy;
 
-// BL-8: boot-time OCI pull + SRM verify + inject of declared policy fragments. Only in
-// strict confidential builds, where the SRM `FRAGMENTS` store exists.
+// BL-8: the measured base policy's declared policy-fragment requirements, and the
+// fail-closed gate that keeps containers from starting until the host has delivered them.
+// Only in strict confidential builds, where the SRM `FRAGMENTS` store exists.
 #[cfg(feature = "strict-policy")]
 mod policy_fragments;
 
@@ -96,6 +97,11 @@ mod policy_fragments;
 // launched with (HOSTDATA / MRCONFIGID). Only in strict confidential builds.
 #[cfg(feature = "strict-policy")]
 mod hostdata;
+
+// FR-3: bounds the divergence between the OCI spec the policy authorized and the spec the
+// in-guest resolution chain actually executes. Only in strict confidential builds.
+#[cfg(feature = "strict-policy")]
+mod plan_binding;
 
 cfg_if! {
     if #[cfg(target_arch = "s390x")] {
@@ -577,21 +583,34 @@ async fn start_sandbox(
         }
     }
 
-    // BL-8: pull, SRM-verify, and inject every fragment the measured base policy declares,
-    // after the base policy is set from init-data and the fragment trust root is seeded, but
-    // before the ttRPC server serves any request. Fail-closed: abort the VM on any failure
-    // so no request is ever served under a partially-composed policy.
+    // BL-8: record the fragment requirements the measured base policy declares, after the
+    // base policy is set from init-data and the fragment trust root is seeded.
+    //
+    // The guest does NOT fetch them. This runs before rpc::start() below, and the guest's
+    // interfaces and routes are configured only by the update_interface/update_routes ttRPC
+    // handlers — so at this point there is no network at all and a pull could never
+    // succeed. Delivery is the host's job (as in C-ACI/hcsshim), arriving through
+    // rpc::load_policy_fragment; verification stays here, against the measured trust root.
+    //
+    // Fail-closed is preserved by refusing container creation while any declaration marked
+    // `required` is outstanding, not by aborting here — the bytes legitimately have not
+    // arrived yet. Declarations without that flag are lazy, as in C-ACI/hcsshim: an
+    // undelivered fragment grants nothing, so its absence cannot widen what runs. Failing to
+    // *read* the declarations is still fatal: an unreadable list must not be mistaken for an
+    // empty one.
     #[cfg(feature = "strict-policy")]
-    match policy_fragments::load_declared_fragments().await {
+    match policy_fragments::record_declared_fragments().await {
         Ok(n) if n > 0 => info!(
             logger,
-            "FR-1/BL-8: injected {} boot-declared fragment(s)", n
+            "FR-1/BL-8: {} declared fragment(s) recorded; see policy-fragments logs for which \
+             are required",
+            n
         ),
         Ok(_) => {}
         Err(e) => {
             error!(
                 logger,
-                "FR-1/BL-8: boot fragment pull failed, aborting VM: {:?}", e
+                "FR-1/BL-8: could not read declared policy fragments, aborting VM: {:?}", e
             );
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
             std::process::abort();
@@ -1112,6 +1131,14 @@ struct FragmentLedgerConfig {
     /// DER in hex plus its COSE algorithm name.
     #[serde(default)]
     key: Vec<FragmentLedgerKeyConfig>,
+    /// FR-1f (trust list): Trust List subject(s) that vouched for this ledger's keys.
+    ///
+    /// Recording provenance is what lets a scope require `TTL:<subject>` — "a receipt
+    /// validated by a key subject S vouched for" — rather than only naming the ledger,
+    /// which is self-asserted metadata on the receipt. Absent here, `TTL:` requirements
+    /// against this ledger are unmet, which is the fail-closed reading.
+    #[serde(default)]
+    ttl_subjects: Vec<String>,
 }
 
 #[cfg(feature = "strict-policy")]
@@ -1154,6 +1181,25 @@ struct FragmentFeedConfig {
     /// FR-1f (trust list): ledgers allowed to back receipts for this feed.
     #[serde(default)]
     allowed_ledgers: Vec<String>,
+    /// FR-1c: policy namespaces under `agent_policy.fragments.` a fragment on this feed may
+    /// contribute a module to. Empty grants only the shared `agent_policy.fragments`
+    /// package. The fragment's own `includes` cannot widen this.
+    #[serde(default)]
+    includes: Vec<String>,
+    /// FR-1c: whether a fragment on this feed may apply its Rego module at all. False
+    /// accepts the fragment for its SVN/receipt/ordering record but contributes no rules.
+    #[serde(default = "default_true_cfg")]
+    allow_module: bool,
+    /// FR-1k: values to instantiate a parameterised fragment on this feed with, as a TOML
+    /// table. The fragment reads them via `parameter("name")`; a name it does not supply
+    /// falls back to the fragment's own declared default.
+    #[serde(default)]
+    parameters: Option<toml::Value>,
+}
+
+#[cfg(feature = "strict-policy")]
+fn default_true_cfg() -> bool {
+    true
 }
 
 #[cfg(feature = "strict-policy")]
@@ -1225,17 +1271,15 @@ async fn seed_fragment_trust_root(logger: &Logger, initdata_cfg: Option<&str>) -
     }
     // FR-1f (trust list): load named ledgers with rotatable keys.
     if !cfg.ledger.is_empty() {
-        let mut entries: Vec<(String, Vec<[u8; 32]>)> = Vec::with_capacity(cfg.ledger.len());
         for l in &cfg.ledger {
             let mut keys = Vec::with_capacity(l.pubkey_hex.len());
             for k in &l.pubkey_hex {
                 keys.push(decode_hex32(k).with_context(|| format!("ledger {} key", l.id))?);
             }
-            entries.push((l.id.clone(), keys));
+            store
+                .load_trust_list_with_subjects(l.id.clone(), &keys, &l.ttl_subjects)
+                .map_err(|e| anyhow::anyhow!("load transparency trust list: {}", e))?;
         }
-        store
-            .load_transparency_trust_list(&entries)
-            .map_err(|e| anyhow::anyhow!("load transparency trust list: {}", e))?;
         // BL-2: additional non-Ed25519 ledger keys (ES256/ES384/PS256/RS256).
         for l in &cfg.ledger {
             for k in &l.key {
@@ -1253,7 +1297,7 @@ async fn seed_fragment_trust_root(logger: &Logger, initdata_cfg: Option<&str>) -
                     .with_context(|| format!("ledger {} spki_hex", l.id))?;
                 let pk = kata_security_reference_monitor::cose_keys::PublicKey::from_spki_der(&der)
                     .ok_or_else(|| anyhow::anyhow!("ledger {} invalid SPKI key", l.id))?;
-                store.add_ledger_key(l.id.clone(), pk, alg);
+                store.add_ledger_key_from_ttl(l.id.clone(), pk, alg, &l.ttl_subjects);
             }
         }
         info!(logger, "FR-1: transparency trust list loaded"; "ledgers" => cfg.ledger.len());
@@ -1323,6 +1367,26 @@ async fn seed_fragment_trust_root(logger: &Logger, initdata_cfg: Option<&str>) -
                     issuer.id.clone(),
                     feed.name.clone(),
                     &feed.required_receipt_from,
+                );
+            }
+            // FR-1c: the trust root is measured state, so it is a valid authority for the
+            // namespace grant on feeds the base policy does not separately declare.
+            // FR-1k: same for parameter bindings.
+            if !feed.includes.is_empty() || !feed.allow_module || feed.parameters.is_some() {
+                // Re-serialized to JSON because the policy engine takes a JSON object; the
+                // TOML table is only the authoring surface.
+                let parameters = match &feed.parameters {
+                    Some(p) => Some(serde_json::to_string(p).with_context(|| {
+                        format!("issuer {} feed {} parameters", issuer.id, feed.name)
+                    })?),
+                    None => None,
+                };
+                store.grant_module_scope(
+                    issuer.id.clone(),
+                    feed.name.clone(),
+                    &feed.includes,
+                    feed.allow_module,
+                    parameters,
                 );
             }
         }

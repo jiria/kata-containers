@@ -115,7 +115,8 @@ CreateContainerRequest := {"ops": ops, "allowed": true} if {
 
     # Check if any element from the allowed-container set (base + composed fragment
     # containers) allows the input request.
-    some idx, p_container in all_policy_containers
+    some entry in all_policy_container_entries
+    p_container := entry.container
     print("======== CreateContainerRequest: trying next policy container")
 
     p_pidns := p_container.sandbox_pidns
@@ -151,9 +152,11 @@ CreateContainerRequest := {"ops": ops, "allowed": true} if {
 
     # save to policy state
     # key: input.container_id
-    # val: index of p_container in the policy_data.containers array
+    # val: a stable reference to the policy container that authorized it. NOT its index
+    #      in the combined set: that set grows as fragments load, so an index recorded
+    #      now can name a different container later (see all_policy_container_entries).
     print("CreateContainerRequest: adding container_id=", input.container_id, " to state")
-    add_p_container_to_state := state_allows(input.container_id, idx)
+    add_p_container_to_state := state_allows(input.container_id, entry.ref)
 
     ops := concat_op_if_not_null(ret.ops, add_p_container_to_state)
 
@@ -1310,11 +1313,39 @@ allow_storages(p_storages, i_storages, bundle_id, sandbox_id) if {
 
     p_count == i_count - img_pull_count
 
+    # FR-4A: the presented storages must be a *bijection* of the declared ones, not
+    # merely an equal-sized set in which every presented storage happens to match some
+    # declaration. Count equality plus an existential match alone accepts a request that
+    # presents one declared storage twice while never presenting another: the counts
+    # still balance and both duplicates satisfy the same declaration. The two checks
+    # below close that, in both directions.
+    #
+    # 1. No presented storage may repeat another's identity.
+    storage_identities := {[s.driver, s.source, s.mount_point] | some s in i_storages}
+    print("allow_storages: distinct identities =", count(storage_identities))
+    count(storage_identities) == i_count
+
+    # 2. Every presented storage is covered by a declaration (as before) ...
     every i_storage in i_storages {
         allow_storage(p_storages, i_storage, bundle_id, sandbox_id)
     }
 
+    # ... and every declaration is covered by a presented storage, so no declared
+    # storage can be silently dropped in favour of a duplicate of another.
+    every p_storage in p_storages {
+        storage_is_presented(p_storage, i_storages, bundle_id, sandbox_id)
+    }
+
     print("allow_storages: true")
+}
+
+# FR-4A: the reverse direction of allow_storage — is this *declaration* satisfied by
+# some presented storage? Together with the count check and the duplicate rejection in
+# allow_storages this makes the declared/presented relation a bijection.
+storage_is_presented(p_storage, i_storages, bundle_id, sandbox_id) if {
+    some i_storage in i_storages
+    storage_pair_matches(p_storage, i_storage, bundle_id, sandbox_id)
+    print("storage_is_presented: true for", p_storage)
 }
 
 allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
@@ -1323,12 +1354,29 @@ allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
     print("allow_storage: p_storage =", p_storage)
     print("allow_storage: i_storage =", i_storage)
 
-    p_storage.driver == i_storage.driver
-    allow_storage_source(p_storage, i_storage, bundle_id)
-
-    allow_storage_base(p_storage, i_storage, bundle_id, sandbox_id)
+    storage_pair_matches(p_storage, i_storage, bundle_id, sandbox_id)
 
     print("allow_storage: true")
+}
+
+# Pairwise storage match: does this single declaration admit this single presented
+# storage? Factored out of allow_storage so that the same relation can be evaluated in
+# the declaration -> presented direction by storage_is_presented. The three bodies below
+# mirror the three p_storage-consuming allow_storage variants exactly.
+storage_pair_matches(p_storage, i_storage, bundle_id, sandbox_id) if {
+    p_storage.driver == i_storage.driver
+    allow_storage_source(p_storage, i_storage, bundle_id)
+    allow_storage_base(p_storage, i_storage, bundle_id, sandbox_id)
+}
+storage_pair_matches(p_storage, i_storage, bundle_id, sandbox_id) if {
+    i_storage.driver == "scsi"
+    regex.match("^[0-9]+:[0-9]+$", i_storage.source)
+    allow_storage_base(p_storage, i_storage, bundle_id, sandbox_id)
+}
+storage_pair_matches(p_storage, i_storage, bundle_id, sandbox_id) if {
+    i_storage.driver == "blk"
+    regex.match("^[0-9a-f]{2}(/[0-9a-f]{2})?$", i_storage.source)
+    allow_storage_base(p_storage, i_storage, bundle_id, sandbox_id)
 }
 allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
     i_storage.driver == "image_guest_pull"
@@ -1340,26 +1388,9 @@ allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
     # TODO: Check Mount Point, Source, Driver Options, etc.
     print("allow_storage with image_guest_pull: true")
 }
-allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
-    print("allow_storage with scsi: start")
-
-    i_storage.driver == "scsi"
-    regex.match("^[0-9]+:[0-9]+$", i_storage.source)
-
-    allow_block_storage(p_storages, i_storage, bundle_id, sandbox_id)
-
-    print("allow_storage with scsi: true")
-}
-allow_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
-    print("allow_storage with blk: start")
-
-    i_storage.driver == "blk"
-    regex.match("^[0-9a-f]{2}(/[0-9a-f]{2})?$", i_storage.source)
-
-    allow_block_storage(p_storages, i_storage, bundle_id, sandbox_id)
-
-    print("allow_storage with blk: true")
-}
+# NOTE: the former scsi/blk allow_storage variants are now expressed as bodies of
+# storage_pair_matches above, so the generic p_storage-consuming allow_storage variant
+# covers them. allow_block_storage became dead with them and has been removed.
 
 # Validates all storage fields except driver and source.
 allow_storage_base(p_storage, i_storage, bundle_id, sandbox_id) if {
@@ -1372,16 +1403,6 @@ allow_storage_base(p_storage, i_storage, bundle_id, sandbox_id) if {
 
     allow_mount_point(p_storage, i_storage, bundle_id, sandbox_id)
     allow_storage_options(p_storage, i_storage)
-}
-
-allow_block_storage(p_storages, i_storage, bundle_id, sandbox_id) if {
-    print("allow_block_storage: start")
-
-    some p_storage in p_storages
-
-    allow_storage_base(p_storage, i_storage, bundle_id, sandbox_id)
-
-    print("allow_block_storage: true")
 }
 
 allow_storage_source(p_storage, i_storage, bundle_id) if {
@@ -1712,8 +1733,8 @@ allow_interactive_exec(p_container, i_process) if {
 }
 
 get_state_container(container_id):= p_container if {
-    idx := get_state_val(container_id)
-    p_container := all_policy_containers[idx]
+    ref := get_state_val(container_id)
+    p_container := container_by_ref(ref)
 }
 
 ExecProcessRequest if {
@@ -1947,17 +1968,146 @@ TtyWinResizeRequest if {
 #
 # Runtime data contract: a verified fragment for feed F contributes, under this namespace, a
 # keyed entry `data.agent_policy.fragments[F] == {"issuer": <did/id>, "svn": <n>,
-# "containers": [<container-policy>, ...]}`. At genpolicy generation time no fragment is loaded
+# "containers": [<container-policy>, ...]}`. Because a feed is an OCI reference
+# (`myregistry.io/fragments/sidecar`) and not a Rego identifier, a fragment writes that key by
+# declaring its package with a quoted path segment:
+#
+#     package agent_policy.fragments["myregistry.io/fragments/sidecar"]
+#     issuer := "did:x509:..."
+#     svn := 3
+#     containers := [ ... ]
+#
+# The agent accepts that form only when the quoted segment equals the feed the SRM verified
+# from the fragment's own COSE envelope, so a fragment can only ever populate its own key and
+# never another publisher's. At genpolicy generation time no fragment is loaded
 # (`data.agent_policy.fragments` is empty) and an unloaded / under-versioned / wrong-issuer
 # fragment contributes nothing => behaviour identical to a monolithic policy (no regression).
-fragment_containers := [c |
-    some spec in policy_data.fragments
-    mod := data.agent_policy.fragments[spec.feed]
-    mod.issuer == spec.issuer
-    to_number(mod.svn) >= spec.minimum_svn
-    some c in mod.containers
-]
 
 # The full allowed-container set: base policy containers plus verified fragment-contributed
 # containers. All container-matching rules iterate this set.
-all_policy_containers := array.concat(policy_data.containers, fragment_containers)
+#
+# Each element carries a **stable reference** next to the container, because policy state
+# has to be able to name the container that authorized a running container_id, and the set
+# itself is not stable: `fragment_container_entries` is a comprehension over the fragments that
+# are *currently loaded*, so delivering another fragment inserts entries and shifts every
+# position after them. Recording a position would silently re-bind a running container to a
+# different policy entry the next time a fragment arrives, and the host chooses fragment
+# delivery order and timing. A reference names the source instead — the measured base array,
+# or a specific (feed, svn) — so it means the same thing however the combined set is
+# rebuilt.
+base_container_entries := [{"ref": {"base": true, "idx": i}, "container": c} |
+    some i, c in policy_data.containers
+]
+
+# A policy can declare a trusted fragment in two places, and both are measured, so both
+# have to be honoured here.
+#
+#   * `policy_data.fragments` — BL-7. Comes from `genpolicy-settings.json`, is serialized
+#     into `policy_data` at generation time, and is what a settings-driven deployment uses.
+#   * `policy_fragments` — BL-8. A rule in the generated policy text; this is the list the
+#     *agent* reads to decide what the host must deliver and what it must refuse.
+#
+# Reading only the first was a silent hole in the other direction from the usual one: a
+# fragment declared for delivery (BL-8), fetched by the host, verified by the SRM and
+# applied into the engine still contributed **no containers**, because the rule that reads
+# its contribution was looking at a list the BL-8 declaration never appears in. Nothing
+# reported an error — the fragment loaded, and the container it carried was simply refused.
+# Declaring the same fragment twice, in two different files, would have been the only way to
+# make it work, with divergence between the two failing silently.
+#
+# Duplicates across the two are harmless: they produce identical container entries with
+# identical references, and `container_by_ref` needs only one matching declaration.
+all_fragment_specs := array.concat(policy_data.fragments, policy_fragments)
+
+fragment_container_entries := [{"ref": {"feed": spec.feed, "svn": to_number(mod.svn), "idx": j}, "container": c} |
+    some spec in all_fragment_specs
+    mod := data.agent_policy.fragments[spec.feed]
+    mod.issuer == spec.issuer
+    to_number(mod.svn) >= spec.minimum_svn
+    some j, c in mod.containers
+]
+
+all_policy_container_entries := array.concat(base_container_entries, fragment_container_entries)
+
+# Resolve a reference recorded by CreateContainerRequest back to a policy container.
+#
+# The fragment arm re-runs the declaration gates rather than trusting the reference: the
+# fragment must still be one the measured base policy declares, from the issuer it declares,
+# at or above the declared SVN floor. The recorded SVN must match exactly, so a container
+# authorized by one version of a fragment is never later evaluated against the containers of
+# another version of it. Both arms are undefined when they do not hold, which makes the
+# calling rule undefined and falls through to the fail-closed default.
+container_by_ref(ref) := c if {
+    ref.base == true
+    c := policy_data.containers[ref.idx]
+}
+
+container_by_ref(ref) := c if {
+    not ref.base
+    some spec in all_fragment_specs
+    spec.feed == ref.feed
+    mod := data.agent_policy.fragments[ref.feed]
+    mod.issuer == spec.issuer
+    to_number(mod.svn) >= spec.minimum_svn
+    to_number(mod.svn) == ref.svn
+    c := mod.containers[ref.idx]
+}
+
+# ---- BL-8: delivery of fragments the base policy declares ----
+# Fragments the measured base policy declares in `policy_fragments[]` are fetched by the
+# host and pushed to the agent one at a time over LoadPolicyFragmentRequest. That endpoint
+# has to be policy-covered like every other one: an undefined rule makes allow_request bail,
+# which is fail-closed and therefore safe, but it is also indistinguishable from a rejected
+# fragment and it leaves the delivery path unusable.
+#
+# Each declaration carries an optional `required` flag, read by the agent and not by this
+# rule. It defaults to false, which is C-ACI/hcsshim behaviour: delivery is lazy, and a
+# fragment that never arrives contributes no grants, so anything only it would have
+# permitted is refused by the composed policy on its own merits. `required: true` is
+# stricter than C-ACI — it makes the declaration an obligation, so the agent refuses to
+# create any container until that fragment has been delivered and verified. Use it when the
+# fragment's absence is not fail-safe (a deny rule, an audit obligation, a constraint the
+# base policy assumes has been composed in). Either way a delivered fragment is verified
+# identically; `required` governs only whether absence is an error.
+#
+# A declaration may also carry `allow_nested`, which decides whether the fragment it names
+# may itself declare further fragments, and whose. It is absent by default, meaning no
+# delegation, so a policy written before the attribute existed cannot acquire the capability
+# by upgrade. The accepted forms are `false` / "none", "same-issuer" (the delivering
+# fragment's own issuer only), "any-authorized" (any issuer the measured trust root
+# authorizes), or an explicit list of issuer strings. Bare `true` is rejected by the agent
+# because it enables delegation without saying to whom.
+#
+# Delegation does not widen trust. A nested declaration only says a feed is expected; the
+# fragment behind it must still be signed by an issuer the measured trust root authorizes,
+# and the issuer-wide SVN floor still binds, so a nested declaration can raise the bar but
+# never lower it. Nested declarations live in the delivering fragment's signed Rego module
+# (at `policy_fragments` inside its own package), so they are covered by the same COSE
+# signature as everything else it carries and the host cannot edit them.
+#
+# The rule is coarse by construction, because the request carries nothing finer to bind to.
+# The host sends only the COSE envelope: issuer, feed and SVN are derived from the bytes the
+# guest verifies rather than from anything the host asserts, precisely so that a lying host
+# cannot describe a fragment into acceptance. Coarse is sufficient here. The Security
+# Reference Monitor verifies the envelope against the measured trust anchors and refuses
+# anything not signed by a declared issuer at or above the declared minimum SVN, so a
+# permitted call grants the host no power beyond offering bytes -- its worst case is denial,
+# never bypass.
+#
+# What this rule adds is the outer bound: a policy that declares no fragments has no reason
+# to accept any, so the endpoint stays shut for it.
+#
+# `policy_fragments` must be *defined* for that to work. Rego's undefined-is-fail-closed
+# behaviour applies to evaluation, not to compilation: a bare reference to a rule nothing
+# declares is an unsafe variable, and regorus rejects the whole module rather than leaving
+# this one rule undefined. That is not fail-closed, it is fail-to-load -- the agent cannot
+# build its engine at all, so every request is refused and no pod can start. genpolicy does
+# not emit `policy_fragments` (only base policies that declare fragments append it), which
+# is the ordinary case, so the default below is what keeps the ordinary case working.
+default policy_fragments := []
+
+default LoadPolicyFragmentRequest := false
+
+LoadPolicyFragmentRequest if {
+    count(policy_fragments) > 0
+}

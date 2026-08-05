@@ -54,6 +54,53 @@ pub struct FragmentSpec {
     pub issuer: String,
     pub feed: String,
     pub minimum_svn: i64,
+
+    /// BL-8: whether the guest must refuse to create containers until this fragment has
+    /// been delivered and verified. Optional in the settings and defaulting to false, which
+    /// is C-ACI/hcsshim behaviour — the declaration authorizes the fragment and fixes the
+    /// terms it must meet, but its absence is tolerated because an undelivered fragment
+    /// simply grants nothing. Set it only for fragments whose absence is not fail-safe.
+    #[serde(default)]
+    pub required: bool,
+
+    /// BL-8: whether this fragment may itself declare further fragments, and whose. Passed
+    /// through verbatim so the agent validates it — genpolicy has no trust context with
+    /// which to judge an issuer scope, and a settings-time check here would only be a
+    /// second place to keep the accepted forms in sync. Omitted from the emitted policy
+    /// when unset, so existing settings produce byte-identical output.
+    ///
+    /// Accepted forms: `false`, `"none"`, `"same-issuer"`, `"any-authorized"`, or a list of
+    /// issuer strings. Bare `true` is rejected by the agent, because it enables delegation
+    /// without saying to whom.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_nested: Option<serde_json::Value>,
+
+    /// FR-1c (F-62): policy namespaces under `agent_policy.fragments.` this fragment may
+    /// contribute a module to. The fragment's own signed `includes` cannot widen this — the
+    /// effective scope is the intersection — so the measured policy stays in control of
+    /// which issuer may populate which namespace. Omitted when unset.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub includes: Vec<String>,
+
+    /// FR-1c: whether the fragment's Rego module may be applied at all. Defaults to true;
+    /// `false` accepts the fragment for its SVN/receipt/ordering record while contributing
+    /// no rules. Emitted only when explicitly disabled, so existing settings produce
+    /// byte-identical output.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub allow_module: bool,
+
+    /// FR-1k: values to instantiate a parameterised fragment with, passed through verbatim.
+    /// The fragment reads them via `parameter("name")`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<serde_json::Value>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
 }
 
 /// Representation of the policy_data field from the output policy text.

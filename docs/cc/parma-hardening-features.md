@@ -7,10 +7,11 @@ this development branch (`coco-parity`) addresses them.
 PARMA reasons about a guest whose *authorized* plan equals its *executed* plan under a
 closed-door policy that mediates every host-reachable operation. Reaching that bar
 requires more than a policy check on the incoming request: the agent must default to
-deny, treat host-supplied identifiers as untrusted aliases, bind every mutating operation
-to a transactional state machine, verify that the object actually executed matches the
-object that was authorized, and freeze or refuse surfaces that would otherwise let the
-host mutate a running workload. The features below implement those properties as a
+deny, treat host-supplied identifiers as untrusted aliases, bind every operation that
+mutates enforcer state to a transactional state machine, verify that the object actually
+executed matches the object that was authorized, and freeze or refuse surfaces that would
+otherwise let the host mutate a running workload. The features below implement those
+properties as a
 "strict" build of the guest agent (`STRICT_POLICY=yes`), deployed via the `kata-parma`
 runtime profile.
 
@@ -168,9 +169,12 @@ bypassed, plus a missing binding. All four are addressed on `fr2-strict-policy-h
 - **Gap:** policy state and runtime state could diverge on partial failure, leaving the
   enforcer believing a container/mount/identity exists (or not) when the opposite is true.
 - **Fix:** a universal `ReferenceMonitor` models a mutating operation as
-  `prepare → execute → commit`/`abort`, with idempotent replay, anti-replay via a monotonic
-  state version, and a fail-closed `quarantine`. `CreateContainer`, `ExecProcess`,
-  `SignalProcess`, and `RemoveContainer` run as SRM transactions. Policy state is bracketed
+  `prepare → execute → commit`/`abort`, with idempotent replay, refusal of duplicates that
+  are still in flight, a monotonic state version that rejects a `prepare` raced against a
+  concurrent state change, and a fail-closed `quarantine`. (The state version is an
+  internal consistency check, not host anti-replay — see **Limits** below.)
+  `CreateContainer`, `ExecProcess`, `SignalProcess`, and `RemoveContainer` run as SRM
+  transactions. Policy state is bracketed
   around authorization and the request's **own delta** is reverted on abort, rather than a
   whole-document snapshot being restored: ttrpc dispatches each request on its own task and
   the policy lock is released while the runtime operation runs, so restoring a snapshot
@@ -201,7 +205,11 @@ bypassed, plus a missing binding. All four are addressed on `fr2-strict-policy-h
   actually mutates can always be rolled back. `ExecProcess` and `SignalProcess` are covered
   as well, though under the reference policy they emit no state ops. The remaining mutating
   RPCs in the complete-mediation manifest (FR-7) are policy-gated but **not** transactional;
-  extending coverage to them is tracked in `docs/cc/backlog.md`.
+  extending coverage to them is tracked in `docs/cc/backlog.md`. The bar this is measured
+  against is enforcer-state coverage, not RPC-count coverage: the equivalent hcsshim
+  mechanism wraps only its storage and device paths and does not bracket container
+  lifecycle at all, so a transaction on an RPC that mutates no enforcer state would add
+  bookkeeping without adding a rollback guarantee.
 - **Limits:** the plan digest passed to `execute` is the same value computed for `prepare`
   at each call site, and the `expected_state_version` is read from the monitor and handed
   straight back, so `PlanMismatch` and `StaleStateVersion` are properties of the crate
@@ -252,11 +260,18 @@ bypassed, plus a missing binding. All four are addressed on `fr2-strict-policy-h
 - **Gap:** the host-supplied `container_id` is an untrusted alias — it can be forged,
   reused, or replayed to drive illegal lifecycle transitions.
 - **Fix:** the enforcer mints its own occurrence handle per container and drives it through
-  `created → running → stopped → removed`. Lifecycle RPCs are gated on occurrence state,
-  with a monotonic per-alias generation as a replay guard and optional per-declaration
-  cardinality.
+  `created → running → stopped → removed`. Lifecycle RPCs are gated on occurrence state.
 - **Guarantee:** start-before-create, exec/signal on an unknown or not-running occurrence,
-  operations on a removed occurrence, and replay of a stale generation are all rejected.
+  and operations on a removed occurrence are all rejected — by the occurrence machine, not
+  by policy.
+- **Limits:** the registry additionally carries a monotonic per-alias **generation** and an
+  optional per-declaration **cardinality** bound. Both are implemented and unit-tested, and
+  neither is currently *armed*: `create` is called with `(None, None)` for the declaration
+  index and bound, and `assert_generation` has no caller. They are forward-looking
+  capabilities, not delivered guarantees. Arming them requires an operation that carries an
+  occurrence handle across a call — no agent RPC does today, since the host presents only
+  the `container_id` alias and every gate resolves it to the *live* occurrence. The parity
+  implementation (hcsshim) enforces no cardinality either.
 - **Commits:** `96a0d641c` (registry), `2434d3ef2` (wiring).
 - **Validated:** unit + **live attack** — `StartContainer` on a never-created id and
   `SignalProcess` on an unknown id are denied under an allow-all policy (the gate is the
