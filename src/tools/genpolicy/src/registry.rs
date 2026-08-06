@@ -21,7 +21,12 @@ use oci_client::{
     Client, Reference,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, io::Read, io::Write, path::Path};
+use std::{
+    collections::BTreeMap,
+    io::Read,
+    io::Write,
+    path::{Component, Path},
+};
 use tokio::io::AsyncWriteExt;
 
 /// Container image properties obtained from an OCI repository.
@@ -125,7 +130,7 @@ const GROUP_FILE_WHITEOUT_TAR_PATH: &str = "etc/.wh.group";
 pub const WHITEOUT_MARKER: &str = "WHITEOUT";
 
 impl Container {
-    pub async fn new(config: &Config, image: &str, is_pause_container: bool) -> Result<Self> {
+    pub async fn new(config: &Config, image: &str) -> Result<Self> {
         info!("============================================");
         info!("Pulling manifest and config for {image}");
         let image_string = image.to_string();
@@ -166,38 +171,31 @@ impl Container {
         let mut passwd = String::new();
         let mut group = String::new();
 
-        // Nydus/guest_pull doesn't make available passwd/group files from layers properly.
-        // See issue https://github.com/kata-containers/kata-containers/issues/11162
-        let v1_policy = config.settings.cluster_config.pause_container_id_policy == "v1";
-        if config.settings.cluster_config.guest_pull && (v1_policy || !is_pause_container) {
-            info!("Guest pull is enabled, skipping passwd/group file parsing");
-        } else {
-            let image_layers = get_image_layers(
-                &config.layers_cache,
-                &mut client,
-                &reference,
-                &manifest,
-                &config_layer,
-            )
-            .await
-            .unwrap();
+        let image_layers = get_image_layers(
+            &config.layers_cache,
+            &mut client,
+            &reference,
+            &manifest,
+            &config_layer,
+        )
+        .await
+        .unwrap();
 
-            // Find the last layer with an /etc/* file, respecting whiteouts.
-            info!("Parsing users and groups in image layers");
-            for layer in &image_layers {
-                if layer.passwd == WHITEOUT_MARKER {
-                    passwd = String::new();
-                } else if !layer.passwd.is_empty() {
-                    passwd = layer.passwd.clone();
-                    debug!("Container:new: Found in image layer passwd = \n{passwd}");
-                }
+        // Find the last layer with an /etc/* file, respecting whiteouts.
+        info!("Parsing users and groups in image layers");
+        for layer in &image_layers {
+            if layer.passwd == WHITEOUT_MARKER {
+                passwd = String::new();
+            } else if !layer.passwd.is_empty() {
+                passwd = layer.passwd.clone();
+                debug!("Container:new: Found in image layer passwd = \n{passwd}");
+            }
 
-                if layer.group == WHITEOUT_MARKER {
-                    group = String::new();
-                } else if !layer.group.is_empty() {
-                    group = layer.group.clone();
-                    debug!("Container:new: Found in image layer group = \n{group}");
-                }
+            if layer.group == WHITEOUT_MARKER {
+                group = String::new();
+            } else if !layer.group.is_empty() {
+                group = layer.group.clone();
+                debug!("Container:new: Found in image layer group = \n{group}");
             }
         }
 
@@ -348,8 +346,14 @@ impl Container {
          * 2. Contain only a UID
          * 3. Contain a UID:GID pair, in that format
          * 4. Contain a user name, which we need to translate into a UID/GID pair
-         * 5. Contain a (user name:group name) pair, which we need to translate into a UID/GID pair
-         * 6. Be erroneus, somehow
+         * 5. Contain a user name:group name pair
+         * 6. Be erroneous, somehow
+         *
+         * For Kubernetes, containerd CRI ImageStatus strips any group component
+         * before kubelet maps the image user into a CRI security context. Keep
+         * genpolicy aligned with that path: USER user:group behaves like USER
+         * user, and USER uid:gid behaves like USER uid. Direct ctr/crictl paths
+         * can resolve the group component differently because they bypass kubelet.
          */
         if let Some(image_user) = &docker_config.User {
             if !image_user.is_empty() {
@@ -621,7 +625,9 @@ pub fn get_users_from_decompressed_layer(path: &Path) -> Result<(String, String)
     for entry_wrap in tar::Archive::new(file).entries()? {
         let mut entry = entry_wrap?;
         let entry_path = entry.header().path()?;
-        let path_str = entry_path.to_str().unwrap();
+        let Some(path_str) = normalized_layer_path(&entry_path) else {
+            continue;
+        };
         if path_str == PASSWD_FILE_TAR_PATH {
             entry.read_to_string(&mut passwd)?;
             found_passwd = true;
@@ -652,16 +658,29 @@ pub fn get_users_from_decompressed_layer(path: &Path) -> Result<(String, String)
     Ok((passwd, group))
 }
 
-pub async fn get_container(
-    config: &Config,
-    image: &str,
-    is_pause_container: bool,
-) -> Result<Container> {
-    if let Some(socket_path) = &config.containerd_socket_path {
-        return Container::new_containerd_pull(config, image, socket_path, is_pause_container)
-            .await;
+fn normalized_layer_path(path: &Path) -> Option<String> {
+    let mut components = Vec::new();
+
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => components.push(part.to_str()?),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
     }
-    Container::new(config, image, is_pause_container).await
+
+    if components.is_empty() {
+        return None;
+    }
+
+    Some(components.join("/"))
+}
+
+pub async fn get_container(config: &Config, image: &str) -> Result<Container> {
+    if let Some(socket_path) = &config.containerd_socket_path {
+        return Container::new_containerd_pull(config, image, socket_path).await;
+    }
+    Container::new(config, image).await
 }
 
 fn build_auth(reference: &Reference) -> RegistryAuth {
@@ -765,4 +784,135 @@ fn parse_group_file(group: &str) -> Result<Vec<GroupRecord>> {
     }
 
     Ok(records)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn container_with_image_user(user: &str) -> Container {
+        Container {
+            image: "test-image".to_string(),
+            config_layer: DockerConfigLayer {
+                config: DockerImageConfig {
+                    User: Some(user.to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            passwd:
+                "root:x:0:0:root:/root:/bin/sh\nwww-data:x:33:33:www-data:/var/www:/sbin/nologin\n"
+                    .to_string(),
+            group: "root:x:0:\nwww-data:x:33:\nstaff:x:50:\nwheel:x:10:\n".to_string(),
+        }
+    }
+
+    fn create_tar_layer(path: &Path, entries: &[(&str, &str)]) {
+        let layer_file = std::fs::File::create(path).unwrap();
+        let mut archive = tar::Builder::new(layer_file);
+
+        for (entry_path, content) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, entry_path, Cursor::new(content.as_bytes()))
+                .unwrap();
+        }
+
+        archive.finish().unwrap();
+    }
+
+    #[test]
+    fn image_user_group_component_matches_kubernetes_path() {
+        let cases = [
+            "33:10",
+            "33:wheel",
+            "www-data:50",
+            "www-data:staff",
+            "www-data:thisgroupdoesnotexist",
+        ];
+
+        for image_user in cases {
+            let container = container_with_image_user(image_user);
+            let mut process = policy::KataProcess::default();
+
+            container.get_process(&mut process, false, false);
+
+            assert_eq!(process.User.UID, 33, "image user: {image_user}");
+            assert_eq!(process.User.GID, 33, "image user: {image_user}");
+            assert_eq!(
+                process
+                    .User
+                    .AdditionalGids
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                vec![33],
+                "image user: {image_user}"
+            );
+        }
+    }
+
+    #[test]
+    fn reads_passwd_and_group_with_dot_slash_tar_paths() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let layer_path = temp_dir.path().join("layer.tar");
+        let passwd = "root:x:0:0:root:/root:/bin/sh\n";
+        let group = "root:x:0:\n";
+
+        create_tar_layer(
+            &layer_path,
+            &[("./etc/passwd", passwd), ("./etc/group", group)],
+        );
+
+        assert_eq!(
+            get_users_from_decompressed_layer(&layer_path).unwrap(),
+            (passwd.to_string(), group.to_string())
+        );
+    }
+
+    #[test]
+    fn normalizes_layer_paths_with_curdir_components() {
+        let cases = [
+            ("etc/passwd", Some(PASSWD_FILE_TAR_PATH)),
+            ("./etc/passwd", Some(PASSWD_FILE_TAR_PATH)),
+            ("././etc/passwd", Some(PASSWD_FILE_TAR_PATH)),
+            ("etc/./passwd", Some(PASSWD_FILE_TAR_PATH)),
+            ("./etc/./passwd", Some(PASSWD_FILE_TAR_PATH)),
+            ("etc/.wh.passwd", Some(PASSWD_FILE_WHITEOUT_TAR_PATH)),
+            ("./etc/.wh.passwd", Some(PASSWD_FILE_WHITEOUT_TAR_PATH)),
+            (".", None),
+            ("./", None),
+            ("../etc/passwd", None),
+            ("etc/../passwd", None),
+            ("/etc/passwd", None),
+        ];
+
+        for (path, expected) in cases {
+            assert_eq!(
+                normalized_layer_path(Path::new(path)),
+                expected.map(str::to_string),
+                "path: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn reads_whiteout_with_dot_slash_tar_path() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let layer_path = temp_dir.path().join("layer.tar");
+
+        create_tar_layer(
+            &layer_path,
+            &[("./etc/.wh.passwd", ""), ("./etc/.wh.group", "")],
+        );
+
+        assert_eq!(
+            get_users_from_decompressed_layer(&layer_path).unwrap(),
+            (WHITEOUT_MARKER.to_string(), WHITEOUT_MARKER.to_string())
+        );
+    }
 }

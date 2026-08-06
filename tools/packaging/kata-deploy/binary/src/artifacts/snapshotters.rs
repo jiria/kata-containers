@@ -74,6 +74,14 @@ pub async fn configure_erofs_snapshotter(config: &Config, configuration_file: &P
         "[\"erofs\",\"walking\"]",
     )?;
 
+    // dm-verity is orthogonal to rw-layer backing — it verifies lower (erofs)
+    // layers via device-mapper regardless of whether the upper rw-layer lives on
+    // disk or in memory. When dm-verity is enabled, fsverity and immutable are
+    // disabled on the snapshotter side in favor of dm-verity.
+    let use_dmverity = config.erofs_dmverity;
+    let dmverity_mode = if use_dmverity { "\"on\"" } else { "\"off\"" };
+    let enable_dmverity = if use_dmverity { "true" } else { "false" };
+
     toml_utils::set_toml_value(
         configuration_file,
         ".plugins.\"io.containerd.snapshotter.v1.erofs\".enable_fsverity",
@@ -83,6 +91,17 @@ pub async fn configure_erofs_snapshotter(config: &Config, configuration_file: &P
         configuration_file,
         ".plugins.\"io.containerd.snapshotter.v1.erofs\".set_immutable",
         "true",
+    )?;
+
+    toml_utils::set_toml_value(
+        configuration_file,
+        ".plugins.\"io.containerd.snapshotter.v1.erofs\".dmverity_mode",
+        dmverity_mode,
+    )?;
+    toml_utils::set_toml_value(
+        configuration_file,
+        ".plugins.\"io.containerd.differ.v1.erofs\".enable_dmverity",
+        enable_dmverity,
     )?;
 
     // Erofs differ plugin options (requires erofs-utils >= 1.8.2 on the host).

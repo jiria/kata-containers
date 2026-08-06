@@ -54,9 +54,9 @@ jobs:
   build-kata-static-tarball-amd64:
     permissions:
       contents: read
-      packages: write
-      id-token: write
-      attestations: write
+      packages: write # needed to push build artifacts to ghcr.io
+      id-token: write # needed to sign images and generate attestations
+      attestations: write # needed to generate artifact attestations
     uses: ./.github/workflows/build-kata-static-tarball-amd64.yaml
     with:
       tarball-suffix: -${{ inputs.tag }}
@@ -69,7 +69,7 @@ jobs:
     needs: build-kata-static-tarball-amd64
     permissions:
       contents: read
-      packages: write
+      packages: write # needed to push build artifacts to ghcr.io
     uses: ./.github/workflows/publish-kata-images.yaml
     with:
       tarball-suffix: -${{ inputs.tag }}
@@ -87,7 +87,7 @@ jobs:
     needs: build-kata-static-tarball-amd64
     permissions:
       contents: read
-      packages: write
+      packages: write # needed to push build artifacts to ghcr.io
     uses: ./.github/workflows/publish-kata-images.yaml
     with:
       tarball-suffix: -${{ inputs.tag }}
@@ -105,9 +105,9 @@ jobs:
   build-kata-static-tarball-arm64:
     permissions:
       contents: read
-      packages: write
-      id-token: write
-      attestations: write
+      packages: write # needed to push build artifacts to ghcr.io
+      id-token: write # needed to sign images and generate attestations
+      attestations: write # needed to generate artifact attestations
     uses: ./.github/workflows/build-kata-static-tarball-arm64.yaml
     with:
       tarball-suffix: -${{ inputs.tag }}
@@ -120,7 +120,7 @@ jobs:
     needs: build-kata-static-tarball-arm64
     permissions:
       contents: read
-      packages: write
+      packages: write # needed to push build artifacts to ghcr.io
     uses: ./.github/workflows/publish-kata-images.yaml
     with:
       tarball-suffix: -${{ inputs.tag }}
@@ -138,7 +138,7 @@ jobs:
     needs: build-kata-static-tarball-arm64
     permissions:
       contents: read
-      packages: write
+      packages: write # needed to push build artifacts to ghcr.io
     uses: ./.github/workflows/publish-kata-images.yaml
     with:
       tarball-suffix: -${{ inputs.tag }}
@@ -157,9 +157,9 @@ jobs:
     if: false # msft-preview doesn't have these runners
     permissions:
       contents: read
-      packages: write
-      id-token: write
-      attestations: write
+      packages: write # needed to push build artifacts to ghcr.io
+      id-token: write # needed to sign images and generate attestations
+      attestations: write # needed to generate artifact attestations
     uses: ./.github/workflows/build-kata-static-tarball-s390x.yaml
     with:
       tarball-suffix: -${{ inputs.tag }}
@@ -172,7 +172,7 @@ jobs:
     if: false # msft-preview doesn't have these runners
     permissions:
       contents: read
-      packages: write
+      packages: write # needed to push build artifacts to ghcr.io
     uses: ./.github/workflows/build-kata-static-tarball-ppc64le.yaml
     with:
       tarball-suffix: -${{ inputs.tag }}
@@ -185,7 +185,7 @@ jobs:
     needs: build-kata-static-tarball-s390x
     permissions:
       contents: read
-      packages: write
+      packages: write # needed to push build artifacts to ghcr.io
     uses: ./.github/workflows/publish-kata-images.yaml
     with:
       tarball-suffix: -${{ inputs.tag }}
@@ -203,7 +203,7 @@ jobs:
     needs: build-kata-static-tarball-s390x
     permissions:
       contents: read
-      packages: write
+      packages: write # needed to push build artifacts to ghcr.io
     uses: ./.github/workflows/publish-kata-images.yaml
     with:
       tarball-suffix: -${{ inputs.tag }}
@@ -222,7 +222,7 @@ jobs:
     needs: build-kata-static-tarball-ppc64le
     permissions:
       contents: read
-      packages: write
+      packages: write # needed to push build artifacts to ghcr.io
     uses: ./.github/workflows/publish-kata-images.yaml
     with:
       tarball-suffix: -${{ inputs.tag }}
@@ -240,7 +240,7 @@ jobs:
     needs: build-kata-static-tarball-ppc64le
     permissions:
       contents: read
-      packages: write
+      packages: write # needed to push build artifacts to ghcr.io
     uses: ./.github/workflows/publish-kata-images.yaml
     with:
       tarball-suffix: -${{ inputs.tag }}
@@ -260,7 +260,7 @@ jobs:
     if: false # msft-preview can't push to GHCR
     permissions:
       contents: read
-      packages: write
+      packages: write # needed to push build artifacts to ghcr.io
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout code
@@ -402,6 +402,21 @@ jobs:
       enable-nvrc-trace: ${{ inputs.pr-number != 'nightly' }}
     secrets:
       NGC_API_KEY: ${{ secrets.NGC_API_KEY }}
+
+  run-k8s-tests-on-nvidia-cpu-arm64:
+    if: ${{ inputs.skip-test != 'yes' }}
+    needs: publish-kata-deploy-image-arm64
+    permissions:
+      contents: read
+    uses: ./.github/workflows/run-k8s-tests-on-nvidia-cpu-arm64.yaml
+    with:
+      tarball-suffix: -${{ inputs.tag }}
+      registry: ghcr.io
+      repo: ${{ github.repository_owner }}/kata-deploy-ci
+      tag: ${{ inputs.tag }}-arm64
+      commit-hash: ${{ inputs.commit-hash }}
+      pr-number: ${{ inputs.pr-number }}
+      target-branch: ${{ inputs.target-branch }}
 
 
   run-kata-coco-tests:

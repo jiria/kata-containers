@@ -119,8 +119,12 @@ monitor:
     reference: quay.io/kata-containers/kata-monitor
     tag: ""
   listenAddress: "0.0.0.0:8090"
-  runtimeEndpoint: "unix:///run/containerd/containerd.sock"
-  logLevel: "info"
+  # CRI runtime socket for kata-monitor. When empty, inherits containerd.runtimeSocket
+  # or derives from k8sDistribution (e.g. k3s uses unix:///run/k3s/containerd/containerd.sock).
+  runtimeEndpoint: ""
+  # Log level for kata-monitor. When empty, inherits chart-wide logLevel and
+  # debug:true implies debug; otherwise defaults to info.
+  logLevel: ""
   port: 8090
   securityContext:
     privileged: false
@@ -144,6 +148,10 @@ containerd:
   # When empty, derived automatically from k8sDistribution.
   # Example: "/etc/my-containerd/"
   configDir: ""
+  # Override the CRI containerd socket URI.
+  # When empty, derived automatically from k8sDistribution.
+  # Example: "unix:///run/k3s/containerd/containerd.sock"
+  runtimeSocket: ""
   # Override the containerd config file name.
   # When empty, the kata-deploy binary uses its built-in default ("config.toml")
   # or auto-detects based on the runtime (k0s, microk8s, k3s/rke2).
@@ -169,6 +177,77 @@ containerd:
 #     effect: "NoSchedule"
 nodeSelector: {}
 tolerations: []
+
+# Startup taints to remove from a node once Kata is installed on it and the node
+# has been labeled katacontainers.io/kata-runtime=true (the final install step).
+#
+# This closes a scheduling race: kata-deploy installs the runtime asynchronously
+# via a DaemonSet (or per-node Jobs), so on a freshly provisioned node a pod that
+# requests a Kata RuntimeClass can be scheduled before the runtime binaries exist
+# and fail to start. Provision such nodes with a startup taint that keeps Kata
+# workloads off them, list that taint here, and kata-deploy will remove it only
+# after the runtime is ready, at which point the scheduler admits the workloads.
+#
+# Each entry is either a bare taint key (removes that key for ANY effect) or
+# "key:effect" (removes only the taint with that key AND effect). Removal is
+# best-effort and idempotent: a taint that is already absent is simply skipped,
+# and a failure to remove leaves the taint in place (workloads stay gated) rather
+# than admitting them prematurely.
+#
+# For this to work, kata-deploy itself must tolerate the taint so its own pods can
+# land on the node. Add a matching entry under `tolerations` above.
+#
+# Example (pairs with a Karpenter NodePool `startupTaints` entry of the same key):
+#   tolerations:
+#     - key: "katacontainers.io/kata-runtime"
+#       operator: "Exists"
+#       effect: "NoSchedule"
+#   startupTaints:
+#     - "katacontainers.io/kata-runtime:NoSchedule"
+startupTaints: []
+
+# Extra labels for the kata-deploy DaemonSet pods (in addition to the
+# required "name: kata-deploy" label used by the chart). A "name" key here
+# is ignored.
+# Examples:
+# podLabels:
+#   team: platform
+podLabels: {}
+
+# Annotations for the kata-deploy DaemonSet pods.
+# Examples:
+# podAnnotations:
+#   prometheus.io/scrape: "false"
+podAnnotations: {}
+
+# Affinity rules for the kata-deploy DaemonSet.
+# nodeSelector matches exact key/value pairs; affinity supports matchExpressions
+# and rules about other pods on the same node (e.g. podAntiAffinity).
+# When node-feature-discovery.enabled=true, the chart merges in a virtualization
+# nodeAffinity rule. User required nodeSelectorTerms are AND-combined with the
+# built-in virtualization terms; multiple user required terms remain OR among
+# themselves. NFD virtualization requirements cannot be bypassed. podAffinity,
+# podAntiAffinity, and preferredDuringSchedulingIgnoredDuringExecution pass through.
+# Examples:
+# affinity:
+#   nodeAffinity:
+#     requiredDuringSchedulingIgnoredDuringExecution:
+#       nodeSelectorTerms:
+#         - matchExpressions:
+#             - key: node.cloud/reserved
+#               operator: In
+#               values:
+#                 - platform-team
+#   podAntiAffinity:
+#     requiredDuringSchedulingIgnoredDuringExecution:
+#       - labelSelector:
+#           matchExpressions:
+#             - key: app
+#               operator: In
+#               values:
+#                 - gpu-operator
+#         topologyKey: kubernetes.io/hostname
+affinity: {}
 
 # Priority class name for the kata-deploy DaemonSet pods.
 #
@@ -283,6 +362,12 @@ snapshotter:
   # erofs snapshotter. When empty, kata-deploy uses its built-in default
   # (merged).
   erofsMergeMode: ""
+  # EROFS snapshotter mode. Controls the rw-layer backing strategy.
+  # Valid values: "" (default), "disk", or "memory".
+  erofsSnapshotterMode: ""
+  # Enable dm-verity integrity verification for EROFS lower layers.
+  # Independent of erofsSnapshotterMode — works with both disk and memory.
+  erofsDmverity: false
 
 # Shim configuration
 # By default (disableAll: false), all shims with enabled: ~ (null) are enabled.
@@ -383,6 +468,24 @@ shims:
       - amd64
       - arm64
       - s390x
+    allowedHypervisorAnnotations: []
+    containerd:
+      snapshotter: ""
+
+  qemu-nvidia-cpu:
+    enabled: ~
+    supportedArches:
+      - amd64
+      - arm64
+    allowedHypervisorAnnotations: []
+    containerd:
+      snapshotter: ""
+
+  qemu-nvidia-cpu-runtime-rs:
+    enabled: ~
+    supportedArches:
+      - amd64
+      - arm64
     allowedHypervisorAnnotations: []
     containerd:
       snapshotter: ""
@@ -625,10 +728,17 @@ shims:
       noProxy: ""
 
 # Default shim per architecture
+#
+# Since the Kata Containers 4.0 release, the Rust runtime (runtime-rs,
+# "qemu-runtime-rs") is the default on every architecture that ships a
+# runtime-rs build. ppc64le has no runtime-rs build yet, so it stays on the
+# Go runtime ("qemu"). The Go runtime remains supported (no new features are
+# being added) and selectable (e.g. RuntimeClass "kata-qemu"); see the
+# deprecation notice in docs/migrating-config-go-runtime-to-runtime-rs.md.
 defaultShim:
-  amd64: qemu
-  arm64: qemu
-  s390x: qemu
+  amd64: qemu-runtime-rs
+  arm64: qemu-runtime-rs
+  s390x: qemu-runtime-rs
   ppc64le: qemu
 
 runtimeClasses:

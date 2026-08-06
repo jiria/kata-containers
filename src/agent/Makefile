@@ -41,12 +41,29 @@ ifeq ($(AGENT_POLICY),yes)
     override EXTRA_RUSTFEATURES += agent-policy
 endif
 
+##VAR STRICT_POLICY=yes|no enable the strict confidential-runtime policy behaviour
+## (closed-door default baseline + escape hatch compiled out). Implies AGENT_POLICY.
+STRICT_POLICY ?= no
+
+ifeq ($(STRICT_POLICY),yes)
+    override EXTRA_RUSTFEATURES += strict-policy
+endif
+
 ##VAR INIT_DATA=yes|no define if agent enables the init data feature
 INIT_DATA ?= yes
 
 # Enable the init data fature of rust build
 ifeq ($(INIT_DATA),yes)
     override EXTRA_RUSTFEATURES += init-data
+endif
+
+##VAR USE_DEVMAPPER=yes|no define if agent enables dm-verity (devicemapper) support
+USE_DEVMAPPER ?= no
+
+# Enable the devicemapper feature (links libdevmapper for dm-verity) with GNU libc
+ifeq ($(USE_DEVMAPPER),yes)
+    override EXTRA_RUSTFEATURES += devicemapper
+    override LIBC = gnu
 endif
 
 include ../../utils.mk
@@ -67,6 +84,8 @@ INIT := no
 
 # Path to systemd unit directory if installed as not init.
 UNIT_DIR := /usr/lib/systemd/system
+# Path to systemd system generator directory.
+GENERATOR_DIR := /usr/lib/systemd/system-generators
 
 GENERATED_CODE = src/version.rs
 
@@ -91,6 +110,13 @@ ifeq ($(INIT),no)
     GENERATED_FILES += $(UNIT_FILES)
     # Target to be reached in systemd services
     UNIT_FILES += kata-containers.target
+    # Template unit for mounting extension block devices (CoCo, GPU, etc.)
+    UNIT_FILES += kata-extension-mount@.service
+    # Helper scripts for extension mount/umount
+    EXTENSION_SCRIPTS = kata-extension-mount.sh kata-extension-umount.sh
+    # systemd generator that enables the mount template per extension declared
+    # on the kernel command line, so new extensions need no rootfs build change
+    EXTENSION_GENERATOR = kata-extension-mount-generator.sh
 endif
 
 # Display name of command and it's version (or a message if not available).
@@ -140,8 +166,12 @@ clean:
 	@rm -f tarpaulin-report.html
 
 #TARGET test: run cargo tests
+# `-p kata-security-reference-monitor` is listed explicitly: the reference monitor is a
+# separate crate, so testing only `kata-agent` left its entire suite unrun in CI. That is
+# the crate carrying the FR-6 transaction lifecycle, which is exactly the logic the
+# hardening depends on being correct.
 test: $(GENERATED_FILES)
-	@RUST_LIB_BACKTRACE=0 RUST_BACKTRACE=1 cargo test -p kata-agent --target $(TRIPLE) $(EXTRA_RUSTFEATURES) -- --nocapture
+	@RUST_LIB_BACKTRACE=0 RUST_BACKTRACE=1 cargo test -p kata-agent -p kata-security-reference-monitor --target $(TRIPLE) $(EXTRA_RUSTFEATURES) -- --nocapture
 
 ##TARGET check: run test
 check: $(GENERATED_FILES) standard_rust_check
@@ -154,6 +184,10 @@ install-services: $(GENERATED_FILES)
 ifeq ($(INIT),no)
 	@echo "Installing systemd unit files..."
 	$(foreach f,$(UNIT_FILES),$(call INSTALL_FILE,$f,$(UNIT_DIR)))
+	@echo "Installing extension helper scripts..."
+	$(foreach f,$(EXTENSION_SCRIPTS),install -D -m 755 $f $(DESTDIR)/usr/libexec/$f || exit 1;)
+	@echo "Installing extension mount generator..."
+	@install -D -m 755 $(EXTENSION_GENERATOR) $(DESTDIR)$(GENERATOR_DIR)/kata-extension-mount-generator
 endif
 
 show-header:

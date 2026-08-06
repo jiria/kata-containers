@@ -137,6 +137,12 @@ assets:
         nvidia-gpu-confidential:
           name: "ubuntu"
           version: "noble"  # 24.04 LTS
+        nvidia:
+          name: "ubuntu"
+          version: "noble"  # 24.04 LTS
+        nvidia-gpu-extension:
+          name: "ubuntu"
+          version: "noble"  # 24.04 LTS
       ppc64le:
         name: "ubuntu"
         version: "noble"  # 24.04 LTS
@@ -161,6 +167,12 @@ assets:
         nvidia-gpu-confidential:
           name: "ubuntu"
           version: "noble"  # 24.04 LTS
+        nvidia:
+          name: "ubuntu"
+          version: "noble"  # 24.04 LTS
+        nvidia-gpu-extension:
+          name: "ubuntu"
+          version: "noble"  # 24.04 LTS
 
   initrd:
     description: |
@@ -169,8 +181,8 @@ assets:
     url: "https://github.com/kata-containers/kata-containers/tools/osbuilder"
     architecture:
       aarch64:
-        name: "alpine"
-        version: "3.22"
+        name: "ubuntu"
+        version: "noble"  # 24.04 LTS
         confidential:
           name: "ubuntu"
           version: "noble"  # 24.04 LTS
@@ -192,8 +204,8 @@ assets:
           name: "ubuntu"
           version: "noble"  # 24.04 LTS
       x86_64:
-        name: "alpine"
-        version: "3.22"
+        name: "ubuntu"
+        version: "noble"  # 24.04 LTS
         confidential:
           name: "ubuntu"
           version: "noble"  # 24.04 LTS
@@ -234,7 +246,7 @@ externals:
   nvrc:
     # yamllint disable-line rule:line-length
     desc: "The NVRC project provides a Rust binary that implements a simple init system for microVMs"
-    version: "v0.1.4"
+    version: "v0.1.5"
     url: "https://github.com/NVIDIA/nvrc/releases/download/"
 
   nvidia:
@@ -292,17 +304,23 @@ externals:
   coco-guest-components:
     description: "Provides attested key unwrapping for image decryption"
     url: "https://github.com/confidential-containers/guest-components/"
-    version: "f1561038b9a58d309a3366cc8e25d8e6162424a0"
+    version: "da8d93f2797088a5f0636c8c1eeb31da73784fe8"
     toolchain: "1.90.0"
 
   coco-trustee:
     description: "Provides attestation and secret delivery components"
     url: "https://github.com/confidential-containers/trustee"
-    version: "d4e317620c4039c89779b725f74974d8f005da66"
+    version: "258ea4acb7b9bd865fce5c63a539f2120dba8298"
     # image and image_tag must be in sync
     image: "ghcr.io/confidential-containers/staged-images/kbs"
-    image_tag: "d4e317620c4039c89779b725f74974d8f005da66"
+    image_tag: "258ea4acb7b9bd865fce5c63a539f2120dba8298"
     toolchain: "1.90.0"
+    # Helm chart deploys three separate images (kbs, as, rvps)
+    # yamllint disable rule:line-length
+    image_kbs: "ghcr.io/confidential-containers/staged-images/kbs-grpc-as:258ea4acb7b9bd865fce5c63a539f2120dba8298"
+    image_as: "ghcr.io/confidential-containers/staged-images/coco-as-grpc:258ea4acb7b9bd865fce5c63a539f2120dba8298"
+    image_rvps: "ghcr.io/confidential-containers/staged-images/rvps:258ea4acb7b9bd865fce5c63a539f2120dba8298"
+    # yamllint enable rule:line-length
 
   containerd:
     description: |
@@ -459,23 +477,23 @@ languages:
     description: "Google's 'go' language"
     notes: "'version' is the default minimum version used by this project."
     # When updating this, also update in go.mod files.
-    version: "1.25.11"
+    version: "1.25.12"
     meta:
       description: |
         'newest-version' is the latest version known to work when
         building Kata
-      newest-version: "1.25.11"
+      newest-version: "1.25.12"
 
   rust:
     description: "Rust language"
     notes: "'version' is the default minimum version used by this project."
     # Keep in sync with rust-toolchain.toml
-    version: "1.94"
+    version: "1.95"
     meta:
       description: |
         'newest-version' is the latest version known to work when
         building Kata
-      newest-version: "1.94"
+      newest-version: "1.95"
 
   golangci-lint:
     description: "golangci-lint"

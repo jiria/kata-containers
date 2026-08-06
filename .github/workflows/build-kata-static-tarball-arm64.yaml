@@ -38,9 +38,9 @@ jobs:
     runs-on: ubuntu-24.04-arm
     permissions:
       contents: read
-      packages: write
-      id-token: write
-      attestations: write
+      packages: write # needed to push build artifacts to ghcr.io
+      id-token: write # needed to sign images and generate attestations
+      attestations: write # needed to generate artifact attestations
     strategy:
       matrix:
         asset:
@@ -101,6 +101,7 @@ jobs:
           TARGET_BRANCH: ${{ inputs.target-branch }}
           RELEASE: ${{ inputs.stage == 'release' && 'yes' || 'no' }}
           KBUILD_SIGN_PIN: ${{ contains(matrix.asset, 'nvidia') && secrets.KBUILD_SIGN_PIN || '' }}
+          USE_DEVMAPPER: ${{ matrix.asset == 'agent' && 'yes' || 'no' }}
 
       - name: Parse OCI image name and digest
         id: parse-oci-segments
@@ -196,13 +197,16 @@ jobs:
     needs: build-asset
     permissions:
       contents: read
-      packages: write
+      packages: write # needed to push build artifacts to ghcr.io
     strategy:
       matrix:
         asset:
           - rootfs-image
           - rootfs-image-confidential
+          - rootfs-image-coco-extension
           - rootfs-image-nvidia-gpu
+          - rootfs-image-nvidia
+          - rootfs-image-nvidia-gpu-extension
           - rootfs-initrd
     concurrency:
       group: ${{ github.workflow }}-${{ github.job }}-${{ github.event.pull_request.number || github.ref }}-arm-${{ toJSON(matrix) }}
@@ -302,7 +306,7 @@ jobs:
     needs: [build-asset, build-asset-rootfs, remove-rootfs-binary-artifacts, remove-rootfs-binary-artifacts-for-release]
     permissions:
       contents: read
-      packages: write
+      packages: write # needed to push build artifacts to ghcr.io
     strategy:
       matrix:
         asset:
@@ -370,7 +374,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     permissions:
       contents: read
-      packages: write
+      packages: write # needed to push build artifacts to ghcr.io
     strategy:
       matrix:
         asset:
@@ -429,7 +433,7 @@ jobs:
     needs: [build-tools-asset]
     permissions:
       contents: read
-      packages: write
+      packages: write # needed to push build artifacts to ghcr.io
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -478,7 +482,7 @@ jobs:
     needs: [build-asset, build-asset-rootfs, build-asset-shim-v2]
     permissions:
       contents: read
-      packages: write
+      packages: write # needed to push build artifacts to ghcr.io
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:

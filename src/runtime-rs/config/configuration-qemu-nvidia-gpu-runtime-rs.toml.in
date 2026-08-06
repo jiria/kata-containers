@@ -16,7 +16,7 @@
 [hypervisor.qemu]
 path = "@QEMUPATH@"
 kernel = "@KERNELPATH_NV@"
-image = "@IMAGEPATH_NV@"
+image = "@IMAGEPATH_NV_BASE@"
 machine_type = "@MACHINETYPE@"
 
 # rootfs filesystem type:
@@ -99,6 +99,15 @@ cpu_features = "@CPUFEATURES@"
 # > number of physical cores      --> will be set to the actual number of physical cores
 default_vcpus = @DEFAULTVCPUS_NV@
 
+# Guest-side vCPU overhead budget (fractional) used with static_sandbox_resource_mgmt.
+# When workload limits are present, vm_vcpus = requested_vcpus + overhead_vcpus
+# (rounded up at boot). If a workload limit is set on another dimension (for example
+# memory) but CPU is missing, requested_vcpus is treated as 0 and vm_vcpus equals
+# overhead_vcpus (minimum 1 at boot). When no workload limits are present,
+# default_vcpus is used instead.
+# See docs/how-to/how-to-size-sandbox-overhead-runtime-rs.md
+overhead_vcpus = @DEFOVERHEADVCPUS_NV@
+
 # Default maximum number of vCPUs per SB/VM:
 # unspecified or == 0             --> will be set to the actual number of physical cores or to the maximum number
 #                                     of vCPUs supported by KVM if that number is exceeded
@@ -141,6 +150,14 @@ reclaim_guest_freed_memory = false
 # Default memory size in MiB for SB/VM.
 # If unspecified then it will be set @DEFMEMSZ@ MiB.
 default_memory = @DEFAULTMEMORY_NV@
+
+# Guest-side memory overhead budget (MiB) used with static_sandbox_resource_mgmt.
+# When workload limits are present, vm_memory = requested_memory + overhead_memory.
+# If a workload limit is set on another dimension (for example CPU) but memory is
+# missing, requested_memory is treated as 0, so vm_memory equals overhead_memory.
+# When no workload limits are present, default_memory is used instead.
+# See docs/how-to/how-to-size-sandbox-overhead-runtime-rs.md
+overhead_memory = @DEFOVERHEADMEMSZ_NV@
 #
 # Default memory slots per SB/VM.
 # If unspecified then it will be set @DEFMEMSLOTS@.
@@ -365,13 +382,6 @@ disable_nesting_checks = true
 # Default is false
 disable_image_nvdimm = @DEFDISABLEIMAGENVDIMM_NV@
 
-# VFIO devices are hotplugged on a bridge by default.
-# Enable hotplugging on root bus. This may be required for devices with
-# a large PCI bar, as this is a current limitation with hotplugging on
-# a bridge.
-# Default false
-hotplug_vfio_on_root_bus = false
-
 # Enable cold-plugging of VFIO devices to a PCIe port type.
 # Accepted values: "no-port" (default, disabled), "root-port".
 # When set to "root-port", devices discovered via CDI / Pod Resources
@@ -381,14 +391,14 @@ cold_plug_vfio = "root-port"
 # Before hot plugging a PCIe device, you need to add a pcie_root_port device.
 # Use this parameter when using some large PCI bar devices, such as Nvidia GPU
 # The value means the number of pcie_root_port
-# This value is valid when hotplug_vfio_on_root_bus is true and machine_type is "q35"
+# This value is valid when machine_type is "q35"
 # Default 0
 pcie_root_port = @DEFAULTPCIEROOTPORT_NV@
 
 # Before hot plugging a PCIe device onto a switch port, you need add a pcie_switch_port device fist.
 # Use this parameter when using some large PCI bar devices, such as Nvidia GPU
 # The value means how many devices attached onto pcie_switch_port will be created.
-# This value is valid when hotplug_vfio_on_root_bus is true, and machine_type is "q35"
+# This value is valid when machine_type is "q35"
 # Default 0
 pcie_switch_port = 0
 
@@ -803,18 +813,33 @@ vfio_mode = "@DEFVFIOMODE_NV@"
 #   - block-encrypted
 #     Plugs a block device to be encrypted in the guest.
 #
+#   - block-plain
+#     Plugs a block device to be mounted directly in the guest.
+#
 emptydir_mode = "@DEFEMPTYDIRMODE@"
 
 # Enabled experimental feature list, format: ["a", "b"].
 # Experimental features are features not stable enough for production,
 # they may break compatibility, and are prepared for a big version bump.
 # Supported experimental features:
+# for example:
+#       experimental = ["force_guest_pull"]
+# which enables force_guest_pull mode in CoCo scenarios.
 # (default: [])
 experimental = @DEFAULTEXPFEATURES@
 
 # If enabled, user can run pprof tools with shim v2 process through kata-monitor.
 # (default: false)
 enable_pprof = false
+
+# Base directory of directly attachable network config.
+# Network devices for VM-based containers are allowed to be placed in the
+# host netns to eliminate as many hops as possible, which is what we
+# called a "Directly Attachable Network". The config, set by special CNI
+# plugins, is used to tell the Kata containers what devices are attached
+# to the hypervisor.
+# (default: /run/kata-containers/dans)
+dan_conf = "@DEFDANCONF@"
 
 # kubelet_root_dir is the kubelet root directory used to match ConfigMap/Secret
 # volume paths for propagation. Override for distros that use a different path
@@ -825,3 +850,12 @@ kubelet_root_dir = "@DEFKUBELETROOTDIR@"
 # When set (together with a non-"no-port" cold_plug_vfio), the runtime can cold-plug
 # devices discovered via the Pod Resources API. Path is typically under kubelet root-dir.
 pod_resource_api_sock = "@DEFPODRESOURCEAPISOCK_NV@"
+
+# The GPU driver stack (userspace binaries, libraries, configs, firmware and the
+# NVIDIA kernel modules) ships in a separate, driver-versioned extension image that
+# is cold-plugged alongside the nvidia base boot image.  NVRC mounts it at
+# /run/kata-extensions/gpu and resolves the GPU stack from there.
+[[hypervisor.qemu.guest_extension_images]]
+name = "gpu"
+path = "@IMAGEPATH_NV_EXTENSION@"
+verity_params = "@NVIDIAGPUEXTENSIONVERITYPARAMS@"

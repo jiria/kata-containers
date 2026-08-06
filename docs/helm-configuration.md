@@ -16,7 +16,7 @@ helm show values --version X.Y.Z oci://ghcr.io/kata-containers/kata-deploy-chart
 
 Kata ships with a number of pre-built artifacts and runtimes. You may selectively enable or disable specific shims. For example:
 
-```yaml title="values.yaml"
+```yaml
 shims:
   disableAll: true
   qemu:
@@ -54,6 +54,28 @@ default (non-custom) runtime. kata-deploy writes it as
 `config.d/50-user-overrides.toml` for that shim.
 
 It's best to reference the default `values.yaml` file above for more details.
+
+### defaultShim
+
+`defaultShim` selects, per architecture, which shim the auto-created default
+RuntimeClass (`runtimeClasses.createDefault`) resolves to:
+
+```yaml title="values.yaml"
+defaultShim:
+  amd64: qemu-runtime-rs
+  arm64: qemu-runtime-rs
+  s390x: qemu-runtime-rs
+  ppc64le: qemu
+```
+
+Since the Kata Containers **4.0 release**, the default is the **Rust runtime**
+(`runtime-rs`, `qemu-runtime-rs`) on every architecture that ships a
+`runtime-rs` build (x86_64, aarch64, s390x). ppc64le has no `runtime-rs` build
+yet and stays on the Go runtime (`qemu`). The Go runtime remains selectable
+(e.g. via the `kata-qemu` RuntimeClass) but is
+[deprecated](migrating-config-go-runtime-to-runtime-rs.md#go-runtime-deprecation).
+See the [config migration guide](migrating-config-go-runtime-to-runtime-rs.md)
+for per-option differences when migrating.
 
 ### Custom Runtimes
 
@@ -297,9 +319,29 @@ Includes:
 - `qemu-coco-dev` - Confidential Containers development (amd64, s390x)
 - `qemu-coco-dev-runtime-rs` - Confidential Containers development Rust runtime (amd64, arm64, s390x)
 
+### [`try-kata-nvidia-cpu.values.yaml`](https://github.com/kata-containers/kata-containers/blob/main/tools/packaging/kata-deploy/helm-chart/kata-deploy/try-kata-nvidia-cpu.values.yaml)
+
+This file enables only the NVIDIA CPU-only shims and installs them using the
+[`job` deployment mode](#deployment-modes-daemonset-vs-job) (no always-on
+DaemonSet on the node):
+
+```sh
+helm install kata-deploy oci://ghcr.io/kata-containers/kata-deploy-charts/kata-deploy \
+  --version VERSION \
+  -f try-kata-nvidia-cpu.values.yaml
+```
+
+Includes:
+
+- `qemu-nvidia-cpu` - NVIDIA base image without GPU passthrough (amd64, arm64)
+- `qemu-nvidia-cpu-runtime-rs` - NVIDIA base image without GPU passthrough,
+  using the Rust runtime (amd64, arm64)
+
 ### [`try-kata-nvidia-gpu.values.yaml`](https://github.com/kata-containers/kata-containers/blob/main/tools/packaging/kata-deploy/helm-chart/kata-deploy/try-kata-nvidia-gpu.values.yaml)
 
-This file enables only the NVIDIA GPU-enabled shims:
+This file enables only the NVIDIA GPU-enabled shims and installs them using the
+[`job` deployment mode](#deployment-modes-daemonset-vs-job) (no always-on
+DaemonSet on the node):
 
 ```sh
 helm install kata-deploy oci://ghcr.io/kata-containers/kata-deploy-charts/kata-deploy \
@@ -330,7 +372,7 @@ $ helm install kata-deploy \
 
 You can also use a values file:
 
-```yaml title="values.yaml"
+```yaml
 nodeSelector:
   kata-containers: "enabled"
   node-type: "worker"
@@ -339,6 +381,107 @@ nodeSelector:
 ```sh
 $ helm install kata-deploy -f values.yaml "${CHART}" --version "${VERSION}"
 ```
+
+### `podLabels`
+
+You can add extra labels to the kata-deploy DaemonSet pods. These are applied
+in addition to the `name: kata-deploy` label that the chart uses internally.
+The chart ignores a `name` key in `podLabels` and always sets the required
+selector label itself.
+
+```sh
+$ helm install kata-deploy \
+  --set podLabels.team=platform \
+  "${CHART}" --version "${VERSION}"
+```
+
+Or via a values file:
+
+```yaml
+podLabels:
+  team: platform
+```
+
+### `podAnnotations`
+
+You can add annotations to the kata-deploy DaemonSet pods for whatever your
+environment needs: Prometheus scrape hints, policy markers, revision metadata,
+and so on. The chart does not set any annotations on the kata-deploy DaemonSet
+pod template by default, so nothing is reserved or overwritten unless you set
+`podAnnotations` yourself.
+
+```sh
+$ helm install kata-deploy \
+  --set-string podAnnotations.prometheus\.io/scrape=false \
+  "${CHART}" --version "${VERSION}"
+```
+
+Or via a values file:
+
+```yaml
+podAnnotations:
+  prometheus.io/scrape: "false"
+  example.com/owner: platform-team
+```
+
+### `affinity`
+
+Use `affinity` when you need more granular scheduling controls than
+`nodeSelector` alone. `nodeSelector` only matches exact key/value pairs on a
+node; affinity gives you `matchExpressions` (e.g. `In`, `NotIn`) and rules
+about other pods on the same node. For example, you might want kata-deploy on
+nodes reserved for your platform team but *not* on nodes that run the GPU
+operator.
+
+```sh
+# First, label the nodes where kata-deploy should run
+$ kubectl label nodes worker-node-1 node.cloud/reserved=platform-team
+$ kubectl label nodes worker-node-2 node.cloud/reserved=platform-team
+
+# Then install the chart with affinity
+$ helm install kata-deploy -f values.yaml "${CHART}" --version "${VERSION}"
+```
+
+```yaml
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: node.cloud/reserved
+              operator: In
+              values:
+                - platform-team
+  podAntiAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchExpressions:
+            - key: app
+              operator: In
+              values:
+                - gpu-operator
+        topologyKey: kubernetes.io/hostname
+```
+
+When `node-feature-discovery.enabled=true`, the chart also merges in a
+`nodeAffinity` rule that requires hardware virtualization support.
+
+!!! note "How NFD and user nodeAffinity are combined"
+    Within a single `nodeSelectorTerm`, `matchExpressions` and `matchFields` are
+    **AND**-ed (all must match). Across `nodeSelectorTerms`, terms are **OR**-ed
+    (any one term may match).
+
+    If you set `affinity.nodeAffinity` yourself, only your **required**
+    `nodeSelectorTerms` participate in the merge. They are combined with the
+    built-in virtualization terms as **(NFD OR-group) AND (user OR-group)**:
+    each built-in term is AND-ed with each of your required terms. Multiple
+    user required terms remain OR among themselves. NFD virtualization
+    requirements cannot be bypassed by user affinity.
+
+    If you set `nodeAffinity` without `requiredDuringSchedulingIgnoredDuringExecution`,
+    the built-in NFD required terms are still applied. Other affinity fields
+    (`podAffinity`, `podAntiAffinity`, and `preferredDuringSchedulingIgnoredDuringExecution`)
+    are passed through unchanged.
 
 ### Multiple Kata installations on the Same Node
 
@@ -401,4 +544,3 @@ no manual `runtimeClass.nodeSelector` is set for that shim.
 **Note**: NFD detection requires cluster access. During `helm template` (dry-run without a
 cluster), external NFD is not seen, so auto-injected labels are not added. Manual
 `runtimeClass.nodeSelector` values are still applied in all cases.
-

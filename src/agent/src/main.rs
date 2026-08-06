@@ -43,8 +43,10 @@ mod config;
 mod console;
 mod device;
 mod features;
+mod guest_extension_image;
 mod initdata;
 mod linux_abi;
+mod mediation;
 mod metrics;
 mod mount;
 mod namespace;
@@ -85,6 +87,22 @@ mod tracer;
 #[cfg(feature = "agent-policy")]
 mod policy;
 
+// BL-8: the measured base policy's declared policy-fragment requirements, and the
+// fail-closed gate that keeps containers from starting until the host has delivered them.
+// Only in strict confidential builds, where the SRM `FRAGMENTS` store exists.
+#[cfg(feature = "strict-policy")]
+mod policy_fragments;
+
+// In-guest verification that the initdata the agent consumed is the initdata the VM was
+// launched with (HOSTDATA / MRCONFIGID). Only in strict confidential builds.
+#[cfg(feature = "strict-policy")]
+mod hostdata;
+
+// FR-3: bounds the divergence between the OCI spec the policy authorized and the spec the
+// in-guest resolution chain actually executes. Only in strict confidential builds.
+#[cfg(feature = "strict-policy")]
+mod plan_binding;
+
 cfg_if! {
     if #[cfg(target_arch = "s390x")] {
         mod ap;
@@ -96,6 +114,9 @@ const NAME: &str = "kata-agent";
 
 const UNIX_SOCKET_PREFIX: &str = "unix://";
 
+// Legacy (non-extension) rootfs locations for the CoCo guest components. They are
+// used to build the built-in launch plan when no CoCo extension image is mounted,
+// keeping monolithic / non-confidential images working unchanged.
 const AA_PATH: &str = "/usr/local/bin/attestation-agent";
 const AA_ATTESTATION_SOCKET: &str =
     "/run/confidential-containers/attestation-agent/attestation-agent.sock";
@@ -107,8 +128,6 @@ const CDH_SOCKET_URI: &str = concatcp!(UNIX_SOCKET_PREFIX, CDH_SOCKET);
 
 const API_SERVER_PATH: &str = "/usr/local/bin/api-server-rest";
 
-/// Path of ocicrypt config file. This is used by CDH when decrypting image.
-/// TODO: remove this when we move the launch of CDH out of the kata-agent.
 const OCICRYPT_CONFIG_PATH: &str = "/etc/ocicrypt_config.json";
 
 lazy_static! {
@@ -122,6 +141,71 @@ lazy_static! {
 #[cfg(feature = "agent-policy")]
 lazy_static! {
     static ref AGENT_POLICY: Mutex<AgentPolicy> = Mutex::new(AgentPolicy::new());
+}
+
+// FR-6: the Security Reference Monitor tracks each security-relevant, state-mutating
+// operation as a two-phase transaction (prepare/execute/commit/abort) so policy and
+// runtime state commit together or are rolled back/quarantined. Present only in strict
+// builds; it is agent-internal and introduces no new shim<->agent API.
+#[cfg(feature = "strict-policy")]
+lazy_static! {
+    static ref SRM: Mutex<kata_security_reference_monitor::ReferenceMonitor> =
+        Mutex::new(kata_security_reference_monitor::ReferenceMonitor::new());
+}
+
+// FR-9: registry of container occurrences and their lifecycle states. The host
+// container_id is an untrusted alias; the enforcer mints its own occurrence handle and
+// gates every lifecycle-mutating RPC on the occurrence state. Strict builds only;
+// agent-internal, no new shim<->agent API.
+#[cfg(feature = "strict-policy")]
+lazy_static! {
+    static ref OCCURRENCES: Mutex<kata_security_reference_monitor::OccurrenceRegistry> =
+        Mutex::new(kata_security_reference_monitor::OccurrenceRegistry::new());
+}
+
+// FR-1: verifier/accumulator for signed, add-only policy fragments. Receipts are enforced
+// in strict builds. Authorized issuers and root constraints are configured from measured
+// state; absent configuration, no issuer is trusted (fail-closed). Strict builds only.
+#[cfg(feature = "strict-policy")]
+lazy_static! {
+    static ref FRAGMENTS: Mutex<kata_security_reference_monitor::FragmentStore> =
+        Mutex::new(kata_security_reference_monitor::FragmentStore::new(true));
+}
+
+// FR-14: network phase state machine. Network-mutating RPCs are permitted only during
+// sandbox setup; once a workload container starts the network surface is frozen. Strict
+// builds only; agent-internal.
+#[cfg(feature = "strict-policy")]
+lazy_static! {
+    static ref NET_PHASE: Mutex<kata_security_reference_monitor::NetworkPhaseMachine> =
+        Mutex::new(kata_security_reference_monitor::NetworkPhaseMachine::new());
+}
+
+// FR-4C: measured allowlist of authorized read-only layer (dm-verity) root digests. The
+// storage handler authorizes each dm-verity layer's (algorithm, root_hash) against this
+// store before creating the verity device — the Kata analogue of runhcs
+// EnforceDeviceMountPolicy(target, RootDigest). Configured from measured state; when
+// verification is required but no layer is authorized, every layer is rejected (fail-closed).
+// Strict builds only.
+#[cfg(feature = "strict-policy")]
+lazy_static! {
+    pub(crate) static ref VERIFIED_LAYERS: Mutex<kata_security_reference_monitor::VerifiedLayerStore> =
+        Mutex::new(kata_security_reference_monitor::VerifiedLayerStore::new(
+            false
+        ));
+}
+
+// BL-3: measured allowlist of authorized guest-pull image manifest digests. The image-pull
+// storage handler authorizes each image reference against this store before asking the CDH to
+// pull it — the image-path analogue of FR-4C. Configured from measured state; when
+// verification is required but no image is authorized, every image is rejected (fail-closed).
+// Strict builds only.
+#[cfg(feature = "strict-policy")]
+lazy_static! {
+    pub(crate) static ref VERIFIED_IMAGES: Mutex<kata_security_reference_monitor::VerifiedImageStore> =
+        Mutex::new(kata_security_reference_monitor::VerifiedImageStore::new(
+            false
+        ));
 }
 
 #[derive(Parser)]
@@ -367,7 +451,14 @@ async fn start_sandbox(
 ) -> Result<()> {
     let debug_console_vport = config.debug_console_vport as u32;
 
-    if config.debug_console {
+    // FR-7: the interactive debug console is an un-mediated shell into the guest and is
+    // never available in a strict confidential build, regardless of host configuration.
+    #[cfg(feature = "strict-policy")]
+    let debug_console_enabled = false;
+    #[cfg(not(feature = "strict-policy"))]
+    let debug_console_enabled = config.debug_console;
+
+    if debug_console_enabled {
         let debug_console_task = tokio::task::spawn(console::debug_console_handler(
             logger.clone(),
             debug_console_vport,
@@ -411,14 +502,71 @@ async fn start_sandbox(
 
     let initdata_return_value = initdata::initialize_initdata(logger).await?;
 
+    // FR-2: bind the initdata the agent just parsed to the VM's launch measurement before
+    // anything consumes it. The host stamps the initdata digest into HOSTDATA (SEV-SNP) or
+    // MRCONFIGID (TDX); without this check the guest would take the host's word for it and
+    // rely on a remote verifier to notice later -- which gates secret release but does not
+    // stop the guest from running under host-chosen initdata (policy, SRM trust roots,
+    // AA/CDH config) in the meantime. Equivalent to hcsshim's `ValidateHostData()`.
+    //
+    // Fail-closed: a mismatch, or a report we cannot read or parse, aborts the VM. When the
+    // guest has no TEE report provider it is not a confidential VM, so there is no launch
+    // measurement to bind to and nothing to verify.
+    #[cfg(feature = "strict-policy")]
+    if let Some(idrv) = initdata_return_value.as_ref() {
+        match hostdata::verify_initdata_binding(logger, &idrv.digest) {
+            Ok(true) => info!(logger, "FR-2: initdata verified against launch measurement"),
+            Ok(false) => warn!(
+                logger,
+                "FR-2: no TEE report provider; initdata is NOT bound to a launch measurement"
+            ),
+            Err(e) => {
+                error!(
+                    logger,
+                    "FR-2: initdata does not match the launch measurement, aborting VM: {:?}", e
+                );
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                std::process::abort();
+            }
+        }
+    }
+
+    // FR-1b / FR-4C / BL-3 (BL-5): seed the SRM trust roots — the policy-fragment issuers,
+    // the verified read-only-layer (dm-verity) allowlist, and the verified guest-pull image
+    // allowlist — from measured guest state, *preferring* the attestation-bound initdata
+    // section over the measured-rootfs file. Seeded after initdata is parsed and before the
+    // ttRPC server (and the BL-8 boot fragment pull) run. Fail-closed semantics are
+    // unchanged: absent config ⇒ no authorized issuer/layer/image.
+    #[cfg(feature = "strict-policy")]
+    {
+        let idrv = initdata_return_value.as_ref();
+        if let Err(e) =
+            seed_fragment_trust_root(logger, idrv.and_then(|r| r._fragment_issuers.as_deref()))
+                .await
+        {
+            warn!(logger, "FR-1: fragment trust root not seeded: {:?}", e);
+        }
+        if let Err(e) =
+            seed_verified_layers(logger, idrv.and_then(|r| r._verified_layers.as_deref())).await
+        {
+            warn!(logger, "FR-4C: verified layers not seeded: {:?}", e);
+        }
+        if let Err(e) =
+            seed_verified_images(logger, idrv.and_then(|r| r._verified_images.as_deref())).await
+        {
+            warn!(logger, "BL-3: verified images not seeded: {:?}", e);
+        }
+    }
+
     let gc_procs = config.guest_components_procs;
-    if !attestation_binaries_available(logger, &gc_procs) {
+    let launch_plan = build_coco_launch_plan(config, &initdata_return_value, gc_procs)?;
+    if !attestation_components_available(logger, &launch_plan) {
         warn!(
             logger,
             "attestation binaries requested for launch not available"
         );
     } else {
-        init_attestation_components(logger, config, &initdata_return_value).await?;
+        init_attestation_components(logger, &launch_plan).await?;
     }
 
     // if policy is given via initdata, use it
@@ -432,6 +580,40 @@ async fn start_sandbox(
                 .set_policy(policy)
                 .await
                 .context("Failed to set policy from initdata")?;
+        }
+    }
+
+    // BL-8: record the fragment requirements the measured base policy declares, after the
+    // base policy is set from init-data and the fragment trust root is seeded.
+    //
+    // The guest does NOT fetch them. This runs before rpc::start() below, and the guest's
+    // interfaces and routes are configured only by the update_interface/update_routes ttRPC
+    // handlers — so at this point there is no network at all and a pull could never
+    // succeed. Delivery is the host's job (as in C-ACI/hcsshim), arriving through
+    // rpc::load_policy_fragment; verification stays here, against the measured trust root.
+    //
+    // Fail-closed is preserved by refusing container creation while any declaration marked
+    // `required` is outstanding, not by aborting here — the bytes legitimately have not
+    // arrived yet. Declarations without that flag are lazy, as in C-ACI/hcsshim: an
+    // undelivered fragment grants nothing, so its absence cannot widen what runs. Failing to
+    // *read* the declarations is still fatal: an unreadable list must not be mistaken for an
+    // empty one.
+    #[cfg(feature = "strict-policy")]
+    match policy_fragments::record_declared_fragments().await {
+        Ok(n) if n > 0 => info!(
+            logger,
+            "FR-1/BL-8: {} declared fragment(s) recorded; see policy-fragments logs for which \
+             are required",
+            n
+        ),
+        Ok(_) => {}
+        Err(e) => {
+            error!(
+                logger,
+                "FR-1/BL-8: could not read declared policy fragments, aborting VM: {:?}", e
+            );
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            std::process::abort();
         }
     }
 
@@ -461,26 +643,192 @@ async fn start_sandbox(
     Ok(())
 }
 
-// Check if required attestation binaries are available on the rootfs.
-fn attestation_binaries_available(logger: &Logger, procs: &GuestComponentsProcs) -> bool {
-    let binaries = match procs {
-        GuestComponentsProcs::AttestationAgent => vec![AA_PATH],
-        GuestComponentsProcs::ConfidentialDataHub => vec![AA_PATH, CDH_PATH],
-        GuestComponentsProcs::ApiServerRest => vec![AA_PATH, CDH_PATH, API_SERVER_PATH],
-        _ => vec![],
+// Map the requested guest-components level to the numeric gating level used by
+// extension manifests. A process is launched only when its declared `level` is
+// <= this value. The ordering mirrors the implications documented on
+// `GuestComponentsProcs` (ApiServerRest implies CDH implies AttestationAgent).
+fn guest_components_max_level(procs: GuestComponentsProcs) -> u32 {
+    match procs {
+        GuestComponentsProcs::None => 0,
+        GuestComponentsProcs::AttestationAgent => 1,
+        GuestComponentsProcs::ConfidentialDataHub => 2,
+        GuestComponentsProcs::ApiServerRest => 3,
+    }
+}
+
+// Build the substitution context exposed to extension manifests. New extension bundles
+// can rely on these variables without requiring agent code changes; introducing
+// a brand new variable is the only case that needs touching the agent.
+fn build_substitution_ctx(
+    config: &AgentConfig,
+    initdata_return_value: &Option<InitdataReturnValue>,
+) -> Result<std::collections::HashMap<String, String>> {
+    let ocicrypt_config_path = guest_extension_image::resolve_component_path(
+        guest_extension_image::COCO_EXTENSION_NAME,
+        guest_extension_image::COCO_COMPONENT_OCICRYPT_CONFIG,
+        OCICRYPT_CONFIG_PATH,
+    )?;
+
+    let initdata_toml_path = if initdata_return_value.is_some() {
+        initdata::INITDATA_TOML_PATH.to_string()
+    } else {
+        String::new()
     };
-    for binary in binaries.iter() {
-        let exists = Path::new(binary)
+
+    let extension_root =
+        guest_extension_image::extension_mount_root(guest_extension_image::COCO_EXTENSION_NAME)?;
+
+    let mut ctx = std::collections::HashMap::new();
+    ctx.insert(
+        "aa_attestation_uri".to_string(),
+        AA_ATTESTATION_URI.to_string(),
+    );
+    ctx.insert(
+        "aa_attestation_socket".to_string(),
+        AA_ATTESTATION_SOCKET.to_string(),
+    );
+    ctx.insert("aa_config_path".to_string(), AA_CONFIG_PATH.to_string());
+    ctx.insert("cdh_config_path".to_string(), CDH_CONFIG_PATH.to_string());
+    ctx.insert("cdh_socket".to_string(), CDH_SOCKET.to_string());
+    ctx.insert(
+        "ocicrypt_config_path".to_string(),
+        ocicrypt_config_path.to_string_lossy().into_owned(),
+    );
+    ctx.insert(
+        "rest_api_features".to_string(),
+        config.guest_components_rest_api.to_string(),
+    );
+    ctx.insert(
+        "launch_process_timeout".to_string(),
+        config.launch_process_timeout.as_secs().to_string(),
+    );
+    ctx.insert("initdata_toml_path".to_string(), initdata_toml_path);
+    ctx.insert(
+        "extension_root".to_string(),
+        extension_root.to_string_lossy().into_owned(),
+    );
+    // The CoCo extension ships several attestation-agent flavours and selects one
+    // via the manifest's "attester_variant". The guest init (NVRC) owns that
+    // decision: with a GPU present it sets KATA_ATTESTER_VARIANT=nvidia so the
+    // NVIDIA-attester build launches (it emits the GPU evidence a KBS GPU
+    // policy requires). Absent that signal we fall back to the stock attester.
+    // Cross-component contract: the env var name and "nvidia" value are set by
+    // NVRC (src/kata_agent.rs, src/gpu.rs); keep them in sync.
+    let attester_variant = env::var("KATA_ATTESTER_VARIANT")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "default".to_string());
+    ctx.insert("attester_variant".to_string(), attester_variant);
+
+    Ok(ctx)
+}
+
+// Built-in launch plan used when no CoCo extension image is mounted. It reproduces
+// the legacy behaviour of launching the guest components from the rootfs
+// (`/usr/local/bin/...`), so monolithic and non-confidential images are
+// unaffected by the extension machinery.
+fn builtin_coco_plan(
+    config: &AgentConfig,
+    initdata_return_value: &Option<InitdataReturnValue>,
+    max_level: u32,
+) -> Vec<guest_extension_image::LaunchSpec> {
+    let mut plan = Vec::new();
+
+    if max_level >= 1 {
+        let mut args = vec![
+            "--attestation_sock".to_string(),
+            AA_ATTESTATION_URI.to_string(),
+        ];
+        if initdata_return_value.is_some() {
+            args.push("--initdata-toml".to_string());
+            args.push(initdata::INITDATA_TOML_PATH.to_string());
+        }
+        plan.push(guest_extension_image::LaunchSpec {
+            id: "attestation-agent".to_string(),
+            path: Path::new(AA_PATH).to_path_buf(),
+            args,
+            config: Some(AA_CONFIG_PATH.to_string()),
+            env: vec![],
+            wait_socket: Some(AA_ATTESTATION_SOCKET.to_string()),
+            timeout_secs: config.launch_process_timeout.as_secs(),
+        });
+    }
+
+    if max_level >= 2 {
+        plan.push(guest_extension_image::LaunchSpec {
+            id: "confidential-data-hub".to_string(),
+            path: Path::new(CDH_PATH).to_path_buf(),
+            args: vec![],
+            config: Some(CDH_CONFIG_PATH.to_string()),
+            env: vec![(
+                "OCICRYPT_KEYPROVIDER_CONFIG".to_string(),
+                OCICRYPT_CONFIG_PATH.to_string(),
+            )],
+            wait_socket: Some(CDH_SOCKET.to_string()),
+            timeout_secs: config.launch_process_timeout.as_secs(),
+        });
+    }
+
+    if max_level >= 3 {
+        plan.push(guest_extension_image::LaunchSpec {
+            id: "api-server-rest".to_string(),
+            path: Path::new(API_SERVER_PATH).to_path_buf(),
+            args: vec![
+                "--features".to_string(),
+                config.guest_components_rest_api.to_string(),
+            ],
+            config: None,
+            env: vec![],
+            wait_socket: None,
+            timeout_secs: 0,
+        });
+    }
+
+    plan
+}
+
+// Build the ordered launch plan for the guest components. When a CoCo extension
+// image is mounted its manifest drives the plan (so new bundles need no agent
+// changes); otherwise the built-in legacy plan is used.
+fn build_coco_launch_plan(
+    config: &AgentConfig,
+    initdata_return_value: &Option<InitdataReturnValue>,
+    procs: GuestComponentsProcs,
+) -> Result<Vec<guest_extension_image::LaunchSpec>> {
+    let max_level = guest_components_max_level(procs);
+    let ctx = build_substitution_ctx(config, initdata_return_value)?;
+    match guest_extension_image::launch_plan(
+        guest_extension_image::COCO_EXTENSION_NAME,
+        max_level,
+        &ctx,
+    )? {
+        Some(plan) => Ok(plan),
+        None => Ok(builtin_coco_plan(config, initdata_return_value, max_level)),
+    }
+}
+
+// Check that every process in the launch plan is present on disk. A missing
+// binary means the components were not provisioned (e.g. a non-confidential
+// rootfs), in which case launching is skipped.
+fn attestation_components_available(
+    logger: &Logger,
+    plan: &[guest_extension_image::LaunchSpec],
+) -> bool {
+    for spec in plan {
+        let exists = spec
+            .path
             .try_exists()
             .unwrap_or_else(|error| match error.kind() {
-                ErrorKind::NotFound => {
-                    warn!(logger, "{} not found", binary);
-                    false
-                }
-                _ => panic!("Path existence check failed for '{}': {}", binary, error),
+                ErrorKind::NotFound => false,
+                _ => panic!(
+                    "Path existence check failed for '{}': {}",
+                    spec.path.display(),
+                    error
+                ),
             });
 
         if !exists {
+            warn!(logger, "{} not found", spec.path.display());
             return false;
         }
     }
@@ -489,75 +837,34 @@ fn attestation_binaries_available(logger: &Logger, procs: &GuestComponentsProcs)
 
 async fn launch_guest_component_procs(
     logger: &Logger,
-    config: &AgentConfig,
-    initdata_return_value: &Option<InitdataReturnValue>,
+    plan: &[guest_extension_image::LaunchSpec],
 ) -> Result<()> {
-    if config.guest_components_procs == GuestComponentsProcs::None {
-        return Ok(());
+    for spec in plan {
+        let path = spec
+            .path
+            .to_str()
+            .ok_or_else(|| anyhow!("non-utf8 component path {}", spec.path.display()))?;
+        debug!(logger, "spawning extension component process {}", spec.id);
+
+        let args: Vec<&str> = spec.args.iter().map(String::as_str).collect();
+        let envs: Vec<(&str, &str)> = spec
+            .env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        launch_process(
+            logger,
+            path,
+            args,
+            spec.config.as_deref(),
+            spec.wait_socket.as_deref().unwrap_or(""),
+            spec.timeout_secs,
+            &envs,
+        )
+        .await
+        .map_err(|e| anyhow!("launch_process {} failed: {:?}", path, e))?;
     }
-
-    debug!(logger, "spawning attestation-agent process {}", AA_PATH);
-    let mut aa_args = vec!["--attestation_sock", AA_ATTESTATION_URI];
-    if initdata_return_value.is_some() {
-        aa_args.push("--initdata-toml");
-        aa_args.push(initdata::INITDATA_TOML_PATH);
-    }
-
-    launch_process(
-        logger,
-        AA_PATH,
-        aa_args,
-        Some(AA_CONFIG_PATH),
-        AA_ATTESTATION_SOCKET,
-        config.launch_process_timeout.as_secs(),
-        &[],
-    )
-    .await
-    .map_err(|e| anyhow!("launch_process {} failed: {:?}", AA_PATH, e))?;
-
-    // skip launch of confidential-data-hub and api-server-rest
-    if config.guest_components_procs == GuestComponentsProcs::AttestationAgent {
-        return Ok(());
-    }
-
-    debug!(
-        logger,
-        "spawning confidential-data-hub process {}", CDH_PATH
-    );
-
-    launch_process(
-        logger,
-        CDH_PATH,
-        vec![],
-        Some(CDH_CONFIG_PATH),
-        CDH_SOCKET,
-        config.launch_process_timeout.as_secs(),
-        &[("OCICRYPT_KEYPROVIDER_CONFIG", OCICRYPT_CONFIG_PATH)],
-    )
-    .await
-    .map_err(|e| anyhow!("launch_process {} failed: {:?}", CDH_PATH, e))?;
-
-    // skip launch of api-server-rest
-    if config.guest_components_procs == GuestComponentsProcs::ConfidentialDataHub {
-        return Ok(());
-    }
-
-    let features = config.guest_components_rest_api;
-    debug!(
-        logger,
-        "spawning api-server-rest process {} --features {}", API_SERVER_PATH, features
-    );
-    launch_process(
-        logger,
-        API_SERVER_PATH,
-        vec!["--features", &features.to_string()],
-        None,
-        "",
-        0,
-        &[],
-    )
-    .await
-    .map_err(|e| anyhow!("launch_process {} failed: {:?}", API_SERVER_PATH, e))?;
 
     Ok(())
 }
@@ -568,10 +875,9 @@ async fn launch_guest_component_procs(
 // If the CDH is started, a CDH client will be instantiated and returned.
 async fn init_attestation_components(
     logger: &Logger,
-    config: &AgentConfig,
-    initdata_return_value: &Option<InitdataReturnValue>,
+    plan: &[guest_extension_image::LaunchSpec],
 ) -> Result<()> {
-    launch_guest_component_procs(logger, config, initdata_return_value).await?;
+    launch_guest_component_procs(logger, plan).await?;
 
     // If a CDH socket exists, initialize the CDH client and enable ocicrypt
     match tokio::fs::metadata(CDH_SOCKET).await {
@@ -694,6 +1000,553 @@ async fn initialize_policy() -> Result<()> {
             None,
         )
         .await
+}
+
+// FR-1b: measured guest path listing the authorized policy-fragment issuers. It lives in
+// the measured rootfs; overridable via KATA_FRAGMENT_ISSUERS for tests. Format (TOML):
+//   require_receipt = true
+//   [[issuer]]
+//   id = "issuerA"
+//   ed25519_pubkey_hex = "<64 hex chars>"
+//   min_svn = 5
+#[cfg(feature = "strict-policy")]
+const FRAGMENT_ISSUERS_PATH: &str = "/etc/kata/fragment-issuers.toml";
+
+// BL-5: resolve an SRM trust-root config with provenance precedence:
+//   1. the measured **initdata** section (attestation-bound) — preferred;
+//   2. else the measured-rootfs file (env-overridable for tests).
+// Returns None when neither source provides the config (so the caller can fail-closed /
+// leave the feature off, unchanged from before). The chosen source is logged so the
+// provenance of the active trust root is auditable.
+#[cfg(feature = "strict-policy")]
+fn resolve_measured_config(
+    logger: &Logger,
+    label: &str,
+    initdata_cfg: Option<&str>,
+    env_var: &str,
+    default_path: &str,
+) -> Option<String> {
+    if let Some(text) = initdata_cfg {
+        info!(
+            logger,
+            "{}: trust-root config sourced from measured initdata", label
+        );
+        return Some(text.to_string());
+    }
+    let path = std::env::var(env_var).unwrap_or_else(|_| default_path.to_string());
+    match std::fs::read_to_string(&path) {
+        Ok(t) => {
+            info!(logger, "{}: trust-root config sourced from measured rootfs", label; "path" => &path);
+            Some(t)
+        }
+        Err(_) => None,
+    }
+}
+
+// FR-1i: runtime SVN high-water state, persisted so an agent restart cannot reopen a
+// rollback window. Must live on sealed/encrypted-scratch storage (in a confidential guest
+// the writable scratch is memory-/disk-encrypted). Overridable via KATA_FRAGMENT_SVN_STATE.
+#[cfg(feature = "strict-policy")]
+const FRAGMENT_SVN_STATE_PATH: &str = "/run/kata/fragment-svn.state";
+
+#[cfg(feature = "strict-policy")]
+fn fragment_svn_state_path() -> String {
+    std::env::var("KATA_FRAGMENT_SVN_STATE").unwrap_or_else(|_| FRAGMENT_SVN_STATE_PATH.to_string())
+}
+
+// FR-1i: write the exported SVN snapshot to the persistence path (best-effort).
+#[cfg(feature = "strict-policy")]
+pub(crate) fn persist_fragment_svn_state(snapshot: &str) {
+    let path = fragment_svn_state_path();
+    if let Some(dir) = std::path::Path::new(&path).parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&path, snapshot);
+}
+
+#[cfg(feature = "strict-policy")]
+#[derive(serde::Deserialize, Default)]
+struct FragmentTrustConfig {
+    #[serde(default)]
+    require_receipt: Option<bool>,
+    /// FR-1f: legacy single transparency anchor public key (hex); mapped to the default
+    /// ledger. Prefer `[[ledger]]` for multi-ledger / rotation.
+    #[serde(default)]
+    transparency_anchor_hex: Option<String>,
+    /// FR-1f (trust list): the Transparency Trust List — named ledgers with rotatable keys.
+    #[serde(default)]
+    ledger: Vec<FragmentLedgerConfig>,
+    /// FR-1d: require every fragment to carry a valid did:x509 chain (no raw-key path).
+    #[serde(default)]
+    require_x509: Option<bool>,
+    /// FR-1d: measured certificate revocation list (SHA-256 fingerprints, hex).
+    #[serde(default)]
+    revoked: Vec<String>,
+    /// FR-1d: authorized did:x509 CA anchors.
+    #[serde(default, rename = "ca_anchor")]
+    ca_anchor: Vec<FragmentCaAnchorConfig>,
+    /// FR-1j: enable append-only application ordering (the log-head gate). Opt-in.
+    #[serde(default)]
+    ordered: Option<bool>,
+    /// FR-1j: the measured ordering-log genesis (hex). Defaults to a fixed constant when
+    /// `ordered` is true and this is unset.
+    #[serde(default)]
+    log_genesis_hex: Option<String>,
+    #[serde(default)]
+    issuer: Vec<FragmentIssuerConfig>,
+}
+
+#[cfg(feature = "strict-policy")]
+#[derive(serde::Deserialize)]
+struct FragmentCaAnchorConfig {
+    /// The did:x509 issuer id this anchor authorizes (must equal a fragment's issuer).
+    did: String,
+    /// SHA-256 fingerprint (hex) of the trusted CA certificate DER. One of this or
+    /// `ca_cert_pem` must be set.
+    #[serde(default)]
+    ca_fingerprint_hex: Option<String>,
+    /// PEM of the trusted CA certificate (its fingerprint is derived). Alternative to
+    /// `ca_fingerprint_hex`.
+    #[serde(default)]
+    ca_cert_pem: Option<String>,
+    /// did:x509 policy over the leaf: required subject Common Name.
+    #[serde(default)]
+    require_subject_cn: Option<String>,
+    /// did:x509 policy: required leaf Extended Key Usage OIDs (dotted).
+    #[serde(default)]
+    require_eku: Vec<String>,
+    /// did:x509 policy: required leaf DNS SubjectAltName entries.
+    #[serde(default)]
+    require_san_dns: Vec<String>,
+}
+
+#[cfg(feature = "strict-policy")]
+#[derive(serde::Deserialize)]
+struct FragmentLedgerConfig {
+    id: String,
+    /// One or more current Ed25519 verification keys for this ledger (multiple ⇒ rotation).
+    #[serde(default)]
+    pubkey_hex: Vec<String>,
+    /// BL-2: additional non-Ed25519 keys (ES256/ES384/PS256/RS256), each a SubjectPublicKeyInfo
+    /// DER in hex plus its COSE algorithm name.
+    #[serde(default)]
+    key: Vec<FragmentLedgerKeyConfig>,
+    /// FR-1f (trust list): Trust List subject(s) that vouched for this ledger's keys.
+    ///
+    /// Recording provenance is what lets a scope require `TTL:<subject>` — "a receipt
+    /// validated by a key subject S vouched for" — rather than only naming the ledger,
+    /// which is self-asserted metadata on the receipt. Absent here, `TTL:` requirements
+    /// against this ledger are unmet, which is the fail-closed reading.
+    #[serde(default)]
+    ttl_subjects: Vec<String>,
+}
+
+#[cfg(feature = "strict-policy")]
+#[derive(serde::Deserialize)]
+struct FragmentLedgerKeyConfig {
+    /// COSE algorithm: "eddsa" | "es256" | "es384" | "ps256" | "rs256".
+    alg: String,
+    /// SubjectPublicKeyInfo DER (hex) for the ledger key.
+    spki_hex: String,
+}
+
+#[cfg(feature = "strict-policy")]
+#[derive(serde::Deserialize)]
+struct FragmentIssuerConfig {
+    id: String,
+    ed25519_pubkey_hex: String,
+    #[serde(default)]
+    min_svn: u64,
+    /// FR-1f (trust list): ledgers a receipt for this issuer's default feed must come from
+    /// (policy-driven required_receipts). Non-empty ⇒ a receipt is mandatory.
+    #[serde(default)]
+    required_receipt_from: Vec<String>,
+    /// FR-1f (trust list): ledgers allowed to back receipts for this issuer's default feed.
+    #[serde(default)]
+    allowed_ledgers: Vec<String>,
+    /// FR-1e: named feeds this issuer may publish, with their SVN floor.
+    #[serde(default)]
+    feed: Vec<FragmentFeedConfig>,
+}
+
+#[cfg(feature = "strict-policy")]
+#[derive(serde::Deserialize)]
+struct FragmentFeedConfig {
+    name: String,
+    #[serde(default)]
+    min_svn: u64,
+    /// FR-1f (trust list): ledgers a receipt for this feed must come from.
+    #[serde(default)]
+    required_receipt_from: Vec<String>,
+    /// FR-1f (trust list): ledgers allowed to back receipts for this feed.
+    #[serde(default)]
+    allowed_ledgers: Vec<String>,
+    /// FR-1c: policy namespaces under `agent_policy.fragments.` a fragment on this feed may
+    /// contribute a module to. Empty grants only the shared `agent_policy.fragments`
+    /// package. The fragment's own `includes` cannot widen this.
+    #[serde(default)]
+    includes: Vec<String>,
+    /// FR-1c: whether a fragment on this feed may apply its Rego module at all. False
+    /// accepts the fragment for its SVN/receipt/ordering record but contributes no rules.
+    #[serde(default = "default_true_cfg")]
+    allow_module: bool,
+    /// FR-1k: values to instantiate a parameterised fragment on this feed with, as a TOML
+    /// table. The fragment reads them via `parameter("name")`; a name it does not supply
+    /// falls back to the fragment's own declared default.
+    #[serde(default)]
+    parameters: Option<toml::Value>,
+}
+
+#[cfg(feature = "strict-policy")]
+fn default_true_cfg() -> bool {
+    true
+}
+
+#[cfg(feature = "strict-policy")]
+fn decode_hex32(s: &str) -> Result<[u8; 32]> {
+    let s = s.trim();
+    if s.len() != 64 {
+        anyhow::bail!("ed25519 pubkey must be 64 hex chars, got {}", s.len());
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
+            .map_err(|e| anyhow::anyhow!("invalid hex in pubkey: {e}"))?;
+    }
+    Ok(out)
+}
+
+// FR-1j: decode an arbitrary-length hex string (e.g. the ordering-log genesis).
+#[cfg(feature = "strict-policy")]
+fn decode_hex_vec(s: &str) -> Result<Vec<u8>> {
+    let s = s.trim();
+    if !s.len().is_multiple_of(2) {
+        anyhow::bail!("hex string has odd length: {}", s.len());
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| anyhow::anyhow!("invalid hex: {e}"))
+        })
+        .collect()
+}
+
+// FR-1b: configure the global fragment store from measured state. Absent/empty config
+// leaves the store with no authorized issuers (fail-closed).
+#[cfg(feature = "strict-policy")]
+async fn seed_fragment_trust_root(logger: &Logger, initdata_cfg: Option<&str>) -> Result<()> {
+    let text = match resolve_measured_config(
+        logger,
+        "FR-1",
+        initdata_cfg,
+        "KATA_FRAGMENT_ISSUERS",
+        FRAGMENT_ISSUERS_PATH,
+    ) {
+        Some(t) => t,
+        None => {
+            info!(
+                logger,
+                "FR-1: no fragment-issuer config; fragments fail-closed"
+            );
+            return Ok(());
+        }
+    };
+    let cfg: FragmentTrustConfig = toml::from_str(&text).context("parse fragment-issuers.toml")?;
+
+    let mut store = FRAGMENTS.lock().await;
+    if let Some(rr) = cfg.require_receipt {
+        // Rebuild with the configured receipt requirement, preserving fail-closed default.
+        *store = kata_security_reference_monitor::FragmentStore::new(rr);
+    }
+    // FR-1f: configure the transparency anchor (receipts cryptographically verified).
+    if let Some(anchor_hex) = &cfg.transparency_anchor_hex {
+        let key = decode_hex32(anchor_hex).context("transparency anchor key")?;
+        store
+            .set_transparency_anchor(&key)
+            .map_err(|e| anyhow::anyhow!("set transparency anchor: {}", e))?;
+        info!(
+            logger,
+            "FR-1: transparency anchor configured (default ledger)"
+        );
+    }
+    // FR-1f (trust list): load named ledgers with rotatable keys.
+    if !cfg.ledger.is_empty() {
+        for l in &cfg.ledger {
+            let mut keys = Vec::with_capacity(l.pubkey_hex.len());
+            for k in &l.pubkey_hex {
+                keys.push(decode_hex32(k).with_context(|| format!("ledger {} key", l.id))?);
+            }
+            store
+                .load_trust_list_with_subjects(l.id.clone(), &keys, &l.ttl_subjects)
+                .map_err(|e| anyhow::anyhow!("load transparency trust list: {}", e))?;
+        }
+        // BL-2: additional non-Ed25519 ledger keys (ES256/ES384/PS256/RS256).
+        for l in &cfg.ledger {
+            for k in &l.key {
+                let alg = match k.alg.trim().to_ascii_lowercase().as_str() {
+                    "eddsa" | "ed25519" => {
+                        kata_security_reference_monitor::cose_keys::CoseAlg::EdDsa
+                    }
+                    "es256" => kata_security_reference_monitor::cose_keys::CoseAlg::Es256,
+                    "es384" => kata_security_reference_monitor::cose_keys::CoseAlg::Es384,
+                    "ps256" => kata_security_reference_monitor::cose_keys::CoseAlg::Ps256,
+                    "rs256" => kata_security_reference_monitor::cose_keys::CoseAlg::Rs256,
+                    other => anyhow::bail!("ledger {} unsupported key alg {}", l.id, other),
+                };
+                let der = decode_hex_vec(&k.spki_hex)
+                    .with_context(|| format!("ledger {} spki_hex", l.id))?;
+                let pk = kata_security_reference_monitor::cose_keys::PublicKey::from_spki_der(&der)
+                    .ok_or_else(|| anyhow::anyhow!("ledger {} invalid SPKI key", l.id))?;
+                store.add_ledger_key_from_ttl(l.id.clone(), pk, alg, &l.ttl_subjects);
+            }
+        }
+        info!(logger, "FR-1: transparency trust list loaded"; "ledgers" => cfg.ledger.len());
+    }
+    // FR-1d: did:x509 issuer identity — require_x509, revocation list, CA anchors.
+    if let Some(rx) = cfg.require_x509 {
+        store.set_require_x509(rx);
+    }
+    if !cfg.revoked.is_empty() {
+        let mut fps = Vec::with_capacity(cfg.revoked.len());
+        for hexfp in &cfg.revoked {
+            fps.push(decode_hex32(hexfp).context("revoked cert fingerprint")?);
+        }
+        store.set_revoked_certs(fps);
+        info!(logger, "FR-1: revocation list loaded"; "revoked" => cfg.revoked.len());
+    }
+    for ca in &cfg.ca_anchor {
+        let ca_fingerprint = if let Some(hexfp) = &ca.ca_fingerprint_hex {
+            decode_hex32(hexfp).with_context(|| format!("ca_anchor {} fingerprint", ca.did))?
+        } else if let Some(pem) = &ca.ca_cert_pem {
+            kata_security_reference_monitor::did_x509::ca_fingerprint_from_pem(pem)
+                .map_err(|e| anyhow::anyhow!("ca_anchor {} pem: {}", ca.did, e))?
+        } else {
+            anyhow::bail!(
+                "ca_anchor {} needs ca_fingerprint_hex or ca_cert_pem",
+                ca.did
+            );
+        };
+        store.authorize_did_x509(kata_security_reference_monitor::DidX509Anchor {
+            did: ca.did.clone(),
+            ca_fingerprint,
+            policy: kata_security_reference_monitor::DidX509Policy {
+                require_subject_cn: ca.require_subject_cn.clone(),
+                require_eku: ca.require_eku.clone(),
+                require_san_dns: ca.require_san_dns.clone(),
+            },
+        });
+        info!(logger, "FR-1: authorized did:x509 anchor"; "did" => &ca.did);
+    }
+    for issuer in &cfg.issuer {
+        let key = decode_hex32(&issuer.ed25519_pubkey_hex)
+            .with_context(|| format!("issuer {}", issuer.id))?;
+        store
+            .authorize_issuer(issuer.id.clone(), &key)
+            .map_err(|e| anyhow::anyhow!("authorize issuer {}: {}", issuer.id, e))?;
+        store.set_min_svn(issuer.id.clone(), issuer.min_svn);
+        // FR-1f (trust list): default-feed receipt scoping for this issuer.
+        if !issuer.allowed_ledgers.is_empty() {
+            store.set_allowed_ledgers(issuer.id.clone(), "", &issuer.allowed_ledgers);
+        }
+        if !issuer.required_receipt_from.is_empty() {
+            store.require_receipt_for(issuer.id.clone(), "", &issuer.required_receipt_from);
+        }
+        // FR-1e: declare named feeds for this issuer.
+        for feed in &issuer.feed {
+            store.declare_feed(issuer.id.clone(), feed.name.clone(), feed.min_svn);
+            // FR-1f (trust list): per-feed receipt scoping.
+            if !feed.allowed_ledgers.is_empty() {
+                store.set_allowed_ledgers(
+                    issuer.id.clone(),
+                    feed.name.clone(),
+                    &feed.allowed_ledgers,
+                );
+            }
+            if !feed.required_receipt_from.is_empty() {
+                store.require_receipt_for(
+                    issuer.id.clone(),
+                    feed.name.clone(),
+                    &feed.required_receipt_from,
+                );
+            }
+            // FR-1c: the trust root is measured state, so it is a valid authority for the
+            // namespace grant on feeds the base policy does not separately declare.
+            // FR-1k: same for parameter bindings.
+            if !feed.includes.is_empty() || !feed.allow_module || feed.parameters.is_some() {
+                // Re-serialized to JSON because the policy engine takes a JSON object; the
+                // TOML table is only the authoring surface.
+                let parameters = match &feed.parameters {
+                    Some(p) => Some(serde_json::to_string(p).with_context(|| {
+                        format!("issuer {} feed {} parameters", issuer.id, feed.name)
+                    })?),
+                    None => None,
+                };
+                store.grant_module_scope(
+                    issuer.id.clone(),
+                    feed.name.clone(),
+                    &feed.includes,
+                    feed.allow_module,
+                    parameters,
+                );
+            }
+        }
+        info!(logger, "FR-1: authorized fragment issuer";
+            "issuer" => &issuer.id, "min-svn" => issuer.min_svn, "feeds" => issuer.feed.len());
+    }
+
+    // FR-1j: enable append-only application ordering (before importing persisted state so
+    // the restored head is not overwritten by the genesis).
+    if cfg.ordered.unwrap_or(false) {
+        let genesis = if let Some(hex) = &cfg.log_genesis_hex {
+            decode_hex_vec(hex).context("log_genesis_hex")?
+        } else {
+            b"kata-fragment-log/v1".to_vec()
+        };
+        store.set_log_genesis(&genesis);
+        info!(
+            logger,
+            "FR-1: append-only fragment ordering enabled (FR-1j)"
+        );
+    }
+
+    // FR-1i: re-import any persisted SVN high-water marks so a restart keeps rollback
+    // protection (import can only raise the floor, never lower it). FR-1j: this also
+    // restores the ordering log head (raise-only) across restart.
+    if let Ok(snapshot) = std::fs::read_to_string(fragment_svn_state_path()) {
+        store.import_svn_state(&snapshot);
+        info!(logger, "FR-1: imported persisted fragment SVN state");
+    }
+    Ok(())
+}
+
+// FR-4C: measured guest path listing the authorized read-only layer (dm-verity) root
+// digests. It lives in the measured rootfs; overridable via KATA_VERIFIED_LAYERS for tests.
+// Format (TOML):
+//   require_verified_layers = true
+//   [[layer]]
+//   algorithm = "sha256"
+//   root_hash = "<hex>"
+#[cfg(feature = "strict-policy")]
+const VERIFIED_LAYERS_PATH: &str = "/etc/kata/verified-layers.toml";
+
+#[cfg(feature = "strict-policy")]
+#[derive(serde::Deserialize, Default)]
+struct VerifiedLayersConfig {
+    /// When true, every dm-verity read-only layer must be in the allowlist (fail-closed).
+    #[serde(default)]
+    require_verified_layers: Option<bool>,
+    #[serde(default)]
+    layer: Vec<VerifiedLayerConfig>,
+}
+
+#[cfg(feature = "strict-policy")]
+#[derive(serde::Deserialize)]
+struct VerifiedLayerConfig {
+    /// dm-verity hash algorithm (e.g. "sha256"). Defaults to "sha256".
+    #[serde(default = "default_layer_algorithm")]
+    algorithm: String,
+    /// dm-verity root hash (hex).
+    root_hash: String,
+}
+
+#[cfg(feature = "strict-policy")]
+fn default_layer_algorithm() -> String {
+    "sha256".to_string()
+}
+
+// FR-4C: configure the verified-layer allowlist from measured state. Absent/empty config
+// leaves verification not required (opt-in); when require_verified_layers is set but no
+// layer is authorized, every read-only layer is rejected (fail-closed).
+#[cfg(feature = "strict-policy")]
+async fn seed_verified_layers(logger: &Logger, initdata_cfg: Option<&str>) -> Result<()> {
+    let text = match resolve_measured_config(
+        logger,
+        "FR-4C",
+        initdata_cfg,
+        "KATA_VERIFIED_LAYERS",
+        VERIFIED_LAYERS_PATH,
+    ) {
+        Some(t) => t,
+        None => {
+            info!(
+                logger,
+                "FR-4C: no verified-layers config; layer verification off"
+            );
+            return Ok(());
+        }
+    };
+    let cfg: VerifiedLayersConfig = toml::from_str(&text).context("parse verified-layers.toml")?;
+
+    let mut store = VERIFIED_LAYERS.lock().await;
+    if let Some(req) = cfg.require_verified_layers {
+        store.set_require(req);
+    }
+    for layer in &cfg.layer {
+        store.authorize_layer(&layer.algorithm, &layer.root_hash);
+    }
+    info!(logger, "FR-4C: verified-layer allowlist configured";
+        "required" => store.is_required(), "layers" => store.len());
+    Ok(())
+}
+
+// BL-3: measured guest path listing the authorized guest-pull image manifest digests. It
+// lives in the measured rootfs; overridable via KATA_VERIFIED_IMAGES for tests. Format (TOML):
+//   require_verified_images = true
+//   [[image]]
+//   digest = "sha256:<hex>"
+#[cfg(feature = "strict-policy")]
+const VERIFIED_IMAGES_PATH: &str = "/etc/kata/verified-images.toml";
+
+#[cfg(feature = "strict-policy")]
+#[derive(serde::Deserialize, Default)]
+struct VerifiedImagesConfig {
+    /// When true, every guest-pull image must be pinned by an allowlisted digest (fail-closed).
+    #[serde(default)]
+    require_verified_images: Option<bool>,
+    #[serde(default)]
+    image: Vec<VerifiedImageConfig>,
+}
+
+#[cfg(feature = "strict-policy")]
+#[derive(serde::Deserialize)]
+struct VerifiedImageConfig {
+    /// Image manifest digest (`algorithm:hex`, e.g. "sha256:...").
+    digest: String,
+}
+
+// BL-3: configure the verified guest-pull image allowlist from measured state. Absent/empty
+// config leaves verification not required (opt-in); when require_verified_images is set but no
+// image is authorized, every guest-pull image is rejected (fail-closed).
+#[cfg(feature = "strict-policy")]
+async fn seed_verified_images(logger: &Logger, initdata_cfg: Option<&str>) -> Result<()> {
+    let text = match resolve_measured_config(
+        logger,
+        "BL-3",
+        initdata_cfg,
+        "KATA_VERIFIED_IMAGES",
+        VERIFIED_IMAGES_PATH,
+    ) {
+        Some(t) => t,
+        None => {
+            info!(
+                logger,
+                "BL-3: no verified-images config; image verification off"
+            );
+            return Ok(());
+        }
+    };
+    let cfg: VerifiedImagesConfig = toml::from_str(&text).context("parse verified-images.toml")?;
+
+    let mut store = VERIFIED_IMAGES.lock().await;
+    if let Some(req) = cfg.require_verified_images {
+        store.set_require(req);
+    }
+    for img in &cfg.image {
+        store.authorize_image(&img.digest);
+    }
+    info!(logger, "BL-3: verified-image allowlist configured";
+        "required" => store.is_required(), "images" => store.len());
+    Ok(())
 }
 
 // The Rust standard library had suppressed the default SIGPIPE behavior,

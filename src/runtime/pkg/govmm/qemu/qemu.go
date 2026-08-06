@@ -1378,6 +1378,9 @@ type BlockDevice struct {
 	// ReadOnly sets the block device in readonly mode
 	ReadOnly bool
 
+	// DiscardUnmap enables discard/unmap support for this block device.
+	DiscardUnmap bool
+
 	// Transport is the virtio transport for this device.
 	Transport VirtioTransport
 }
@@ -1425,6 +1428,9 @@ func (blkdev BlockDevice) QemuParams(config *Config) []string {
 	if blkdev.ShareRW {
 		deviceParams = append(deviceParams, "share-rw=on")
 	}
+	if blkdev.DiscardUnmap {
+		deviceParams = append(deviceParams, "discard=on")
+	}
 
 	deviceParams = append(deviceParams, fmt.Sprintf("serial=%s", blkdev.ID))
 
@@ -1436,6 +1442,9 @@ func (blkdev BlockDevice) QemuParams(config *Config) []string {
 
 	if blkdev.ReadOnly {
 		blkParams = append(blkParams, "readonly=on")
+	}
+	if blkdev.DiscardUnmap {
+		blkParams = append(blkParams, "discard=unmap")
 	}
 
 	qemuParams = append(qemuParams, "-device")
@@ -1799,6 +1808,11 @@ type PXBPCIeDevice struct {
 	// ID is the QEMU device identifier (e.g. "pxb-numa0").
 	ID string
 
+	// Bus is the parent root bus (default pcie.0). Each pxb-pcie must be
+	// plugged directly into the machine root complex, not into another
+	// pxb-pcie bus.
+	Bus string
+
 	// BusNr is the guest PCI bus number for this root complex.
 	// Use values spaced apart (e.g. 0x20, 0x40) to leave room for
 	// bridges beneath each pxb-pcie.
@@ -1810,9 +1824,13 @@ type PXBPCIeDevice struct {
 
 // QemuParams returns the QEMU parameters for a pxb-pcie device.
 func (dev PXBPCIeDevice) QemuParams(_ *Config) []string {
+	bus := dev.Bus
+	if bus == "" {
+		bus = "pcie.0"
+	}
 	return []string{
 		"-device",
-		fmt.Sprintf("pxb-pcie,id=%s,bus_nr=%d,numa_node=%d", dev.ID, dev.BusNr, dev.NUMANode),
+		fmt.Sprintf("pxb-pcie,id=%s,bus=%s,bus_nr=%d,numa_node=%d", dev.ID, bus, dev.BusNr, dev.NUMANode),
 	}
 }
 
@@ -1876,6 +1894,13 @@ func (b PCIeRootPortDevice) QemuParams(config *Config) []string {
 		if b.Addr == "" {
 			b.Addr = "0x00"
 		}
+	}
+	// Emit addr= whenever caller pinned it, not only when multifunction is
+	// on. Callers (e.g. kata's nested-bridge topology) need to know exactly
+	// which slot the root port lands on so the guest PCI path computed by
+	// the runtime matches what the kernel will see in sysfs. Auto-assigned
+	// addresses would silently shift the root port and break that lookup.
+	if b.Addr != "" {
 		deviceParams = append(deviceParams, fmt.Sprintf("addr=%s", b.Addr))
 	}
 	deviceParams = append(deviceParams, fmt.Sprintf("multifunction=%v", multifunction))

@@ -32,8 +32,14 @@ setup() {
 	# Create the pods
 	kubectl create -f "${yaml_file}"
 
-	# Wait for completion
-	kubectl wait --for=jsonpath='{.status.phase}'=Succeeded --timeout=$timeout pod --all
+	# Wait for each test container to terminate successfully. Using container
+	# termination state is more robust than pod phase checks, which can lag.
+	for pod in "${pods[@]}"; do
+		kubectl wait \
+			--for=jsonpath='{.status.containerStatuses[0].state.terminated.reason}'=Completed \
+			--timeout=$timeout \
+			"pod/${pod}"
+	done
 
 	# Check the pods
 	# msft-preview: default_vcpus = 0 + no limits is expected to fail if not using static resource management

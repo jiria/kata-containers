@@ -28,7 +28,18 @@ const POLICY_MAX_FILE_BYTES: usize = 16 * 1024 * 1024; // 16 MiB per file
 const POLICY_MAX_LINES: usize = 200_000;
 
 static POLICY_LOG_FILE: &str = "/tmp/policy.jsonl";
+#[cfg(not(feature = "strict-policy"))]
 static POLICY_DEFAULT_FILE: &str = "/etc/kata-opa/default-policy.rego";
+
+/// Closed-door baseline used in strict builds. Every endpoint is left undefined, so policy
+/// evaluation fails closed and every request is denied.
+///
+/// Unlike upstream this does not carve out `SetPolicyRequest`: strict builds deliver policy
+/// exclusively through initdata, which is bound to the launch measurement, and the
+/// `SetPolicy` RPC is compiled out. There is therefore no request the guest should accept
+/// before an authorized policy is installed.
+#[cfg(feature = "strict-policy")]
+static STRICT_DEFAULT_POLICY: &str = "package agent_policy\n";
 
 /// Convenience macro to obtain the scope logger
 macro_rules! sl {
@@ -43,6 +54,13 @@ pub struct AgentPolicy {
     /// When true policy errors are ignored, for debug purposes.
     allow_failures: bool,
 
+    /// Strict builds: set once an authorized policy has been activated. After
+    /// activation, any further call to `set_policy` is rejected (activation is one-shot;
+    /// changing policy requires a new verifier-authorized epoch), so the host cannot swap
+    /// the policy at runtime.
+    #[cfg(feature = "strict-policy")]
+    policy_activated: bool,
+
     /// "/tmp/policy.jsonl" log file for policy activity.
     log_file: Option<tokio::fs::File>,
 
@@ -54,6 +72,230 @@ pub struct AgentPolicy {
 struct MetadataResponse {
     allowed: bool,
     ops: Option<json_patch::Patch>,
+}
+
+/// BL-8: whether a delivered fragment may itself declare further fragments, and whose.
+///
+/// One attribute carries both the switch and the scope, so the two cannot drift apart —
+/// there is no way to enable delegation without saying how far it reaches.
+///
+/// Authored in rego as the `allow_nested` field of a declaration:
+///
+/// ```text
+/// (omitted) | false        no delegation                              (default)
+/// "same-issuer"           nested declarations may name only the delivering
+///                         fragment's own issuer
+/// "any-authorized"        any issuer the measured trust root authorizes
+/// ["did:x509:a", ...]     only these issuers
+/// ```
+///
+/// `true` is deliberately **not** accepted: it enables delegation without saying whose, and
+/// picking a scope on the author's behalf is exactly the kind of silent assumption this
+/// gate exists to prevent. It is rejected with a message naming the valid forms.
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug, PartialEq)]
+#[serde(untagged)]
+pub enum AllowNested {
+    /// `false` — no delegation. `true` is parsed here so it can be rejected by name.
+    Flag(bool),
+    /// `"same-issuer"` / `"any-authorized"` / `"none"`.
+    Mode(String),
+    /// An explicit issuer allow-list.
+    Issuers(Vec<String>),
+}
+
+impl Default for AllowNested {
+    fn default() -> Self {
+        AllowNested::Flag(false)
+    }
+}
+
+/// The resolved, validated form of [`AllowNested`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum NestedScope {
+    /// The fragment may not declare further fragments.
+    None,
+    /// Nested declarations must name the delivering fragment's own issuer.
+    SameIssuer,
+    /// Nested declarations may name any issuer the measured trust root authorizes.
+    AnyAuthorized,
+    /// Nested declarations may name only these issuers.
+    Issuers(Vec<String>),
+}
+
+impl NestedScope {
+    /// Whether `issuer` may appear in a nested declaration carried by a fragment signed by
+    /// `parent_issuer`.
+    ///
+    /// Note this is a *scope* check only. It never widens trust on its own: the nested
+    /// fragment must still be signed by an issuer the measured trust root authorizes, or
+    /// `verify_cose` rejects it as `UnauthorizedIssuer` regardless of what any declaration
+    /// says. `AnyAuthorized` therefore means "anyone the trust root already trusts", not
+    /// "anyone".
+    pub fn permits(&self, parent_issuer: &str, issuer: &str) -> bool {
+        match self {
+            NestedScope::None => false,
+            NestedScope::SameIssuer => issuer == parent_issuer,
+            NestedScope::AnyAuthorized => true,
+            NestedScope::Issuers(list) => list.iter().any(|i| i == issuer),
+        }
+    }
+
+    /// Whether delegation is enabled at all.
+    pub fn is_enabled(&self) -> bool {
+        !matches!(self, NestedScope::None)
+    }
+}
+
+/// BL-8: a boot-time fragment declaration from the measured base policy
+/// (`data.agent_policy.policy_fragments[]`). The host fetches the COSE artifact for `feed`
+/// and pushes it in; the guest verifies it (issuer/SVN/receipt/ordering) through the SRM
+/// `FragmentStore`.
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug, PartialEq)]
+pub struct FragmentSpec {
+    /// `did:x509` issuer the fragment must be signed by.
+    pub issuer: String,
+    /// OCI reference (e.g. `contoso.azurecr.io/frag/infra:1`) the fragment is published at.
+    pub feed: String,
+    /// Minimum acceptable SVN (rollback floor) for this feed.
+    #[serde(default)]
+    pub minimum_svn: u64,
+    /// Whether this fragment must be present before any container may be created.
+    ///
+    /// Defaults to `false`, which is C-ACI/hcsshim behaviour: a declaration authorizes a
+    /// fragment and states the terms it must meet, but delivery is lazy and a fragment that
+    /// never arrives simply contributes nothing. That is already safe, because a container
+    /// only the fragment would have permitted still does not match the base policy and is
+    /// refused on its own merits. hcsshim has no equivalent of this flag at all.
+    ///
+    /// Setting it to `true` is *stricter* than C-ACI: it converts the declaration from a
+    /// permission into an obligation, so a host that withholds the fragment cannot run the
+    /// workload under a policy that is missing grants it was measured to include. Use it
+    /// when the fragment carries something whose absence is not fail-safe — a deny rule, an
+    /// audit obligation, or a constraint the base policy assumes has been composed in.
+    ///
+    /// `false` never means "unchecked". An optional fragment that *is* delivered is
+    /// verified exactly as a required one: same issuer binding, same SVN floor, same
+    /// receipt and ordering gates. The flag governs only whether absence is tolerated.
+    #[serde(default)]
+    pub required: bool,
+    /// Whether this fragment may itself declare further fragments, and whose. Defaults to
+    /// no delegation. See [`AllowNested`].
+    #[serde(default)]
+    pub allow_nested: AllowNested,
+    /// FR-1c: the policy namespaces under `agent_policy.fragments.` this fragment may
+    /// contribute a module to. Empty (the default) grants only the shared
+    /// `agent_policy.fragments` package.
+    ///
+    /// The fragment statement carries an `includes` list of its own, but that is signed by
+    /// the fragment's issuer and so states only what *that issuer* intended. Left as the
+    /// sole authority it would let any trust-root-authorized issuer claim any namespace,
+    /// including one the base policy meant a different issuer to fill. This field is the
+    /// measured policy's grant; the effective scope is the intersection of the two, so
+    /// neither side can widen the other. hcsshim does the same, taking `includes` from the
+    /// matched candidate declaration rather than from the delivered fragment.
+    #[serde(default)]
+    pub includes: Vec<String>,
+    /// FR-1c: whether this fragment's Rego module may be applied at all. Defaults to true.
+    ///
+    /// Setting it to false accepts the fragment for its SVN, receipt and ordering record
+    /// while contributing no rules — hcsshim's `add_module` behaviour. Useful to pin a
+    /// version, or to require that an artifact exist and be countersigned, without granting
+    /// it any policy surface.
+    #[serde(default = "default_true")]
+    pub allow_module: bool,
+    /// FR-1k: values to instantiate a parameterised fragment's Rego with.
+    ///
+    /// A fragment can read these via `parameter("name")` rather than hard-coding a value,
+    /// so one signed artefact serves several deployments without being re-signed per value.
+    /// Mirrors hcsshim's fragment `parameters`.
+    ///
+    /// These are authority-bearing — a parameter may decide which env var value or command
+    /// a rule admits — which is why they live on the *declaration*, in measured policy,
+    /// rather than arriving with the fragment or from the host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<serde_json::Value>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// FR-1l: the enforcement framework version this agent implements.
+///
+/// Bumped when a gate is added that a policy could reasonably depend on, so a policy can
+/// state a floor and be refused rather than under-enforced by an older agent. Deliberately
+/// not tied to the agent version: two agents may differ in ways policy cannot observe.
+pub const POLICY_FRAMEWORK_VERSION: &str = "1.0.0";
+
+/// Parse a strict `major.minor.patch`. Returns `None` on anything else, including the
+/// pre-release and build-metadata suffixes semver allows — accepting them would mean
+/// deciding how they order, and there is no version here that needs them.
+fn parse_semver(s: &str) -> Option<(u64, u64, u64)> {
+    let mut it = s.trim().split('.');
+    let out = (
+        it.next()?.parse().ok()?,
+        it.next()?.parse().ok()?,
+        it.next()?.parse().ok()?,
+    );
+    it.next().is_none().then_some(out)
+}
+
+impl Default for FragmentSpec {
+    /// Hand-written rather than derived so it cannot drift from the serde defaults: a
+    /// derived impl would give `allow_module: false`, which is the opposite of what an
+    /// omitted field means when the declaration is parsed.
+    fn default() -> Self {
+        Self {
+            issuer: String::new(),
+            feed: String::new(),
+            minimum_svn: 0,
+            required: false,
+            allow_nested: AllowNested::default(),
+            includes: Vec::new(),
+            allow_module: true,
+            parameters: None,
+        }
+    }
+}
+
+impl FragmentSpec {
+    /// Resolve and validate [`Self::allow_nested`].
+    ///
+    /// Fails closed on anything unrecognised rather than defaulting to permissive *or* to
+    /// silently disabled: a policy author who mistypes `"same_issuer"` must find out at
+    /// boot, not discover months later that delegation was quietly off (or, worse, on).
+    pub fn nested_scope(&self) -> Result<NestedScope> {
+        match &self.allow_nested {
+            AllowNested::Flag(false) => Ok(NestedScope::None),
+            AllowNested::Flag(true) => bail!(
+                "fragment declaration for feed {:?}: allow_nested = true does not say which \
+                 issuers may be delegated to; use \"same-issuer\", \"any-authorized\", or an \
+                 explicit list of issuer strings",
+                self.feed
+            ),
+            AllowNested::Mode(m) => match m.as_str() {
+                "none" => Ok(NestedScope::None),
+                "same-issuer" => Ok(NestedScope::SameIssuer),
+                "any-authorized" => Ok(NestedScope::AnyAuthorized),
+                other => bail!(
+                    "fragment declaration for feed {:?}: unknown allow_nested value {other:?}; \
+                     expected \"none\", \"same-issuer\", \"any-authorized\", false, or a list \
+                     of issuer strings",
+                    self.feed
+                ),
+            },
+            AllowNested::Issuers(list) => {
+                if list.is_empty() {
+                    bail!(
+                        "fragment declaration for feed {:?}: allow_nested is an empty issuer \
+                         list, which permits nothing; use false to disable delegation",
+                        self.feed
+                    );
+                }
+                Ok(NestedScope::Issuers(list.clone()))
+            }
+        }
+    }
 }
 
 impl AgentPolicy {
@@ -115,8 +357,48 @@ impl AgentPolicy {
             debug!(sl!(), "policy: log file: {}", log_file_path);
         }
 
-        // Check if policy file has been set via AgentConfig
-        // If empty, use default file.
+        self.load_initial_policy(default_policy_file).await
+    }
+
+    /// Strict builds never load a policy from the guest filesystem: the compiled-in
+    /// closed-door baseline is installed unconditionally, so the guest denies all
+    /// security-relevant requests until an authorized policy is delivered through initdata,
+    /// which is bound to the launch measurement. (The `SetPolicy` RPC is not an alternative
+    /// here -- it is compiled out of strict builds entirely.)
+    ///
+    /// `default_policy_file` is deliberately ignored. It is host-influenceable: it is
+    /// populated from the `KATA_AGENT_POLICY_FILE` environment variable and from the agent
+    /// config file, which the kernel command line can select via `agent.config_file=`.
+    /// Honouring it would let a non-empty value skip the baseline and load a permissive
+    /// policy from the image instead.
+    #[cfg(feature = "strict-policy")]
+    async fn load_initial_policy(&mut self, default_policy_file: String) -> Result<()> {
+        if default_policy_file.is_empty() {
+            info!(
+                sl!(),
+                "strict-policy: no explicit policy provided; loading closed-door baseline"
+            );
+        } else {
+            warn!(
+                sl!(),
+                "strict-policy: ignoring configured policy file; the closed-door baseline is \
+                 always used until an authorized policy is delivered";
+                "ignored-policy-file" => &default_policy_file
+            );
+        }
+
+        self.engine.add_policy(
+            "strict-default.rego".to_string(),
+            STRICT_DEFAULT_POLICY.to_string(),
+        )?;
+        self.update_allow_failures_flag().await?;
+        Ok(())
+    }
+
+    /// Non-strict builds keep the historical behaviour: load the configured policy file, or
+    /// fall back to the default policy shipped in the guest image.
+    #[cfg(not(feature = "strict-policy"))]
+    async fn load_initial_policy(&mut self, default_policy_file: String) -> Result<()> {
         let mut default_policy_file = default_policy_file;
         if default_policy_file.is_empty() {
             default_policy_file = POLICY_DEFAULT_FILE.to_string();
@@ -142,6 +424,56 @@ impl AgentPolicy {
         self.engine
             .add_data(regorus::Value::from_json_str(&state.to_string())?)?;
 
+        Ok(())
+    }
+
+    /// FR-6: capture the current policy state (`pstate`) so a transaction can roll it back.
+    /// The policy applies its state-mutating `ops` during authorization; snapshotting before
+    /// authorization and restoring on abort ensures a failed operation leaves no committed
+    /// enforcer state (equivalent to runhcs/OpenGCS `WithMetadataRollback`).
+    #[cfg(feature = "strict-policy")]
+    pub fn snapshot_state(&self) -> Result<String> {
+        Ok(serde_json::to_value(self.engine.get_data())?.to_string())
+    }
+
+    /// FR-6: restore policy state captured by `snapshot_state` (transaction rollback).
+    ///
+    /// Replaces the whole data document, so it is only safe when no other request can have
+    /// mutated policy state in the meantime. Prefer [`AgentPolicy::revert_state_delta`] on
+    /// any path that awaits between the snapshot and the rollback.
+    #[cfg(feature = "strict-policy")]
+    pub fn restore_state(&mut self, snapshot: &str) -> Result<()> {
+        self.engine.clear_data();
+        self.engine
+            .add_data(regorus::Value::from_json_str(snapshot)?)?;
+        Ok(())
+    }
+
+    /// FR-6: undo only the state mutations made by one request, leaving concurrent ones
+    /// intact.
+    ///
+    /// Restoring a whole-document snapshot rolls back *every* change made since it was
+    /// taken, not just this request's. ttrpc dispatches each request on its own task and
+    /// the policy lock is released while the runtime operation runs, so the interleaving
+    /// is reachable: `remove(A)` snapshots, `create(B)` commits `B` into `pstate`, then
+    /// `remove(A)` fails and restores a snapshot that predates `B`. Container `B` is now
+    /// running but absent from the enforcer's state — it can never be authorized for
+    /// removal, which is the divergence FR-6 exists to prevent.
+    ///
+    /// `before` and `after` bracket this request's own authorization, so their difference
+    /// is exactly the set of keys it touched. Reverting only those keys, against whatever
+    /// the current state happens to be, leaves everyone else's changes alone.
+    #[cfg(feature = "strict-policy")]
+    pub fn revert_state_delta(&mut self, before: &str, after: &str) -> Result<()> {
+        let before: serde_json::Value = serde_json::from_str(before)?;
+        let after: serde_json::Value = serde_json::from_str(after)?;
+        let mut current: serde_json::Value = serde_json::to_value(self.engine.get_data())?;
+
+        revert_delta(&mut current, &before, &after);
+
+        self.engine.clear_data();
+        self.engine
+            .add_data(regorus::Value::from_json_str(&current.to_string())?)?;
         Ok(())
     }
 
@@ -211,16 +543,284 @@ impl AgentPolicy {
             allow = true;
         }
 
+        // FR-8: on denial, emit a structured, rule-attributable decision object. It
+        // records the endpoint, the denied rule, and the request's top-level field names
+        // (never values), so denials are auditable without leaking env values, sealed
+        // secrets, or policy text.
+        if !allow {
+            let decision = crate::decision::DecisionObject::for_denial(ep, ep_input);
+            self.log_decision(&decision).await;
+        }
+
         Ok((allow, prints))
+    }
+
+    /// FR-8: append a structured decision object to the policy log. The object carries no
+    /// request values, so this cannot leak workload data.
+    async fn log_decision(&mut self, decision: &crate::decision::DecisionObject) {
+        debug!(sl!(), "policy decision"; "endpoint" => &decision.endpoint, "decision" => decision.decision, "failed-rule" => &decision.failed_rule);
+        if let Some(log_file) = &mut self.log_file {
+            let line = format!("{}\n", decision.to_json());
+            if let Err(e) = log_file.write_all(line.as_bytes()).await {
+                warn!(sl!(), "policy: log_decision: write_all failed: {}", e);
+            } else if let Err(e) = log_file.flush().await {
+                warn!(sl!(), "policy: log_decision: flush failed: {}", e);
+            }
+        }
     }
 
     /// Replace the Policy in regorus.
     pub async fn set_policy(&mut self, policy: &str) -> Result<()> {
+        // Strict builds: policy activation is one-shot. Once an authorized policy is
+        // active, reject any attempt to replace it (changing policy requires a new
+        // verifier-authorized epoch), so the host cannot weaken policy at runtime.
+        //
+        // Note this guards the *method*, not the `SetPolicy` RPC -- that RPC is compiled
+        // out of strict builds entirely, so the only caller left is the initdata
+        // activation in `main.rs`. The guard is the runtime invariant backing that
+        // compile-time removal: if a second activation path is ever introduced, it fails
+        // closed rather than silently replacing the active ruleset.
+        #[cfg(feature = "strict-policy")]
+        if self.policy_activated {
+            bail!("strict-policy: policy already activated; activation is one-shot");
+        }
         self.engine = Self::new_engine();
         self.engine
             .add_policy("agent_policy".to_string(), policy.to_string())?;
+        self.check_framework_version()?;
         self.update_allow_failures_flag().await?;
+        #[cfg(feature = "strict-policy")]
+        {
+            self.policy_activated = true;
+        }
         Ok(())
+    }
+
+    /// FR-1l: refuse a policy that expects a newer enforcement framework than this agent
+    /// implements.
+    ///
+    /// A policy declares `framework_version` (semver) if it wants to be sure of what it is
+    /// running on. Absent, it is treated as legacy and allowed — that is every policy
+    /// written before this check existed, and refusing them would be a compatibility break
+    /// with no security benefit, since such a policy by definition expects nothing newer.
+    ///
+    /// The asymmetry is the point. A policy **older** than the agent is fine: the agent
+    /// implements every gate it names, and any gate the policy does not name is simply not
+    /// requested. A policy **newer** than the agent is not: it was authored expecting checks
+    /// this binary has never heard of, and an unknown rule name in Rego is not an error but
+    /// an undefined value, so those checks would not fail loudly — they would silently not
+    /// happen, and the policy would appear to be enforced while the gates it was written for
+    /// were absent. Downgrading the enforcer is exactly the move an adversary would want, so
+    /// this fails closed. Mirrors hcsshim, whose `apply_defaults` has cases for equal and
+    /// older framework versions and deliberately none for newer.
+    fn check_framework_version(&mut self) -> Result<()> {
+        let declared = match self.engine.eval_rule("data.agent_policy.framework_version".into()) {
+            Ok(v) => match v.as_string() {
+                Ok(s) => s.to_string(),
+                Err(_) => return Ok(()),
+            },
+            Err(_) => return Ok(()),
+        };
+        let policy = parse_semver(&declared).ok_or_else(|| {
+            anyhow::anyhow!("policy framework_version {declared:?} is not a semver x.y.z")
+        })?;
+        let ours = parse_semver(POLICY_FRAMEWORK_VERSION)
+            .expect("POLICY_FRAMEWORK_VERSION is a compile-time constant");
+        if policy > ours {
+            bail!(
+                "policy declares framework_version {declared}, but this agent implements \
+                 {POLICY_FRAMEWORK_VERSION}; refusing to enforce a policy written for gates \
+                 this build does not have"
+            );
+        }
+        Ok(())
+    }
+
+    /// FR-1a: apply a verified policy fragment's Rego module to the live engine.    ///
+    /// This is the **only** sanctioned runtime extension of an active policy. Unlike
+    /// `set_policy` it is **additive** — it adds a named module via `add_policy` and does
+    /// NOT rebuild the engine, so it bypasses the FR-12 one-shot lock without weakening it
+    /// (`set_policy` stays rejected after activation). The fragment module must declare a
+    /// package inside the reserved fragment namespace (`agent_policy.fragments`, optionally
+    /// scoped to one of the fragment's `includes`), so a fragment can only *add* rules in
+    /// its own namespace and can never redefine or shadow a base `agent_policy` rule. The
+    /// base policy is authored to consult `data.agent_policy.fragments.*`.
+    ///
+    /// One further form is permitted: `agent_policy.fragments["<feed>"]`, quoted, naming
+    /// **this fragment's own verified feed and nothing else**. It exists because the
+    /// generated `rules.rego` looks a fragment's contribution up by feed
+    /// (`data.agent_policy.fragments[spec.feed]`, the container-contribution contract), and
+    /// a feed is an OCI reference — `localhost:5000/coco-e2e/fragment` — which is not a
+    /// Rego identifier and therefore cannot be a rule name. Without this form that whole
+    /// contract is unreachable: a fragment can never contribute a container. The feed comes
+    /// from the COSE envelope the SRM already verified, not from the module, so the key a
+    /// fragment writes under is pinned to the identity it was signed with; it cannot squat
+    /// the namespace of another feed.
+    ///
+    /// Returns the rego package the module was applied under, so the caller can find what
+    /// the fragment itself declares (see [`Self::nested_fragment_specs`]).
+    pub fn apply_fragment_module(
+        &mut self,
+        name: &str,
+        rego: &str,
+        feed: &str,
+        includes: &[String],
+        parameters: Option<&str>,
+    ) -> Result<String> {
+        let pkg = Self::rego_package(rego)
+            .ok_or_else(|| anyhow::anyhow!("fragment module has no package declaration"))?;
+
+        let mut allowed = vec!["agent_policy.fragments".to_string()];
+        for ns in includes {
+            allowed.push(format!("agent_policy.fragments.{ns}"));
+        }
+        if !allowed.iter().any(|a| a == &pkg) && !Self::is_own_feed_package(&pkg, feed) {
+            bail!(
+                "fragment module package {:?} is outside the permitted fragment namespaces {:?} \
+                 (and is not this fragment's own feed {:?})",
+                pkg,
+                allowed,
+                feed
+            );
+        }
+
+        let rego = match parameters {
+            Some(p) => Self::instantiate_parameters(rego, &pkg, p)?,
+            None => rego.to_string(),
+        };
+
+        // Additive merge; never resets the engine, never touches the one-shot lock.
+        self.engine.add_policy(name.to_string(), rego)?;
+        Ok(pkg)
+    }
+
+    /// FR-1k: bind a parameterised fragment's `parameter("name")` calls to concrete values.
+    ///
+    /// The values are appended to the module as a constant, plus a total `parameter`
+    /// function that falls back to the `default` the fragment declares in its own
+    /// `parameters_api`, and `null` when neither supplies one. This is hcsshim's mechanism
+    /// (`getRegoWithParameterDefinitions` + `fragment_definition.rego`) and, like it,
+    /// happens *after* the fragment's signature has been verified over the original bytes —
+    /// the appended text is generated by the guest from measured state, so instantiating a
+    /// fragment neither requires nor grants the ability to alter what was signed.
+    ///
+    /// `parameters` must be a JSON **object**. Anything else is rejected rather than
+    /// coerced: `parameter(name)` is a lookup, and a non-object would make every lookup
+    /// silently fall through to its default, turning a mis-specified policy into a quietly
+    /// permissive one.
+    fn instantiate_parameters(rego: &str, pkg: &str, parameters: &str) -> Result<String> {
+        let parsed: serde_json::Value = serde_json::from_str(parameters)
+            .map_err(|e| anyhow::anyhow!("fragment parameters are not valid JSON: {e}"))?;
+        if !parsed.is_object() {
+            bail!("fragment parameters must be a JSON object, got {parsed}");
+        }
+        // Re-serialize from the parsed form so the text spliced into the module is known to
+        // be a single well-formed JSON value and cannot carry trailing Rego.
+        let json = serde_json::to_string(&parsed)?;
+
+        Ok(format!(
+            "{rego}\n\
+             # ---- appended by the agent (FR-1k): fragment parameter bindings ----\n\
+             __fragment_parameters := {json}\n\
+             default __fragment_parameters_api := {{}}\n\
+             __fragment_parameters_api := data.{pkg}.parameters_api\n\
+             parameter(__name) := object.get(\n\
+             \x20   __fragment_parameters,\n\
+             \x20   __name,\n\
+             \x20   object.get(object.get(__fragment_parameters_api, __name, {{}}), \"default\", null),\n\
+             )\n"
+        ))
+    }
+
+    /// BL-8: read the fragment declarations a *delivered* fragment carries in its own
+    /// module, at `data.<package>.policy_fragments`.
+    ///
+    /// These are signed: `policy_module` is covered by the fragment statement's
+    /// `signing_bytes()`, so the declarations a fragment makes are bound to the same COSE
+    /// signature as everything else it carries. The host cannot add, remove or edit one.
+    ///
+    /// Reading them is only *permitted* when the declaration that authorized this fragment
+    /// enabled delegation, and what they may name is bounded by that declaration's scope —
+    /// see `NestedScope`. This function performs no authorization itself; it only reads.
+    pub fn nested_fragment_specs(&mut self, package: &str) -> Result<Vec<FragmentSpec>> {
+        self.query_fragment_specs(&format!("data.{package}.policy_fragments"))
+    }
+
+    /// BL-8: read the boot-time fragment declarations the measured base policy exposes at
+    /// `data.agent_policy.policy_fragments`. Each declaration names an `issuer`
+    /// (`did:x509`), a `feed` (OCI reference), a `minimum_svn`, and optionally `required`
+    /// and `allow_nested`. The host delivers each fragment over `LoadPolicyFragment` and the
+    /// guest verifies it through the SRM.
+    ///
+    /// Returns an empty vector when the base policy declares none (or the value is absent /
+    /// not an array) — a base policy that declares no fragments is unaffected by any of
+    /// this.
+    pub fn fragment_specs(&mut self) -> Result<Vec<FragmentSpec>> {
+        self.query_fragment_specs("data.agent_policy.policy_fragments")
+    }
+
+    /// Shared parse for a `policy_fragments[]` array at an arbitrary rego path.
+    fn query_fragment_specs(&mut self, query: &str) -> Result<Vec<FragmentSpec>> {
+        self.engine.set_input_json("{}")?;
+        let results = self.engine.eval_query(query.to_string(), false)?;
+        let value = match results
+            .result
+            .first()
+            .and_then(|r| r.expressions.first())
+            .map(|e| &e.value)
+        {
+            Some(v) => v,
+            None => return Ok(Vec::new()),
+        };
+        let arr = match value {
+            regorus::Value::Array(a) => a,
+            regorus::Value::Undefined => return Ok(Vec::new()),
+            _ => bail!("policy_fragments is not an array: {value:?}"),
+        };
+        let json = serde_json::to_string(arr)?;
+        let specs: Vec<FragmentSpec> = serde_json::from_str(&json)
+            .map_err(|e| anyhow::anyhow!("malformed policy_fragments declaration: {e}"))?;
+        Ok(specs)
+    }
+
+    /// Extract the top-level `package` path from a Rego module (e.g. "agent_policy.fragments").
+    fn rego_package(rego: &str) -> Option<String> {
+        for line in rego.lines() {
+            let l = line.trim();
+            if let Some(rest) = l.strip_prefix("package ") {
+                let pkg = rest.trim();
+                if !pkg.is_empty() {
+                    return Some(pkg.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    /// Whether `pkg` is the quoted-feed form `agent_policy.fragments["<feed>"]` naming
+    /// exactly `feed`.
+    ///
+    /// The comparison is on the decoded string, not on the source text, so whitespace
+    /// inside the brackets is tolerated while a different feed — or a second segment
+    /// smuggled in after the bracket — is not. A fragment therefore cannot reach any
+    /// namespace but the one its verified feed names.
+    fn is_own_feed_package(pkg: &str, feed: &str) -> bool {
+        if feed.is_empty() {
+            return false;
+        }
+        let Some(rest) = pkg.strip_prefix("agent_policy.fragments[") else {
+            return false;
+        };
+        let Some(inner) = rest.strip_suffix(']') else {
+            return false;
+        };
+        let inner = inner.trim();
+        let Some(quoted) = inner.strip_prefix('"').and_then(|s| s.strip_suffix('"')) else {
+            return false;
+        };
+        // A feed containing a quote or backslash could otherwise be spelled several ways;
+        // refuse rather than guess at an unescaping the parser may not share.
+        !quoted.contains('"') && !quoted.contains('\\') && quoted == feed
     }
 
     async fn log_eval_input(&mut self, ep: &str, input: &str) {
@@ -248,19 +848,86 @@ impl AgentPolicy {
     }
 
     async fn update_allow_failures_flag(&mut self) -> Result<()> {
-        self.allow_failures = match self.allow_request("AllowRequestsFailingPolicy", "{}").await {
-            Ok((allowed, _prints)) => {
-                if allowed {
-                    warn!(
-                        sl!(),
-                        "policy: AllowRequestsFailingPolicy is enabled - will ignore errors"
-                    );
+        // In strict builds the "ignore requests failing policy" escape hatch is
+        // compiled out: requests that fail policy evaluation are always denied,
+        // regardless of any AllowRequestsFailingPolicy value in the policy.
+        #[cfg(feature = "strict-policy")]
+        {
+            self.allow_failures = false;
+        }
+        #[cfg(not(feature = "strict-policy"))]
+        {
+            self.allow_failures = match self.allow_request("AllowRequestsFailingPolicy", "{}").await
+            {
+                Ok((allowed, _prints)) => {
+                    if allowed {
+                        warn!(
+                            sl!(),
+                            "policy: AllowRequestsFailingPolicy is enabled - will ignore errors"
+                        );
+                    }
+                    allowed
                 }
-                allowed
-            }
-            Err(_) => false,
-        };
+                Err(_) => false,
+            };
+        }
         Ok(())
+    }
+}
+
+/// Undo, in `current`, exactly the differences between `before` and `after`.
+///
+/// A key whose value is identical in `before` and `after` was not touched by the request
+/// being rolled back, so whatever `current` holds for it — including a change another
+/// request made in the meantime — is left alone. Only keys the request actually added,
+/// removed or modified are put back the way it found them, recursing into nested objects
+/// so that two requests touching sibling entries of the same map do not clobber each
+/// other.
+#[cfg(feature = "strict-policy")]
+fn revert_delta(
+    current: &mut serde_json::Value,
+    before: &serde_json::Value,
+    after: &serde_json::Value,
+) {
+    use serde_json::Value;
+
+    if before == after {
+        return;
+    }
+
+    let (Value::Object(before_map), Value::Object(after_map)) = (before, after) else {
+        // Not a map on at least one side, so there is no finer granularity to exploit.
+        *current = before.clone();
+        return;
+    };
+    let Value::Object(current_map) = current else {
+        // The shape changed underneath us; the request's own view is the best we have.
+        *current = before.clone();
+        return;
+    };
+
+    let keys: std::collections::BTreeSet<&String> =
+        before_map.keys().chain(after_map.keys()).collect();
+    for key in keys {
+        match (before_map.get(key), after_map.get(key)) {
+            // Untouched by this request.
+            (Some(b), Some(a)) if b == a => {}
+            (Some(b), Some(a)) => match current_map.get_mut(key) {
+                Some(c) => revert_delta(c, b, a),
+                None => {
+                    current_map.insert(key.clone(), b.clone());
+                }
+            },
+            // The request removed it; put it back.
+            (Some(b), None) => {
+                current_map.insert(key.clone(), b.clone());
+            }
+            // The request added it; take it away.
+            (None, Some(_)) => {
+                current_map.remove(key);
+            }
+            (None, None) => unreachable!("key came from one of the two maps"),
+        }
     }
 }
 
@@ -355,6 +1022,911 @@ mod tests {
     use std::convert::TryInto;
 
     use protocols::agent::CopyFileRequest;
+
+    /// FR-6: a rollback must undo only its own request's mutations.
+    ///
+    /// The interleaving this guards against: `remove(A)` snapshots `{A}`, `create(B)`
+    /// commits `{A, B}`, then `remove(A)` fails. A whole-document restore would write back
+    /// `{A}` and lose `B` — leaving `B` running but invisible to the enforcer, hence
+    /// unremovable. Reverting the delta must leave `B` in place.
+    #[cfg(feature = "strict-policy")]
+    #[test]
+    fn reverting_a_delta_keeps_concurrent_changes() {
+        let before = serde_json::json!({"pstate": {"A": {"running": true}}});
+        // This request removed A.
+        let after = serde_json::json!({"pstate": {}});
+        // Meanwhile another request added B and committed it.
+        let mut current = serde_json::json!({"pstate": {"B": {"running": true}}});
+
+        revert_delta(&mut current, &before, &after);
+
+        assert_eq!(
+            current,
+            serde_json::json!({"pstate": {"A": {"running": true}, "B": {"running": true}}}),
+            "rollback must restore A without erasing the concurrently created B"
+        );
+    }
+
+    /// The mirror case: a request that *added* state has that addition taken away again,
+    /// and nothing else is disturbed.
+    #[cfg(feature = "strict-policy")]
+    #[test]
+    fn reverting_a_delta_removes_only_what_the_request_added() {
+        let before = serde_json::json!({"pstate": {"A": {"running": true}}});
+        let after = serde_json::json!({"pstate": {"A": {"running": true}, "B": {"n": 1}}});
+        let mut current =
+            serde_json::json!({"pstate": {"A": {"running": true}, "B": {"n": 1}, "C": {"n": 2}}});
+
+        revert_delta(&mut current, &before, &after);
+
+        assert_eq!(
+            current,
+            serde_json::json!({"pstate": {"A": {"running": true}, "C": {"n": 2}}})
+        );
+    }
+
+    /// A key the request never touched must survive even when another request changed its
+    /// value after the snapshot was taken.
+    #[cfg(feature = "strict-policy")]
+    #[test]
+    fn reverting_a_delta_leaves_untouched_keys_alone() {
+        let before = serde_json::json!({"pstate": {"A": 1}, "other": "old"});
+        let after = serde_json::json!({"pstate": {"A": 2}, "other": "old"});
+        let mut current =
+            serde_json::json!({"pstate": {"A": 2}, "other": "changed-by-someone-else"});
+
+        revert_delta(&mut current, &before, &after);
+
+        assert_eq!(
+            current,
+            serde_json::json!({"pstate": {"A": 1}, "other": "changed-by-someone-else"})
+        );
+    }
+
+    // FR-1a helper: evaluate `data.agent_policy.<ep>` on a policy's engine and return
+    // whether it is boolean-true. Synchronous (no async runtime needed).
+    fn eval_bool(p: &mut AgentPolicy, ep: &str) -> bool {
+        p.engine.set_input_json("{}").unwrap();
+        let r = p
+            .engine
+            .eval_query(format!("data.agent_policy.{ep}"), false)
+            .unwrap();
+        matches!(
+            r.result
+                .first()
+                .and_then(|x| x.expressions.first())
+                .map(|e| &e.value),
+            Some(regorus::Value::Bool(true))
+        )
+    }
+
+    /// Endpoints a closed-door baseline must refuse. `SetPolicyRequest` is deliberately in
+    /// this list: strict builds deliver policy through initdata only.
+    #[cfg(feature = "strict-policy")]
+    const CLOSED_DOOR_ENDPOINTS: &[&str] = &[
+        "CreateContainerRequest",
+        "StartContainerRequest",
+        "ExecProcessRequest",
+        "ReadStreamRequest",
+        "WriteStreamRequest",
+        "CopyFileRequest",
+        "CreateSandboxRequest",
+        "GetOOMEventRequest",
+        "SetPolicyRequest",
+    ];
+
+    const POLICY_ALLOW_CREATE: &str =
+        "package agent_policy\ndefault CreateContainerRequest := true\n";
+    const POLICY_ALLOW_EXEC: &str = "package agent_policy\ndefault ExecProcessRequest := true\n";
+
+    /// A request is refused either by evaluating to `false` or by failing to evaluate at
+    /// all (an undefined rule yields an empty result, which `allow_request` turns into an
+    /// error). Both are denials; the agent maps `Err` to a refused request.
+    #[cfg(feature = "strict-policy")]
+    fn is_denied(outcome: Result<(bool, String)>) -> bool {
+        !matches!(outcome, Ok((true, _)))
+    }
+
+    /// A3: the compiled-in baseline denies every endpoint, including `SetPolicyRequest`.
+    /// Guards against reintroducing a carve-out.
+    #[cfg(feature = "strict-policy")]
+    #[tokio::test]
+    async fn strict_baseline_denies_every_endpoint() {
+        let mut p = AgentPolicy::new();
+        p.engine
+            .add_policy(
+                "strict-default.rego".to_string(),
+                STRICT_DEFAULT_POLICY.to_string(),
+            )
+            .unwrap();
+
+        for ep in CLOSED_DOOR_ENDPOINTS {
+            assert!(
+                is_denied(p.allow_request(ep, "{}").await),
+                "closed-door baseline allowed {}",
+                ep
+            );
+        }
+    }
+
+    /// A1: in a strict build a configured policy file is ignored and the closed-door
+    /// baseline is installed anyway. This is the regression test for the rootfs
+    /// policy-file override: on the pre-fix agent the permissive file below is loaded and
+    /// `CreateContainerRequest` is allowed.
+    #[cfg(feature = "strict-policy")]
+    #[tokio::test]
+    async fn strict_initialize_ignores_configured_policy_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let permissive = dir.path().join("allow-all.rego");
+        std::fs::write(
+            &permissive,
+            "package agent_policy\ndefault CreateContainerRequest := true\n",
+        )
+        .unwrap();
+
+        let mut p = AgentPolicy::new();
+        p.initialize(0, permissive.to_string_lossy().into_owned(), None)
+            .await
+            .unwrap();
+
+        assert!(
+            is_denied(p.allow_request("CreateContainerRequest", "{}").await),
+            "a policy file on the guest filesystem overrode the closed-door baseline"
+        );
+    }
+
+    /// A1b: the same holds when no policy file is configured at all.
+    #[cfg(feature = "strict-policy")]
+    #[tokio::test]
+    async fn strict_initialize_without_policy_file_is_closed() {
+        let mut p = AgentPolicy::new();
+        p.initialize(0, String::new(), None).await.unwrap();
+
+        assert!(is_denied(
+            p.allow_request("CreateContainerRequest", "{}").await
+        ));
+    }
+
+    /// A2: non-strict builds keep the historical behaviour -- the configured policy file
+    /// wins. Ensures the strict hardening did not change the default build.
+    #[cfg(not(feature = "strict-policy"))]
+    #[tokio::test]
+    async fn non_strict_initialize_loads_configured_policy_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let permissive = dir.path().join("allow-all.rego");
+        std::fs::write(
+            &permissive,
+            "package agent_policy\ndefault CreateContainerRequest := true\n",
+        )
+        .unwrap();
+
+        let mut p = AgentPolicy::new();
+        p.initialize(0, permissive.to_string_lossy().into_owned(), None)
+            .await
+            .unwrap();
+
+        let (allowed, _) = p
+            .allow_request("CreateContainerRequest", "{}")
+            .await
+            .unwrap();
+        assert!(
+            allowed,
+            "non-strict build should honour the configured policy file"
+        );
+    }
+
+    /// FR-12 / F-7: policy activation is one-shot in strict builds. The first activation
+    /// succeeds; every subsequent one is refused.
+    ///
+    /// This guards `AgentPolicy::set_policy()`, which is distinct from the `SetPolicy`
+    /// RPC -- the RPC is compiled out of strict builds, leaving the initdata activation in
+    /// `main.rs` as the only caller. That caller runs once per boot, so no live path
+    /// exercises the guard today: it exists so that a future second activation path fails
+    /// closed instead of silently replacing the active ruleset, and so that re-enabling
+    /// the RPC does not by itself reintroduce runtime policy mutation. Without this test a
+    /// regression that deleted the guard would therefore be entirely silent.
+    #[cfg(feature = "strict-policy")]
+    #[tokio::test]
+    async fn strict_policy_activation_is_one_shot() {
+        let mut p = AgentPolicy::new();
+        p.set_policy(POLICY_ALLOW_CREATE).await.unwrap();
+
+        let err = p
+            .set_policy(POLICY_ALLOW_CREATE)
+            .await
+            .expect_err("second activation must be refused");
+        assert!(
+            err.to_string().contains("one-shot"),
+            "unexpected rejection reason: {}",
+            err
+        );
+    }
+
+    /// FR-12 / F-7: a *refused* second activation must not disturb the policy already in
+    /// force. The guard returns before `new_engine()`, so a rejected call cannot wipe the
+    /// active ruleset -- this is the property that makes the one-shot lock safe rather than
+    /// merely noisy.
+    #[cfg(feature = "strict-policy")]
+    #[tokio::test]
+    async fn strict_rejected_activation_leaves_active_policy_intact() {
+        let mut p = AgentPolicy::new();
+        p.set_policy(POLICY_ALLOW_CREATE).await.unwrap();
+
+        assert!(p.set_policy(POLICY_ALLOW_EXEC).await.is_err());
+
+        let (allowed, _) = p
+            .allow_request("CreateContainerRequest", "{}")
+            .await
+            .unwrap();
+        assert!(allowed, "rejected activation wiped the active policy");
+        assert!(
+            is_denied(p.allow_request("ExecProcessRequest", "{}").await),
+            "rejected activation leaked rules from the refused policy"
+        );
+    }
+
+    /// FR-12 / F-5: `apply_fragment_module` is deliberately *not* covered by the one-shot
+    /// lock -- it is additive and namespace-confined, so it extends the ruleset without
+    /// rebuilding the engine. Pinning both halves here makes any future change to that
+    /// asymmetry a conscious decision rather than an accident.
+    #[cfg(feature = "strict-policy")]
+    #[tokio::test]
+    async fn strict_fragments_still_apply_after_activation() {
+        let mut p = AgentPolicy::new();
+        p.set_policy(POLICY_ALLOW_CREATE).await.unwrap();
+
+        p.apply_fragment_module(
+            "frag",
+            "package agent_policy.fragments\ndefault allowed := true\n",
+            "reg/a",
+            &[],
+            None,
+        )
+        .expect("an additive fragment must still apply after activation");
+
+        assert!(
+            p.set_policy(POLICY_ALLOW_CREATE).await.is_err(),
+            "set_policy must stay rejected regardless of fragment activity"
+        );
+    }
+
+    /// FR-12: the one-shot lock is strict-only. Default builds must keep the historical
+    /// replaceable-policy behaviour, so the hardening cannot regress upstream users.
+    #[cfg(not(feature = "strict-policy"))]
+    #[tokio::test]
+    async fn non_strict_set_policy_can_be_replaced() {
+        let mut p = AgentPolicy::new();
+        p.set_policy(POLICY_ALLOW_CREATE).await.unwrap();
+        p.set_policy(POLICY_ALLOW_EXEC)
+            .await
+            .expect("non-strict builds must allow policy replacement");
+
+        let (allowed, _) = p.allow_request("ExecProcessRequest", "{}").await.unwrap();
+        assert!(allowed, "the replacement policy did not take effect");
+    }
+
+    /// BL-8: the boot-time fragment declarations are read from
+    /// `data.agent_policy.policy_fragments[]`. A base policy declaring them yields the
+    /// parsed specs; a base policy declaring none yields an empty list (no boot pull).
+    #[test]
+    fn test_fragment_specs_read_from_base_policy() {
+        let mut p = AgentPolicy::new();
+        // No declaration → empty (default: boot unchanged, zero network calls).
+        let base_none = "package agent_policy\ndefault SetPolicyRequest := true\n";
+        p.engine
+            .add_policy("agent_policy".to_string(), base_none.to_string())
+            .unwrap();
+        assert!(p.fragment_specs().unwrap().is_empty());
+
+        // Declared fragments → parsed into FragmentSpec entries in policy order.
+        let mut p2 = AgentPolicy::new();
+        let base = "package agent_policy\n\
+            policy_fragments := [\n\
+            {\"issuer\": \"did:x509:0:sha256:AAA::CN:signer\", \"feed\": \"reg/frag/infra:1\", \"minimum_svn\": 2},\n\
+            {\"issuer\": \"did:x509:0:sha256:BBB::CN:other\", \"feed\": \"reg/frag/net:3\"}\n\
+            ]\n";
+        p2.engine
+            .add_policy("agent_policy".to_string(), base.to_string())
+            .unwrap();
+        let specs = p2.fragment_specs().unwrap();
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].issuer, "did:x509:0:sha256:AAA::CN:signer");
+        assert_eq!(specs[0].feed, "reg/frag/infra:1");
+        assert_eq!(specs[0].minimum_svn, 2);
+        assert_eq!(specs[1].feed, "reg/frag/net:3");
+        // minimum_svn defaults to 0 when omitted.
+        assert_eq!(specs[1].minimum_svn, 0);
+        // `required` defaults to false when omitted: a declaration is a permission, not an
+        // obligation, unless the policy explicitly says otherwise (C-ACI parity).
+        assert!(!specs[0].required);
+        assert!(!specs[1].required);
+    }
+
+    /// BL-8: `required: true` is parsed off the declaration, so a policy can demand that a
+    /// specific fragment be present while leaving others optional.
+    #[test]
+    fn test_fragment_specs_parse_required_flag() {
+        let mut p = AgentPolicy::new();
+        let base = "package agent_policy\n\
+            policy_fragments := [\n\
+            {\"issuer\": \"did:x509:0:sha256:AAA::CN:signer\", \"feed\": \"reg/must:1\", \"minimum_svn\": 2, \"required\": true},\n\
+            {\"issuer\": \"did:x509:0:sha256:AAA::CN:signer\", \"feed\": \"reg/may:1\", \"required\": false}\n\
+            ]\n";
+        p.engine
+            .add_policy("agent_policy".to_string(), base.to_string())
+            .unwrap();
+        let specs = p.fragment_specs().unwrap();
+        assert_eq!(specs.len(), 2);
+        assert!(specs[0].required, "explicit required:true must be honoured");
+        assert!(!specs[1].required);
+    }
+
+    /// BL-8: `allow_nested` defaults to no delegation, so a policy written before the
+    /// attribute existed cannot have acquired the capability by upgrade.
+    #[test]
+    fn test_fragment_specs_default_to_no_delegation() {
+        let mut p = AgentPolicy::new();
+        let base = "package agent_policy\n\
+            policy_fragments := [\n\
+            {\"issuer\": \"did:x509:0:sha256:AAA::CN:signer\", \"feed\": \"reg/frag:1\"}\n\
+            ]\n";
+        p.engine
+            .add_policy("agent_policy".to_string(), base.to_string())
+            .unwrap();
+        let specs = p.fragment_specs().unwrap();
+        let scope = specs[0].nested_scope().unwrap();
+        assert_eq!(scope, NestedScope::None);
+        assert!(!scope.is_enabled());
+        assert!(
+            !scope.permits("did:x509:0:sha256:AAA::CN:signer", "did:x509:0:sha256:AAA::CN:signer"),
+            "no delegation means not even the fragment's own issuer"
+        );
+    }
+
+    /// BL-8: each accepted `allow_nested` form resolves to the scope it names, and the scope
+    /// admits exactly the issuers it should.
+    #[test]
+    fn test_allow_nested_scopes_resolve_and_bound_issuers() {
+        let parent = "did:x509:0:sha256:AAA::CN:parent";
+        let other = "did:x509:0:sha256:BBB::CN:other";
+        let third = "did:x509:0:sha256:CCC::CN:third";
+
+        let mut p = AgentPolicy::new();
+        let base = format!(
+            "package agent_policy\n\
+            policy_fragments := [\n\
+            {{\"issuer\": \"{parent}\", \"feed\": \"reg/a:1\", \"allow_nested\": \"same-issuer\"}},\n\
+            {{\"issuer\": \"{parent}\", \"feed\": \"reg/b:1\", \"allow_nested\": \"any-authorized\"}},\n\
+            {{\"issuer\": \"{parent}\", \"feed\": \"reg/c:1\", \"allow_nested\": [\"{other}\"]}},\n\
+            {{\"issuer\": \"{parent}\", \"feed\": \"reg/d:1\", \"allow_nested\": false}},\n\
+            {{\"issuer\": \"{parent}\", \"feed\": \"reg/e:1\", \"allow_nested\": \"none\"}}\n\
+            ]\n"
+        );
+        p.engine.add_policy("agent_policy".to_string(), base).unwrap();
+        let specs = p.fragment_specs().unwrap();
+        assert_eq!(specs.len(), 5);
+
+        // same-issuer: the delivering fragment's issuer only.
+        let same = specs[0].nested_scope().unwrap();
+        assert_eq!(same, NestedScope::SameIssuer);
+        assert!(same.permits(parent, parent));
+        assert!(!same.permits(parent, other));
+
+        // any-authorized: bounded by the trust root, not by the declaration.
+        let any = specs[1].nested_scope().unwrap();
+        assert_eq!(any, NestedScope::AnyAuthorized);
+        assert!(any.permits(parent, other));
+
+        // explicit list: exactly the issuers named, and notably not the parent's own unless
+        // it is listed — an explicit list is the whole answer, not an addition to a default.
+        let list = specs[2].nested_scope().unwrap();
+        assert_eq!(list, NestedScope::Issuers(vec![other.to_string()]));
+        assert!(list.permits(parent, other));
+        assert!(!list.permits(parent, third));
+        assert!(!list.permits(parent, parent));
+
+        // Both spellings of "off".
+        assert_eq!(specs[3].nested_scope().unwrap(), NestedScope::None);
+        assert_eq!(specs[4].nested_scope().unwrap(), NestedScope::None);
+    }
+
+    /// BL-8: `allow_nested: true` names no scope, so it is rejected rather than guessed at.
+    /// Guessing either way would be wrong — permissive silently widens delegation, and
+    /// silently disabling it leaves the author believing a control is on when it is not.
+    #[test]
+    fn test_allow_nested_true_is_rejected() {
+        let mut p = AgentPolicy::new();
+        let base = "package agent_policy\n\
+            policy_fragments := [\n\
+            {\"issuer\": \"did:x509:0:sha256:AAA::CN:signer\", \"feed\": \"reg/frag:1\", \"allow_nested\": true}\n\
+            ]\n";
+        p.engine
+            .add_policy("agent_policy".to_string(), base.to_string())
+            .unwrap();
+        let specs = p.fragment_specs().unwrap();
+        let err = specs[0].nested_scope().unwrap_err().to_string();
+        assert!(
+            err.contains("does not say which issuers"),
+            "error must tell the author what is missing, got: {}", err
+        );
+        assert!(err.contains("same-issuer"), "error must name a valid form");
+    }
+
+    /// BL-8: an unrecognised mode string fails closed instead of being treated as "off".
+    /// A typo like `same_issuer` must surface at boot, not silently disable delegation.
+    #[test]
+    fn test_allow_nested_unknown_mode_is_rejected() {
+        let mut p = AgentPolicy::new();
+        let base = "package agent_policy\n\
+            policy_fragments := [\n\
+            {\"issuer\": \"did:x509:0:sha256:AAA::CN:signer\", \"feed\": \"reg/frag:1\", \"allow_nested\": \"same_issuer\"}\n\
+            ]\n";
+        p.engine
+            .add_policy("agent_policy".to_string(), base.to_string())
+            .unwrap();
+        let err = specs_err(&mut p);
+        assert!(err.contains("same_issuer"), "error must quote the bad value: {}", err);
+    }
+
+    /// BL-8: an empty issuer list permits nothing, which is almost certainly an authoring
+    /// mistake rather than an intent. Reject so it cannot be confused with `false`.
+    #[test]
+    fn test_allow_nested_empty_list_is_rejected() {
+        let mut p = AgentPolicy::new();
+        let base = "package agent_policy\n\
+            policy_fragments := [\n\
+            {\"issuer\": \"did:x509:0:sha256:AAA::CN:signer\", \"feed\": \"reg/frag:1\", \"allow_nested\": []}\n\
+            ]\n";
+        p.engine
+            .add_policy("agent_policy".to_string(), base.to_string())
+            .unwrap();
+        let err = specs_err(&mut p);
+        assert!(err.contains("empty issuer list"), "got: {}", err);
+    }
+
+    fn specs_err(p: &mut AgentPolicy) -> String {
+        let specs = p.fragment_specs().unwrap();
+        specs[0].nested_scope().unwrap_err().to_string()
+    }
+
+    /// F-62: the declaration carries the namespace grant and the module switch, and both
+    /// default safely — no named namespaces, module allowed.
+    #[test]
+    fn test_fragment_specs_parse_module_grant() {
+        let mut p = AgentPolicy::new();
+        let base = "package agent_policy\n\
+            policy_fragments := [\n\
+            {\"issuer\": \"did:x509:0:sha256:AAA::CN:s\", \"feed\": \"reg/a:1\", \"includes\": [\"infra\", \"net\"]},\n\
+            {\"issuer\": \"did:x509:0:sha256:AAA::CN:s\", \"feed\": \"reg/b:1\", \"allow_module\": false},\n\
+            {\"issuer\": \"did:x509:0:sha256:AAA::CN:s\", \"feed\": \"reg/c:1\"}\n\
+            ]\n";
+        p.engine
+            .add_policy("agent_policy".to_string(), base.to_string())
+            .unwrap();
+        let specs = p.fragment_specs().unwrap();
+
+        assert_eq!(specs[0].includes, vec!["infra".to_string(), "net".to_string()]);
+        assert!(
+            specs[0].allow_module,
+            "allow_module must default to true, or every existing declaration silently \
+             stops contributing rules"
+        );
+
+        // Metadata-only: accepted for its SVN/receipt record, contributes no rules.
+        assert!(!specs[1].allow_module);
+
+        // Omitting both grants no named namespace but still applies the module — the
+        // shared package remains available.
+        assert!(specs[2].includes.is_empty());
+        assert!(specs[2].allow_module);
+    }
+
+    /// F-62: `FragmentSpec::default()` must agree with what serde produces for an empty
+    /// declaration. A derived Default would give `allow_module: false` and quietly disable
+    /// module injection anywhere the struct is built from defaults.
+    #[test]
+    fn test_fragment_spec_default_matches_serde_default() {
+        let from_serde: FragmentSpec =
+            serde_json::from_str(r#"{"issuer":"i","feed":"f"}"#).unwrap();
+        let from_default = FragmentSpec {
+            issuer: "i".to_string(),
+            feed: "f".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(from_serde, from_default);
+        assert!(from_default.allow_module);
+    }
+
+    /// BL-8: a delivered fragment's own declarations are read from its module's package, so
+    /// two fragments in different namespaces cannot see or overwrite each other's.
+    #[test]
+    fn test_nested_fragment_specs_are_read_per_package() {
+        let mut p = AgentPolicy::new();
+        p.engine
+            .add_policy(
+                "agent_policy".to_string(),
+                "package agent_policy\ndefault SetPolicyRequest := false\n".to_string(),
+            )
+            .unwrap();
+
+        let module = "package agent_policy.fragments.infra\n\
+            policy_fragments := [\n\
+            {\"issuer\": \"did:x509:0:sha256:BBB::CN:child\", \"feed\": \"reg/child:1\", \"minimum_svn\": 5, \"required\": true}\n\
+            ]\n";
+        let pkg = p
+            .apply_fragment_module("fragment:test", module, "reg/parent", &["infra".to_string()], None)
+            .unwrap();
+        assert_eq!(pkg, "agent_policy.fragments.infra");
+
+        let nested = p.nested_fragment_specs(&pkg).unwrap();
+        assert_eq!(nested.len(), 1);
+        assert_eq!(nested[0].feed, "reg/child:1");
+        assert_eq!(nested[0].minimum_svn, 5);
+        assert!(nested[0].required);
+        // A fragment that declares none, and a namespace nobody wrote to, both read empty
+        // rather than erroring — declaring nothing is the overwhelmingly common case.
+        assert!(p
+            .nested_fragment_specs("agent_policy.fragments.absent")
+            .unwrap()
+            .is_empty());
+    }
+
+    /// TC-F1.1: a verified fragment module flips a specific decision from deny→allow, and
+    /// base rules are otherwise unaffected.
+    #[test]
+    fn test_fragment_module_flips_deny_to_allow() {
+        let mut p = AgentPolicy::new();
+        // Base policy: exec denied unless a fragment fact grants it.
+        let base = "package agent_policy\n\
+            default ExecProcessRequest := false\n\
+            ExecProcessRequest := data.agent_policy.fragments.exec_allowed\n";
+        p.engine
+            .add_policy("agent_policy".to_string(), base.to_string())
+            .unwrap();
+        assert!(
+            !eval_bool(&mut p, "ExecProcessRequest"),
+            "denied before fragment"
+        );
+
+        // Apply a verified fragment module in the reserved namespace.
+        let module = "package agent_policy.fragments\nexec_allowed := true\n";
+        p.apply_fragment_module("frag:issuerA:1", module, "reg/a", &[], None)
+            .unwrap();
+        assert!(
+            eval_bool(&mut p, "ExecProcessRequest"),
+            "allowed after fragment"
+        );
+    }
+
+    /// TC-F1.2: a fragment module outside the permitted fragment namespaces is rejected —
+    /// it can never redefine/shadow a base rule or contribute outside its `includes`.
+    #[test]
+    fn test_fragment_module_namespace_is_enforced() {
+        let mut p = AgentPolicy::new();
+        // A module trying to live in the base package is refused.
+        let base_ns = "package agent_policy\ndefault ExecProcessRequest := true\n";
+        assert!(p.apply_fragment_module("evil", base_ns, "reg/a", &[], None).is_err());
+
+        // A sub-namespace not in `includes` is refused; one that is, is accepted.
+        let mount_ns = "package agent_policy.fragments.mount\nallowed := true\n";
+        assert!(p
+            .apply_fragment_module("m", mount_ns, "reg/a", &["exec".to_string()], None)
+            .is_err());
+        assert!(p
+            .apply_fragment_module("m", mount_ns, "reg/a", &["mount".to_string()], None)
+            .is_ok());
+    }
+
+    /// F-69: a fragment may declare `agent_policy.fragments["<feed>"]` for its own verified
+    /// feed — that is the only way to satisfy the container-contribution contract, because a
+    /// feed is an OCI reference and cannot be a Rego identifier. Any *other* feed is refused,
+    /// so the quoted form cannot be used to squat another publisher's namespace.
+    #[test]
+    fn test_fragment_may_only_claim_its_own_feed_namespace() {
+        let feed = "localhost:5000/coco-e2e/fragment";
+        let own = format!(
+            "package agent_policy.fragments[\"{feed}\"]\n\
+             issuer := \"did:example:e2e\"\nsvn := \"1\"\ncontainers := []\n"
+        );
+
+        let mut p = AgentPolicy::new();
+        assert!(
+            p.apply_fragment_module("own", &own, feed, &[], None).is_ok(),
+            "a fragment must be able to write under its own verified feed"
+        );
+
+        // Same module, delivered under a different verified feed: refused.
+        let mut q = AgentPolicy::new();
+        assert!(
+            q.apply_fragment_module("other", &own, "localhost:5000/someone-else", &[], None)
+                .is_err(),
+            "a fragment must not be able to claim another feed's namespace"
+        );
+
+        // Whitespace inside the brackets is tolerated; the decoded feed is what is compared.
+        let spaced = format!(
+            "package agent_policy.fragments[ \"{feed}\" ]\ncontainers := []\n"
+        );
+        let mut r = AgentPolicy::new();
+        assert!(r.apply_fragment_module("spaced", &spaced, feed, &[], None).is_ok());
+
+        // A trailing segment after the bracket is not the sanctioned form.
+        let suffixed =
+            format!("package agent_policy.fragments[\"{feed}\"].extra\ncontainers := []\n");
+        let mut s = AgentPolicy::new();
+        assert!(s
+            .apply_fragment_module("suffixed", &suffixed, feed, &[], None)
+            .is_err());
+    }
+
+    /// FR-1k: a parameterised fragment reads its values through `parameter(name)`, falls
+    /// back to the default it declares itself, and yields `null` when neither supplies one.
+    #[test]
+    fn test_fragment_parameters_are_bound_and_defaulted() {
+        let mut p = AgentPolicy::new();
+        let module = "package agent_policy.fragments\n\
+            parameters_api := {\"host\": {\"default\": \"fallback\"}, \"other\": {}}\n\
+            bound := parameter(\"host\")\n\
+            defaulted := parameter(\"missing_here\")\n\
+            unknown := parameter(\"other\")\n";
+        p.apply_fragment_module("frag", module, "reg/a", &[], Some("{\"host\": \"supplied\"}"))
+            .unwrap();
+
+        let get = |p: &mut AgentPolicy, rule: &str| {
+            p.engine
+                .eval_rule(format!("data.agent_policy.fragments.{rule}"))
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(get(&mut p, "bound"), "\"supplied\"");
+        // Neither supplied nor declared -> null rather than an evaluation failure.
+        assert_eq!(get(&mut p, "defaulted"), "null");
+        // Declared in `parameters_api` but with no default and no value -> null.
+        assert_eq!(get(&mut p, "unknown"), "null");
+
+        // The same module with the parameter left out falls back to the declared default,
+        // proving `parameters_api` is consulted rather than the value being required.
+        let mut q = AgentPolicy::new();
+        q.apply_fragment_module("frag", module, "reg/a", &[], Some("{}"))
+            .unwrap();
+        assert_eq!(get(&mut q, "bound"), "\"fallback\"");
+    }
+
+    /// FR-1k: parameters must be a JSON object. A scalar or array is rejected rather than
+    /// coerced — every `parameter()` lookup would otherwise fall silently through to its
+    /// default, turning a mis-specified policy into a quietly permissive one.
+    #[test]
+    fn test_fragment_parameters_must_be_an_object() {
+        let mut p = AgentPolicy::new();
+        let module = "package agent_policy.fragments\nx := 1\n";
+        assert!(p
+            .apply_fragment_module("a", module, "reg/a", &[], Some("[1, 2]"))
+            .is_err());
+        assert!(p
+            .apply_fragment_module("b", module, "reg/a", &[], Some("\"scalar\""))
+            .is_err());
+        assert!(p
+            .apply_fragment_module("c", module, "reg/a", &[], Some("{ not json"))
+            .is_err());
+        // A fragment that is not parameterised is unaffected.
+        assert!(p.apply_fragment_module("d", module, "reg/a", &[], None).is_ok());
+    }
+
+    /// FR-1l: a policy may state the enforcement framework it was written against. Equal or
+    /// older is enforced; newer is refused, because gates this build lacks would silently
+    /// not run rather than fail. An absent or unparseable declaration is legacy, not an
+    /// error — only a malformed *explicit* one is.
+    #[tokio::test]
+    async fn test_framework_version_floor_is_enforced() {
+        let base = "package agent_policy\ndefault SetPolicyRequest := false\n";
+        let with = |v: &str| format!("{base}framework_version := \"{v}\"\n");
+
+        // No declaration at all: every policy written before this check existed.
+        assert!(AgentPolicy::new().set_policy(base).await.is_ok());
+        // Older and equal are fine.
+        assert!(AgentPolicy::new().set_policy(&with("0.9.0")).await.is_ok());
+        assert!(AgentPolicy::new()
+            .set_policy(&with(POLICY_FRAMEWORK_VERSION))
+            .await
+            .is_ok());
+        // Newer in any component is refused.
+        for v in ["1.0.1", "1.1.0", "2.0.0"] {
+            assert!(
+                AgentPolicy::new().set_policy(&with(v)).await.is_err(),
+                "expected {v} to be refused"
+            );
+        }
+        // An explicit but malformed version is an error, not a silent legacy fallback.
+        assert!(AgentPolicy::new().set_policy(&with("1.0")).await.is_err());
+        assert!(AgentPolicy::new().set_policy(&with("v1.0.0")).await.is_err());
+    }
+
+    /// A miniature policy that reproduces the `pstate` mechanics of the generated
+    /// `rules.rego`: the helper functions verbatim, a `RemoveContainerRequest` rule that
+    /// deletes the container from `pstate` as its authorization `ops`, and a
+    /// `SignalProcessRequest` rule that is undefined for a container missing from
+    /// `pstate`. It is deliberately self-contained so the test does not depend on a
+    /// generated policy_data blob.
+    #[cfg(feature = "strict-policy")]
+    const POLICY_PSTATE_LIFECYCLE: &str = r#"package agent_policy
+
+import future.keywords.if
+
+default RemoveContainerRequest := false
+default SignalProcessRequest := false
+default CreateContainerRequest := false
+
+get_state() = state if { state := data["pstate"] }
+get_state_val(key) = value if { state := get_state(); value := state[key] }
+get_state_path(key) = path if { path := concat("/", ["/pstate", key]) }
+
+state_del_key(key) = action if {
+  get_state()
+  path := get_state_path(key)
+  action := {"op": "remove", "path": path}
+}
+
+state_add_key(key) = action if {
+  get_state()
+  path := get_state_path(key)
+  action := {"op": "add", "path": path, "value": 0}
+}
+
+concat_op_if_not_null(ops, op) = result if { op == null; result := ops }
+concat_op_if_not_null(ops, op) = result if { op != null; result := array.concat(ops, [op]) }
+
+CreateContainerRequest := {"ops": ops, "allowed": true} if {
+  not get_state_val(input.container_id)
+  ops := concat_op_if_not_null([], state_add_key(input.container_id))
+}
+
+RemoveContainerRequest := {"ops": ops, "allowed": true} if {
+  get_state_val(input.container_id)
+  ops := concat_op_if_not_null([], state_del_key(input.container_id))
+}
+
+SignalProcessRequest if {
+  get_state_val(input.container_id)
+}
+"#;
+
+    /// Build a policy with the lifecycle rules above and one container already recorded in
+    /// `pstate`, as a successful `CreateContainerRequest` would have left it.
+    #[cfg(feature = "strict-policy")]
+    fn pstate_policy_with_container(cid: &str) -> AgentPolicy {
+        let mut p = AgentPolicy::new();
+        p.engine
+            .add_policy(
+                "pstate-lifecycle.rego".to_string(),
+                POLICY_PSTATE_LIFECYCLE.to_string(),
+            )
+            .unwrap();
+        // AgentPolicy::new() already seeds an empty `pstate`, so replace the data wholesale
+        // rather than adding a second binding for the same key.
+        p.restore_state(&format!(r#"{{"pstate": {{"{cid}": 0}}}}"#))
+            .unwrap();
+        p
+    }
+
+    /// F-19: authorizing a `RemoveContainerRequest` deletes the container from `pstate`
+    /// before the teardown runs. If the teardown then fails and that mutation is not rolled
+    /// back, the container is still running but the policy no longer knows about it, so
+    /// every later signal and every retried removal is denied by the fail-closed default.
+    ///
+    /// This asserts the damage exists, which is what makes the rollback in
+    /// `remove_container` load-bearing rather than defensive.
+    #[cfg(feature = "strict-policy")]
+    #[tokio::test]
+    async fn remove_authorization_alone_strands_the_container() {
+        let cid = "ctr1";
+        let req = format!(r#"{{"container_id": "{cid}"}}"#);
+        let mut p = pstate_policy_with_container(cid);
+
+        assert!(
+            matches!(
+                p.allow_request("SignalProcessRequest", &req).await,
+                Ok((true, _))
+            ),
+            "a container in pstate must be signallable to begin with"
+        );
+
+        // Authorization applies the pstate deletion. Imagine do_remove_container failing here.
+        assert!(matches!(
+            p.allow_request("RemoveContainerRequest", &req).await,
+            Ok((true, _))
+        ));
+
+        assert!(
+            is_denied(p.allow_request("SignalProcessRequest", &req).await),
+            "container is unreachable by signal once removed from pstate"
+        );
+        assert!(
+            is_denied(p.allow_request("RemoveContainerRequest", &req).await),
+            "and the removal cannot be retried either -- the container is stranded"
+        );
+    }
+
+    /// F-19: reverting this request's own `pstate` delta undoes the removal's deletion, so
+    /// a container whose teardown failed stays signallable and the removal stays retryable.
+    /// This is the regression test for the rollback that `remove_container` performs on the
+    /// failure path -- it exercises `revert_state_delta`, which is what the handler calls.
+    #[cfg(feature = "strict-policy")]
+    #[tokio::test]
+    async fn rollback_after_failed_remove_keeps_the_container_reachable() {
+        let cid = "ctr1";
+        let req = format!(r#"{{"container_id": "{cid}"}}"#);
+        let mut p = pstate_policy_with_container(cid);
+
+        // What remove_container does: bracket authorization with before/after, then
+        // revert only this request's delta on failure.
+        let before = p.snapshot_state().unwrap();
+        assert!(matches!(
+            p.allow_request("RemoveContainerRequest", &req).await,
+            Ok((true, _))
+        ));
+        let after = p.snapshot_state().unwrap();
+        p.revert_state_delta(&before, &after).unwrap();
+
+        assert!(
+            matches!(
+                p.allow_request("SignalProcessRequest", &req).await,
+                Ok((true, _))
+            ),
+            "after rollback the still-running container must remain signallable"
+        );
+        assert!(
+            matches!(
+                p.allow_request("RemoveContainerRequest", &req).await,
+                Ok((true, _))
+            ),
+            "after rollback the failed removal must be retryable"
+        );
+    }
+
+    /// F-19: the reason the rollback is a *delta* revert and not a snapshot restore.
+    /// A concurrent request commits its own `pstate` change while the failing removal is
+    /// awaiting the runtime; the rollback must not take that change with it.
+    #[cfg(feature = "strict-policy")]
+    #[tokio::test]
+    async fn rollback_preserves_concurrent_state_changes() {
+        let (a, b) = ("ctr1", "ctr2");
+        let req_a = format!(r#"{{"container_id": "{a}"}}"#);
+        let req_b = format!(r#"{{"container_id": "{b}"}}"#);
+        let mut p = pstate_policy_with_container(a);
+
+        // remove(A) brackets its own authorization...
+        let before = p.snapshot_state().unwrap();
+        assert!(matches!(
+            p.allow_request("RemoveContainerRequest", &req_a).await,
+            Ok((true, _))
+        ));
+        let after = p.snapshot_state().unwrap();
+
+        // ...then B is created and committed while remove(A) awaits the runtime.
+        assert!(matches!(
+            p.allow_request("CreateContainerRequest", &req_b).await,
+            Ok((true, _))
+        ));
+
+        // remove(A) fails and rolls back. A whole-document restore of `before` would
+        // erase B; reverting only A's delta must not.
+        p.revert_state_delta(&before, &after).unwrap();
+
+        assert!(
+            matches!(
+                p.allow_request("RemoveContainerRequest", &req_b).await,
+                Ok((true, _))
+            ),
+            "a concurrently created container must survive another request's rollback"
+        );
+        assert!(
+            matches!(
+                p.allow_request("SignalProcessRequest", &req_a).await,
+                Ok((true, _))
+            ),
+            "the rolled-back container must still be reachable"
+        );
+    }
 
     struct TestCase {
         name: String,

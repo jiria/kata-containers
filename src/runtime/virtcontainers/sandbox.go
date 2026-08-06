@@ -50,6 +50,7 @@ import (
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/utils"
 
+	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
 	grpcStatus "google.golang.org/grpc/status"
 )
@@ -189,7 +190,7 @@ type SandboxConfig struct {
 	DisableGuestSeccomp bool
 
 	// EmptyDirMode specifies how Kubernetes emptyDir volumes are handled.
-	// Valid values are "shared-fs" (default) or "block-encrypted".
+	// Valid values are "shared-fs" (default), "block-encrypted", or "block-plain".
 	EmptyDirMode string
 
 	// EnableVCPUsPinning controls whether each vCPU thread should be scheduled to a fixed CPU
@@ -269,11 +270,6 @@ type Sandbox struct {
 	seccompSupported  bool
 	disableVMShutdown bool
 	isVCPUsPinningOn  bool
-
-	// hotplugNetworkConfigApplied prevents network config API being called
-	// multiple times for hot-plugged network device when Sandbox has multiple
-	// containers.
-	hotplugNetworkConfigApplied bool
 }
 
 // ID returns the sandbox identifier string.
@@ -1134,7 +1130,7 @@ func (s *Sandbox) Delete(ctx context.Context) error {
 
 // cleanupEphemeralDisks removes ephemeral disk images and their mount info.
 func (s *Sandbox) cleanupEphemeralDisks() error {
-	if s.config.EmptyDirMode != EmptyDirModeVirtioBlkEncrypted {
+	if !isBlockEmptyDirMode(s.config.EmptyDirMode) {
 		return nil
 	}
 
@@ -1148,6 +1144,10 @@ func (s *Sandbox) cleanupEphemeralDisks() error {
 	}
 
 	return nil
+}
+
+func isBlockEmptyDirMode(mode string) bool {
+	return mode == EmptyDirModeVirtioBlkEncrypted || mode == EmptyDirModeVirtioBlkPlain
 }
 
 func (s *Sandbox) createNetwork(ctx context.Context) error {
@@ -2385,6 +2385,65 @@ func (s *Sandbox) GetVfioDeviceGuestPciPath(hostBDF string) types.PciPath {
 	return types.PciPath{}
 }
 
+// hotplugVfioNetworkDevice hotplugs the VFIO device backing a DAN network
+// endpoint into the VM and records its guest PCI path on the endpoint.
+//
+// The device is attached at sandbox scope so that it is available before any
+// container is created -- in particular before init containers, which do not
+// reference the device in their spec. When a workload container later
+// references the same VFIO group through a device plugin, the device manager
+// finds the existing device by major:minor and only bumps its reference
+// counts, so the device is neither plugged twice nor unplugged when that
+// container exits.
+func (s *Sandbox) hotplugVfioNetworkDevice(ctx context.Context, ep *VfioEndpoint) error {
+	if !ep.PciPath().IsNil() {
+		// The device is already attached and configured.
+		return nil
+	}
+
+	if s.config.HypervisorConfig.HotPlugVFIO == config.NoPort {
+		return fmt.Errorf("cannot attach VFIO network interface %q (BDF %s): hot_plug_vfio port is not configured", ep.Name(), ep.HostBDF)
+	}
+
+	devPath, err := drivers.GetVFIODevPath(ep.HostBDF)
+	if err != nil {
+		return fmt.Errorf("failed to resolve VFIO device path for network interface %q (BDF %s): %v", ep.Name(), ep.HostBDF, err)
+	}
+
+	var stat unix.Stat_t
+	if err := unix.Stat(devPath, &stat); err != nil {
+		return fmt.Errorf("stat %q failed for network interface %q: %v", devPath, ep.Name(), err)
+	}
+
+	devInfo := config.DeviceInfo{
+		HostPath:      devPath,
+		ContainerPath: devPath,
+		DevType:       "c",
+		Major:         int64(unix.Major(uint64(stat.Rdev))),
+		Minor:         int64(unix.Minor(uint64(stat.Rdev))),
+		Port:          s.config.HypervisorConfig.HotPlugVFIO,
+	}
+
+	if _, err := s.AddDevice(ctx, devInfo); err != nil {
+		return fmt.Errorf("failed to hotplug VFIO device %q for network interface %q: %v", devPath, ep.Name(), err)
+	}
+
+	pciPath := s.GetVfioDeviceGuestPciPath(ep.HostBDF)
+	if pciPath.IsNil() {
+		return fmt.Errorf("PCI path for VFIO interface %q (BDF %s) not found after hotplug", ep.Name(), ep.HostBDF)
+	}
+	ep.SetPciPath(pciPath)
+
+	s.Logger().WithFields(logrus.Fields{
+		"interface": ep.Name(),
+		"host-bdf":  ep.HostBDF,
+		"device":    devPath,
+		"pci-path":  pciPath.String(),
+	}).Info("VFIO network device hotplugged")
+
+	return nil
+}
+
 // updateResources will:
 // - calculate the resources required for the virtual machine, and adjust the virtual machine
 // sizing accordingly. For a given sandbox, it will calculate the number of vCPUs required based
@@ -3142,13 +3201,29 @@ func (s *Sandbox) checkVCPUsPinning(ctx context.Context) error {
 func (s *Sandbox) checkVCPUsPinningNUMA(ctx context.Context, vCPUThreadsMap VcpuThreadIDs, numaNodes []types.GuestNUMANode, cpuSetSlice []int) error {
 	numVCPUs := uint32(len(vCPUThreadsMap.vcpus))
 	numNodes := uint32(len(numaNodes))
-	if numVCPUs < numNodes {
-		return fmt.Errorf("number of vCPUs (%d) must be >= NUMA node count (%d) for NUMA pinning", numVCPUs, numNodes)
-	}
 
-	vcpusPerNode, err := utils.DistributeVCPUsProportionally(numaNodes, numVCPUs)
-	if err != nil {
-		return fmt.Errorf("failed to compute NUMA vCPU distribution for pinning: %v", err)
+	var vcpusPerNode []uint32
+	if numVCPUs >= numNodes {
+		var err error
+		vcpusPerNode, err = utils.DistributeVCPUsProportionally(numaNodes, numVCPUs)
+		if err != nil {
+			return fmt.Errorf("failed to compute NUMA vCPU distribution for pinning: %v", err)
+		}
+	} else {
+		// Fewer vCPUs than NUMA nodes.  This is expected when a memory-only
+		// NUMA topology is emitted to enable multi-node pxb-pcie placement
+		// for VFIO GPUs (e.g. default_vcpus=1 on a dual-socket DGX).  Give
+		// 1 vCPU to each of the first numVCPUs nodes and 0 to the rest; the
+		// loop below skips nodes with 0 vCPUs so no pinning is attempted for
+		// memory-only nodes.
+		s.Logger().WithFields(logrus.Fields{
+			"vcpus":      numVCPUs,
+			"numa-nodes": numNodes,
+		}).Warn("fewer vCPUs than NUMA nodes (memory-only topology); pinning available vCPU(s) to first node(s)")
+		vcpusPerNode = make([]uint32, numNodes)
+		for i := uint32(0); i < numVCPUs; i++ {
+			vcpusPerNode[i] = 1
+		}
 	}
 
 	cpuSetAll := cpuset.NewCPUSet(cpuSetSlice...)

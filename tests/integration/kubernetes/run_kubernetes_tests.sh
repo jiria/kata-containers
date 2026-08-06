@@ -25,7 +25,7 @@ cleanup() {
 trap cleanup EXIT
 
 TARGET_ARCH="${TARGET_ARCH:-x86_64}"
-KATA_HYPERVISOR="${KATA_HYPERVISOR:-qemu}"
+KATA_HYPERVISOR="${KATA_HYPERVISOR:-qemu-runtime-rs}"
 K8S_TEST_DEBUG="${K8S_TEST_DEBUG:-false}"
 K8S_TEST_HOST_TYPE="${K8S_TEST_HOST_TYPE:-small}"
 # Setting to "yes" enables fail fast, stopping execution at the first failed test.
@@ -75,8 +75,10 @@ else
 		"k8s-custom-dns.bats" \
 		"k8s-empty-dirs.bats" \
 		"k8s-env.bats" \
+		"k8s-erofs-dmverity.bats" \
 		"k8s-exec.bats" \
 		"k8s-file-volume.bats" \
+		"k8s-graceful-termination.bats" \
 		"k8s-hostname.bats" \
 		"k8s-hostpath-volume.bats" \
 		"k8s-inotify.bats" \
@@ -93,6 +95,7 @@ else
 		"k8s-optional-empty-configmap.bats" \
 		"k8s-optional-empty-secret.bats" \
 		"k8s-pid-ns.bats" \
+		"k8s-plain-ephemeral-data-storage.bats" \
 		"k8s-pod-quota.bats" \
 		"k8s-port-forward.bats" \
 		"k8s-privileged.bats" \

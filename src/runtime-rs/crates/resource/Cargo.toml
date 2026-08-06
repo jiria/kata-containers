@@ -17,7 +17,7 @@ actix-rt = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 byte-unit = "5.1.6"
-cgroups-rs = { version = "0.5.0", features = ["oci"] }
+cgroups.workspace = true
 futures = "0.3.11"
 lazy_static = { workspace = true }
 libc = { workspace = true }
@@ -39,7 +39,10 @@ flate2 = "1.1"
 tempfile = "3.19.1"
 hex = "0.4"
 base64 = { workspace = true }
-hyper = { workspace = true, features = ["client", "http1"] }
+bytes = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
 hyperlocal = { workspace = true }
 
 ## Dependencies from `rust-netlink`

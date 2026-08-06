@@ -72,6 +72,77 @@ If containerd.configDir is set explicitly, use that instead.
 {{- end -}}
 
 {{/*
+Set the CRI containerd socket URI depending on the k8s distribution.
+If containerd.runtimeSocket is set explicitly, use that instead.
+*/}}
+{{- define "containerdRuntimeSocket" -}}
+{{- if and .containerd .containerd.runtimeSocket -}}
+{{- .containerd.runtimeSocket -}}
+{{- else if or (eq .k8sDistribution "k3s") (eq .k8sDistribution "rke2") -}}
+unix:///run/k3s/containerd/containerd.sock
+{{- else if eq .k8sDistribution "k0s" -}}
+unix:///run/k0s/containerd.sock
+{{- else if eq .k8sDistribution "microk8s" -}}
+unix:///var/snap/microk8s/common/run/containerd.sock
+{{- else -}}
+unix:///run/containerd/containerd.sock
+{{- end -}}
+{{- end -}}
+
+{{/*
+Resolve the kata-monitor CRI runtime endpoint.
+When monitor.runtimeEndpoint is empty, inherit containerd.runtimeSocket or
+derive it from k8sDistribution.
+*/}}
+{{- define "monitorRuntimeEndpoint" -}}
+{{- if .Values.monitor.runtimeEndpoint -}}
+{{- .Values.monitor.runtimeEndpoint -}}
+{{- else -}}
+{{- include "containerdRuntimeSocket" .Values -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Filesystem path of the CRI runtime socket, derived from monitorRuntimeEndpoint.
+*/}}
+{{- define "monitorRuntimeSocketPath" -}}
+{{- $endpoint := include "monitorRuntimeEndpoint" . -}}
+{{- if hasPrefix "unix://" $endpoint -}}
+{{- trimPrefix "unix://" $endpoint -}}
+{{- else if hasPrefix "unix:" $endpoint -}}
+{{- trimPrefix "unix:" $endpoint -}}
+{{- else -}}
+{{- $endpoint -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Host directory containing the CRI runtime socket, derived from monitorRuntimeEndpoint.
+Used for kata-monitor volume hostPath and mountPath so the socket is reachable in-container.
+*/}}
+{{- define "monitorRuntimeSocketDir" -}}
+{{- include "monitorRuntimeSocketPath" . | dir -}}
+{{- end -}}
+
+{{/*
+Resolve kata-monitor log level.
+Honors monitor.logLevel, then the chart-wide logLevel, then debug:true -> debug.
+*/}}
+{{- define "monitorLogLevel" -}}
+{{- $logLevel := .Values.monitor.logLevel | default "" | trim -}}
+{{- if not $logLevel -}}
+{{- $logLevel = .Values.logLevel | default "" | trim -}}
+{{- end -}}
+{{- if and (not $logLevel) .Values.debug -}}
+{{- $logLevel = "debug" -}}
+{{- end -}}
+{{- if not $logLevel -}}
+{{- $logLevel = "info" -}}
+{{- end -}}
+{{- $logLevel -}}
+{{- end -}}
+
+{{/*
 Check if node-feature-discovery is already installed by someone else
 Returns the namespace where node-feature-discovery is found, or empty string if not found
 */}}
@@ -581,6 +652,14 @@ e.g. `{{- include "kata-deploy.commonEnv" . | nindent 8 }}`.
 - name: EROFS_MERGE_MODE
   value: {{ $erofsMergeMode | quote }}
 {{- end }}
+{{- if .Values.snapshotter.erofsSnapshotterMode | trim }}
+- name: EROFS_SNAPSHOTTER_MODE
+  value: {{ .Values.snapshotter.erofsSnapshotterMode | trim | quote }}
+{{- end }}
+{{- if .Values.snapshotter.erofsDmverity }}
+- name: EROFS_DMVERITY
+  value: "dmverity"
+{{- end }}
 {{- $forceGuestPullAmd64 := include "kata-deploy.getForceGuestPullForArch" (dict "root" . "arch" "amd64") | trim -}}
 {{- if $forceGuestPullAmd64 }}
 - name: EXPERIMENTAL_FORCE_GUEST_PULL_X86_64
@@ -616,6 +695,10 @@ e.g. `{{- include "kata-deploy.commonEnv" . | nindent 8 }}`.
 {{- if and .Values.customRuntimes.enabled .Values.customRuntimes.runtimes }}
 - name: CUSTOM_RUNTIMES_ENABLED
   value: "true"
+{{- end }}
+{{- with .Values.startupTaints }}
+- name: STARTUP_TAINTS
+  value: {{ join "," . | quote }}
 {{- end }}
 {{- end -}}
 
@@ -908,4 +991,124 @@ Returns "true" when at least one default shim has a non-empty dropIn value.
 {{- end -}}
 {{- end -}}
 {{- if $has -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+NFD virtualization nodeAffinity for the kata-deploy DaemonSet.
+Applied when node-feature-discovery is managed by this chart (enabled: true).
+Kata Containers requires hardware virtualization support to function.
+
+Note: Virtualization checks are ONLY enforced when node-feature-discovery is
+      managed by kata-deploy. If node-feature-discovery is installed
+      independently (enabled: false), no checks are applied because we cannot
+      guarantee the external node-feature-discovery configuration and labels.
+
+NOTE: For kata-remote/peer-pods support in the future, add a condition here:
+      if and (index .Values "node-feature-discovery" "enabled") (not .Values.cloud-api-adaptor.enabled)
+*/}}
+{{- define "kata-deploy.nfdVirtualizationNodeAffinity" -}}
+nodeAffinity:
+  requiredDuringSchedulingIgnoredDuringExecution:
+    nodeSelectorTerms:
+    # x86_64: Intel VT-x (VMX) support
+    - matchExpressions:
+      - key: feature.node.kubernetes.io/cpu-cpuid.VMX
+        operator: In
+        values:
+        - "true"
+      - key: kubernetes.io/arch
+        operator: In
+        values:
+        - "amd64"
+    # x86_64: AMD-V (SVM) support
+    - matchExpressions:
+      - key: feature.node.kubernetes.io/cpu-cpuid.SVM
+        operator: In
+        values:
+        - "true"
+      - key: kubernetes.io/arch
+        operator: In
+        values:
+        - "amd64"
+    # aarch64: Allow all ARM64 nodes (virtualization check not yet implemented)
+    # TODO: Implement proper virtualization detection for aarch64
+    - matchExpressions:
+      - key: kubernetes.io/arch
+        operator: In
+        values:
+        - "arm64"
+        - "aarch64"
+    # s390x: Allow all s390x nodes (virtualization check not yet implemented)
+    # TODO: Implement proper virtualization detection for s390x
+    - matchExpressions:
+      - key: kubernetes.io/arch
+        operator: In
+        values:
+        - "s390x"
+    # ppc64le: Allow all ppc64le nodes (virtualization check not yet implemented)
+    # TODO: Implement proper virtualization detection for ppc64le
+    - matchExpressions:
+      - key: kubernetes.io/arch
+        operator: In
+        values:
+        - "ppc64le"
+    # riscv64: Allow all RISC-V nodes (virtualization support not yet available)
+    # TODO: Implement virtualization detection when RISC-V virt support is available
+    - matchExpressions:
+      - key: kubernetes.io/arch
+        operator: In
+        values:
+        - "riscv64"
+{{- end -}}
+
+{{/*
+Merged affinity for the kata-deploy DaemonSet.
+When NFD is enabled, the built-in virtualization nodeAffinity is always applied.
+Kubernetes semantics:
+  - nodeSelectorTerms are OR within a group (match any one term)
+  - matchExpressions and matchFields are AND within a term (all must match)
+If the user sets affinity.nodeAffinity, their required nodeSelectorTerms are
+combined with the NFD terms as (NFD OR-group) AND (user OR-group) via cross-
+product: each NFD term is AND-ed with each user term. NFD virtualization
+requirements cannot be bypassed by user affinity.
+*/}}
+{{- define "kata-deploy.daemonsetAffinity" -}}
+{{- $affinity := .Values.affinity | default dict | deepCopy -}}
+{{- if index .Values "node-feature-discovery" "enabled" -}}
+{{- $nfd := include "kata-deploy.nfdVirtualizationNodeAffinity" . | fromYaml -}}
+{{- $nfdNodeAffinity := $nfd.nodeAffinity -}}
+{{- if not (hasKey $affinity "nodeAffinity") -}}
+{{- $affinity = merge $affinity $nfd -}}
+{{- else -}}
+{{- $userNodeAffinity := $affinity.nodeAffinity | deepCopy -}}
+{{- $nfdRequired := $nfdNodeAffinity.requiredDuringSchedulingIgnoredDuringExecution | default dict -}}
+{{- $nfdTerms := $nfdRequired.nodeSelectorTerms | default list -}}
+{{- $userRequired := $userNodeAffinity.requiredDuringSchedulingIgnoredDuringExecution | default dict -}}
+{{- $userTerms := $userRequired.nodeSelectorTerms | default list -}}
+{{- $mergedTerms := list -}}
+{{- if $userTerms -}}
+{{- range $nfdTerm := $nfdTerms -}}
+{{- range $userTerm := $userTerms -}}
+{{- $mergedTerm := dict -}}
+{{- $exprs := concat ($nfdTerm.matchExpressions | default list) ($userTerm.matchExpressions | default list) -}}
+{{- $fields := concat ($nfdTerm.matchFields | default list) ($userTerm.matchFields | default list) -}}
+{{- if $exprs -}}
+{{- $_ := set $mergedTerm "matchExpressions" $exprs -}}
+{{- end -}}
+{{- if $fields -}}
+{{- $_ := set $mergedTerm "matchFields" $fields -}}
+{{- end -}}
+{{- $mergedTerms = append $mergedTerms $mergedTerm -}}
+{{- end -}}
+{{- end -}}
+{{- else -}}
+{{- $mergedTerms = $nfdTerms -}}
+{{- end -}}
+{{- $_ := set $userNodeAffinity "requiredDuringSchedulingIgnoredDuringExecution" (dict "nodeSelectorTerms" $mergedTerms) -}}
+{{- $_ := set $affinity "nodeAffinity" $userNodeAffinity -}}
+{{- end -}}
+{{- end -}}
+{{- if $affinity -}}
+{{- $affinity | toYaml -}}
+{{- end -}}
 {{- end -}}

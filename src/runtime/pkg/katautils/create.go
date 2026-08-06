@@ -67,7 +67,6 @@ func HandleFactory(ctx context.Context, vci vc.VC, runtimeConfig *oci.RuntimeCon
 	if !runtimeConfig.FactoryConfig.Template && runtimeConfig.FactoryConfig.VMCacheNumber == 0 {
 		return
 	}
-
 	factoryConfig := vf.Config{
 		Template:        runtimeConfig.FactoryConfig.Template,
 		TemplatePath:    runtimeConfig.FactoryConfig.TemplatePath,
@@ -75,7 +74,7 @@ func HandleFactory(ctx context.Context, vci vc.VC, runtimeConfig *oci.RuntimeCon
 		VMCacheEndpoint: runtimeConfig.FactoryConfig.VMCacheEndpoint,
 		VMConfig: vc.VMConfig{
 			HypervisorType:   runtimeConfig.HypervisorType,
-			HypervisorConfig: oci.StaticHypervisorConfig(*runtimeConfig),
+			HypervisorConfig: runtimeConfig.HypervisorConfig,
 			AgentConfig:      runtimeConfig.AgentConfig,
 		},
 	}
@@ -108,7 +107,9 @@ func SetEphemeralStorageType(ociSpec specs.Spec, disableGuestEmptyDir bool, empt
 			//   disableGuestEmptyDir and emptyDirMode.
 			if vc.IsHugePageEmptyDir(mnt.Source) {
 				ociSpec.Mounts[idx].Type = vc.KataLocalDevType
-			} else if !disableGuestEmptyDir && emptyDirMode != vc.EmptyDirModeVirtioBlkEncrypted {
+			} else if !disableGuestEmptyDir &&
+				emptyDirMode != vc.EmptyDirModeVirtioBlkEncrypted &&
+				emptyDirMode != vc.EmptyDirModeVirtioBlkPlain {
 				ociSpec.Mounts[idx].Type = vc.KataLocalDevType
 			}
 		}

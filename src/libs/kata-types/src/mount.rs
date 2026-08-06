@@ -5,6 +5,7 @@
 //
 
 use anyhow::{anyhow, Context, Error, Result};
+use base64::Engine as _;
 use std::convert::TryFrom;
 use std::{collections::HashMap, path::PathBuf};
 
@@ -39,6 +40,9 @@ pub const DEFAULT_KATA_DIRECT_VOLUME_ROOT_PATH: &str = "/run/kata-containers/sha
 /// Key to indentify directory creation in `Storage.driver_options`.
 pub const KATA_VOLUME_OVERLAYFS_CREATE_DIR: &str =
     "io.katacontainers.volume.overlayfs.create_directory";
+
+/// Key to request filesystem creation for a fresh block volume.
+pub const KATA_BLOCK_VOLUME_CREATE_FS: &str = "create_filesystem";
 
 /// SANDBOX_BIND_MOUNTS_DIR is for sandbox bindmounts
 pub const SANDBOX_BIND_MOUNTS_DIR: &str = "sandbox-mounts";
@@ -171,8 +175,9 @@ impl NydusExtraOptions {
             ));
         }
         let config_raw_data = options[0].trim_start_matches("extraoption=");
-        let extra_options_buf =
-            base64::decode(config_raw_data).context("decode the nydus's base64 extraoption")?;
+        let extra_options_buf = base64::engine::general_purpose::STANDARD
+            .decode(config_raw_data)
+            .context("decode the nydus's base64 extraoption")?;
 
         serde_json::from_slice(&extra_options_buf).context("deserialize nydus's extraoption")
     }
@@ -193,6 +198,27 @@ pub struct DmVerityInfo {
     pub hashsize: u64,
     /// Offset of hash area/superblock on hash_device.
     pub offset: u64,
+    /// Salt value for dm-verity (256-bit hex string, optional).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub salt: Option<String>,
+    /// Hash type for dm-verity (0 or 1).
+    /// Type 0: original format without padding
+    /// Type 1: current format with padding
+    #[serde(default = "default_hash_type")]
+    pub hash_type: u32,
+    /// Whether to skip superblock at hash offset.
+    /// true: no superblock, hash tree starts at offset
+    /// false: superblock exists at offset, hash tree after superblock
+    #[serde(default = "default_no_superblock")]
+    pub no_superblock: bool,
+}
+
+fn default_hash_type() -> u32 {
+    1
+}
+
+fn default_no_superblock() -> bool {
+    false
 }
 
 /// Information about directly assigned volume.
@@ -373,10 +399,8 @@ impl KataVirtualVolume {
                     }
                 }
             }
-            KATA_VIRTUAL_VOLUME_IMAGE_GUEST_PULL => {
-                if self.source.is_empty() {
-                    return Err(anyhow!("missing image reference for guest pulling volume"));
-                }
+            KATA_VIRTUAL_VOLUME_IMAGE_GUEST_PULL if self.source.is_empty() => {
+                return Err(anyhow!("missing image reference for guest pulling volume"));
             }
             _ => {}
         }
@@ -399,12 +423,12 @@ impl KataVirtualVolume {
     /// Serializes the virtual volume object to a JSON string and encodes the string with base64.
     pub fn to_base64(&self) -> Result<String> {
         let json = self.to_json()?;
-        Ok(base64::encode(json))
+        Ok(base64::engine::general_purpose::STANDARD.encode(json))
     }
 
     /// Decodes and deserializes a virtual volume object from a base64 encoded JSON string.
     pub fn from_base64(value: &str) -> Result<Self> {
-        let json = base64::decode(value)?;
+        let json = base64::engine::general_purpose::STANDARD.decode(value)?;
         let volume: KataVirtualVolume = serde_json::from_slice(&json)?;
 
         Ok(volume)
@@ -490,7 +514,8 @@ pub fn join_path(prefix: &str, volume_path: &str) -> Result<PathBuf> {
     if volume_path.is_empty() {
         return Err(anyhow!(std::io::ErrorKind::NotFound));
     }
-    let b64_url_encoded_path = base64::encode_config(volume_path.as_bytes(), base64::URL_SAFE);
+    let b64_url_encoded_path =
+        base64::engine::general_purpose::URL_SAFE.encode(volume_path.as_bytes());
 
     Ok(safe_path::scoped_join(prefix, b64_url_encoded_path)?)
 }

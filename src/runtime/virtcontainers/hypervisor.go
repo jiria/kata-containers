@@ -18,6 +18,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/pkg/errors"
 
@@ -463,6 +464,22 @@ type Param struct {
 	Value string
 }
 
+// GuestExtensionImage represents an additional block device image to attach to the VM
+// (e.g. CoCo extension, GPU extension).
+type GuestExtensionImage struct {
+	// Name is a short identifier for this extension (e.g. "coco", "gpu").
+	// Used as the virtio-blk serial so the guest can discover the device
+	// via /dev/disk/by-id/virtio-extension-<name> and match verity params
+	// from kernel cmdline kata.extension.<name>.verity_params=...
+	Name string
+
+	// Path is the host path to the extension image file.
+	Path string
+
+	// VerityParams contains dm-verity parameters for this extension image.
+	VerityParams string
+}
+
 // HypervisorConfig is the hypervisor configuration.
 // nolint: govet
 type HypervisorConfig struct {
@@ -484,6 +501,9 @@ type HypervisorConfig struct {
 	// InitrdPath is the guest initrd image host path.
 	// ImagePath and InitrdPath cannot be set at the same time.
 	InitrdPath string
+
+	// GuestExtensionImages lists additional block device images to attach to the VM.
+	GuestExtensionImages []GuestExtensionImage
 
 	// RootfsType is filesystem type of rootfs.
 	RootfsType string
@@ -1231,6 +1251,20 @@ func GetHypervisorPid(h Hypervisor) int {
 		return 0
 	}
 	return pids[0]
+}
+
+// IsHypervisorRunning reports whether the hypervisor process backing the
+// sandbox is still alive.  It is best-effort: a missing pidfile or a pid that
+// no longer maps to a live process is treated as "not running".
+func IsHypervisorRunning(h Hypervisor) bool {
+	pid := GetHypervisorPid(h)
+	if pid <= 0 {
+		return false
+	}
+	// Signal 0 performs error checking without sending a signal: nil means
+	// the process exists, EPERM means it exists but we may not signal it.
+	err := syscall.Kill(pid, 0)
+	return err == nil || err == syscall.EPERM
 }
 
 // Kind of guest protection

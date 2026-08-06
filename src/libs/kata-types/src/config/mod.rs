@@ -31,8 +31,8 @@ pub use self::hypervisor::{
 
 mod runtime;
 pub use self::runtime::{
-    Runtime, RuntimeVendor, EMPTYDIR_MODE_BLOCK_ENCRYPTED, EMPTYDIR_MODE_SHARED_FS,
-    RUNTIME_NAME_VIRTCONTAINER,
+    Runtime, RuntimeVendor, EMPTYDIR_MODE_BLOCK_ENCRYPTED, EMPTYDIR_MODE_BLOCK_PLAIN,
+    EMPTYDIR_MODE_SHARED_FS, RUNTIME_NAME_VIRTCONTAINER,
 };
 
 pub use self::agent::AGENT_NAME_KATA;
@@ -179,7 +179,7 @@ impl TomlConfig {
     /// This function only works with `configuration.toml` and does not handle
     /// drop-in config file fragments in config.d/.
     pub fn load(content: &str) -> Result<TomlConfig> {
-        let mut config: TomlConfig = toml::from_str(content)?;
+        let mut config: TomlConfig = toml::from_str(content).map_err(std::io::Error::other)?;
         config.adjust_config()?;
         info!(sl!(), "get kata config: {:?}", config);
         Ok(config)

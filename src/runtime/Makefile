@@ -65,6 +65,8 @@ INITRDCONFIDENTIALNAME = $(PROJECT_TAG)-initrd-confidential.img
 
 IMAGENAME_NV = $(PROJECT_TAG)-nvidia-gpu.img
 IMAGENAME_CONFIDENTIAL_NV = $(PROJECT_TAG)-nvidia-gpu-confidential.img
+# Driver-agnostic NVIDIA base image (no GPU userspace), booted by qemu-nvidia-cpu.
+IMAGENAME_NV_BASE = $(PROJECT_TAG)-nvidia.img
 
 TARGET = $(BIN_PREFIX)-runtime
 RUNTIME_OUTPUT = $(CURDIR)/$(TARGET)
@@ -104,6 +106,7 @@ GENERATED_VARS = \
 		CONFIG_QEMU_IN \
         CONFIG_QEMU_COCO_DEV_IN \
 		CONFIG_QEMU_NVIDIA_GPU_IN \
+		CONFIG_QEMU_NVIDIA_CPU_IN \
 		CONFIG_QEMU_NVIDIA_GPU_SNP_IN \
 		CONFIG_QEMU_NVIDIA_GPU_TDX_IN \
 		CONFIG_QEMU_TDX_IN \
@@ -134,6 +137,7 @@ INITRDCONFIDENTIALPATH := $(PKGDATADIR)/$(INITRDCONFIDENTIALNAME)
 
 IMAGEPATH_NV := $(PKGDATADIR)/$(IMAGENAME_NV)
 IMAGEPATH_CONFIDENTIAL_NV := $(PKGDATADIR)/$(IMAGENAME_CONFIDENTIAL_NV)
+IMAGEPATH_NV_BASE := $(PKGDATADIR)/$(IMAGENAME_NV_BASE)
 
 ROOTFSTYPE_EXT4 := \"ext4\"
 ROOTFSTYPE_XFS := \"xfs\"
@@ -151,6 +155,10 @@ ifeq ($(ARCH),arm64)
     FIRMWAREPATH_NV := $(PREFIXDEPS)/share/$(EDK2_NAME)/AAVMF_CODE.fd
 endif
 
+
+FIRMWAREPATH_NV_CPU :=
+FIRMWAREVOLUMEPATH_NV_CPU :=
+
 FIRMWARETDVFPATH := $(PREFIXDEPS)/share/ovmf/OVMF.inteltdx.fd
 FIRMWARETDVFPATH_NV := $(FIRMWARETDVFPATH)
 FIRMWARETDVFVOLUMEPATH :=
@@ -161,6 +169,10 @@ FIRMWARESNPPATH_NV := $(FIRMWARESNPPATH)
 KERNELVERITYPARAMS ?= ""
 KERNELVERITYPARAMS_NV ?= ""
 KERNELVERITYPARAMS_CONFIDENTIAL_NV ?= ""
+# dm-verity params for the driver-agnostic nvidia base image (qemu-nvidia-cpu).
+# The Go runtime maps KERNELVERITYPARAMS_NV to the monolithic nvidia-gpu hash,
+# so qemu-nvidia-cpu needs its own var pointing at the "nvidia" base root hash.
+KERNELVERITYPARAMS_NV_BASE ?= ""
 
 # Name of default configuration file the runtime will use.
 CONFIG_FILE = configuration.toml
@@ -413,6 +425,12 @@ ifneq (,$(QEMUCMD))
     CONFIG_QEMU_NVIDIA_GPU_IN = $(CONFIG_QEMU_NVIDIA_GPU).in
 
     CONFIGS += $(CONFIG_QEMU_NVIDIA_GPU)
+
+    CONFIG_FILE_QEMU_NVIDIA_CPU = configuration-qemu-nvidia-cpu.toml
+    CONFIG_QEMU_NVIDIA_CPU = config/$(CONFIG_FILE_QEMU_NVIDIA_CPU)
+    CONFIG_QEMU_NVIDIA_CPU_IN = $(CONFIG_QEMU_NVIDIA_CPU).in
+
+    CONFIGS += $(CONFIG_QEMU_NVIDIA_CPU)
 
     CONFIG_FILE_QEMU_NVIDIA_GPU_SNP = configuration-qemu-nvidia-gpu-snp.toml
     CONFIG_QEMU_NVIDIA_GPU_SNP = config/$(CONFIG_FILE_QEMU_NVIDIA_GPU_SNP)
@@ -693,6 +711,8 @@ USER_VARS += IMAGENAME_NV
 USER_VARS += IMAGENAME_CONFIDENTIAL_NV
 USER_VARS += IMAGEPATH_NV
 USER_VARS += IMAGEPATH_CONFIDENTIAL_NV
+USER_VARS += IMAGENAME_NV_BASE
+USER_VARS += IMAGEPATH_NV_BASE
 USER_VARS += KERNELNAME_NV
 USER_VARS += KERNELPATH_NV
 USER_VARS += KERNELNAME_CONFIDENTIAL_NV
@@ -705,6 +725,7 @@ USER_VARS += KERNELPARAMS_NV
 USER_VARS += KERNELPARAMS_CONFIDENTIAL_NV
 USER_VARS += KERNELVERITYPARAMS_NV
 USER_VARS += KERNELVERITYPARAMS_CONFIDENTIAL_NV
+USER_VARS += KERNELVERITYPARAMS_NV_BASE
 USER_VARS += DEFAULTTIMEOUT_NV
 USER_VARS += DEFAULTLAUNCHPROCESSTIMEOUT_NV
 USER_VARS += DEFSANDBOXCGROUPONLY_NV
@@ -728,8 +749,10 @@ USER_VARS += KERNELPATH_STRATOVIRT
 USER_VARS += KERNELVIRTIOFSPATH
 USER_VARS += FIRMWAREPATH
 USER_VARS += FIRMWAREPATH_NV
+USER_VARS += FIRMWAREPATH_NV_CPU
 USER_VARS += FIRMWARETDVFPATH
 USER_VARS += FIRMWAREVOLUMEPATH
+USER_VARS += FIRMWAREVOLUMEPATH_NV_CPU
 USER_VARS += FIRMWARETDVFVOLUMEPATH
 USER_VARS += FIRMWARESNPPATH
 USER_VARS += FIRMWARETDVFPATH_NV
@@ -864,6 +887,19 @@ BUILDTAGS :=
 
 # go build common flags
 BUILDFLAGS := -buildmode=pie ${BUILDTAGS}
+
+# Static build profile.
+#
+# When STATIC=yes the Go host binaries (kata-runtime, containerd-shim-kata-v2
+# and kata-monitor) are built with cgo disabled and without PIE, producing
+# fully static, libc-agnostic executables. This lets the kata-deploy payload
+# run on musl-only hosts that have no glibc dynamic loader. It relies on the
+# runtime being cgo-free; the default (non-static) build is left unchanged.
+ifeq ($(STATIC),yes)
+       export CGO_ENABLED := 0
+       # PIE requires a dynamic loader, so it cannot be used for static binaries.
+       BUILDFLAGS := ${BUILDTAGS}
+endif
 
 # whether stipping the binary
 ifeq ($(STRIP),yes)

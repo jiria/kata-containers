@@ -24,7 +24,7 @@ export DOCKER_REGISTRY="${DOCKER_REGISTRY:-quay.io}"
 export DOCKER_REPO="${DOCKER_REPO:-kata-containers/kata-deploy-ci}"
 export DOCKER_TAG="${DOCKER_TAG:-kata-containers-latest}"
 export SNAPSHOTTER_DEPLOY_WAIT_TIMEOUT="${SNAPSHOTTER_DEPLOY_WAIT_TIMEOUT:-8m}"
-export KATA_HYPERVISOR="${KATA_HYPERVISOR:-qemu}"
+export KATA_HYPERVISOR="${KATA_HYPERVISOR:-qemu-runtime-rs}"
 export CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-containerd}"
 export KBS="${KBS:-false}"
 export KBS_INGRESS="${KBS_INGRESS:-}"
@@ -169,6 +169,8 @@ function delete_coco_kbs() {
 # Environment variables:
 #	KBS_INGRESS - (optional) specify the ingress implementation to expose the
 #	              service externally
+#	NVIDIA_VERIFIER_MODE - (optional) remote (default) | local: overrides the
+#	                       NVIDIA verifier type for nvidia-gpu hypervisors.
 #
 function deploy_coco_kbs() {
 	kbs_k8s_deploy "${KBS_INGRESS}"

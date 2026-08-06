@@ -79,6 +79,11 @@ service AgentService {
 	rpc GetVolumeStats(VolumeStatsRequest) returns (VolumeStatsResponse);
 	rpc ResizeVolume(ResizeVolumeRequest) returns (google.protobuf.Empty);
 	rpc SetPolicy(SetPolicyRequest) returns (google.protobuf.Empty);
+
+	// FR-1: load a signed, add-only policy fragment that extends the active policy with
+	// additional narrowly-scoped grants. The fragment is verified in the guest (issuer
+	// signature, monotonic SVN, add-only/fail-closed, transparency receipt).
+	rpc LoadPolicyFragment(LoadPolicyFragmentRequest) returns (google.protobuf.Empty);
 }
 
 message CreateContainerRequest {
@@ -625,6 +630,57 @@ message ResizeVolumeRequest {
 
 message SetPolicyRequest {
 	string policy = 1;
+}
+
+// FR-1: a signed, add-only policy fragment. The signature covers a canonical encoding of
+// the issuer, svn, sorted grants, and receipt; see the guest-side verifier.
+message LoadPolicyFragmentRequest {
+	// Identifier of the issuer that signed the fragment.
+	string issuer = 1;
+	// Security version number; must strictly increase per issuer.
+	uint64 svn = 2;
+	// Additional grants introduced by this fragment (add-only).
+	repeated string grants = 3;
+	// Transparency receipt identifier/blob (required in strict mode).
+	string receipt = 4;
+	// Detached Ed25519 signature over the fragment's canonical bytes.
+	bytes signature = 5;
+	// FR-1c: a signed Rego module (text) the fragment contributes to the policy engine.
+	// Must declare a package under the reserved fragment namespace.
+	bytes policy_module = 6;
+	// FR-1c: the policy namespaces this fragment is scoped to contribute to.
+	repeated string includes = 7;
+	// FR-1e: the logical feed (scope) under the issuer; the base policy declares accepted
+	// (issuer, feed) pairs and their SVN floor.
+	string feed = 8;
+	// FR-1g: identifiers of fragments that must already be loaded before this one.
+	repeated string requires = 9;
+	// FR-1h: optional COSE_Sign1 (CBOR) envelope carrying the fragment statement as its
+	// payload, for interop with COSE tooling. When present, it is verified instead of the
+	// detached `signature`.
+	bytes cose_sign1 = 10;
+	// FR-1f (trust list): the transparency ledger this receipt is claimed to originate
+	// from. Selects which ledger's key(s) the receipt is verified against and is subject to
+	// per-(issuer,feed) allowed_ledgers / required_receipts scoping. Empty = default ledger.
+	string receipt_ledger = 11;
+	// FR-1j: the append-only ordering log head this fragment asserts it is applied on top
+	// of. In ordered mode the agent requires this to equal its current log head (rejecting
+	// reordering/omission/insertion); it is bound into the issuer signature.
+	bytes prev_log_head = 12;
+	// FR-1f Stage 2: an optional transparency inclusion + consistency proof
+	// (`kata-ttl-proof/v1`) anchoring the fragment statement in an append-only transparency
+	// log at a signed, monotonic tree head. Verified against the transparency trust list.
+	string receipt_proof = 13;
+
+	// FR-1f (trust list): additional Stage-1 countersignatures, as "<ledger>=<hex sig>"
+	// entries, each a detached signature over the same fragment statement.
+	//
+	// A scope's `required_receipts` list is a conjunction, so a policy demanding (say)
+	// a vendor countersignature *and* a public-log entry cannot be satisfied by a single
+	// receipt. Like `receipt`, these are not covered by the issuer signature — a receipt
+	// countersigns the statement and so cannot be inside it — which is why adding them
+	// needs no fragment statement version bump.
+	repeated string extra_receipts = 14;
 }
 
 message GetDiagnosticDataRequest {

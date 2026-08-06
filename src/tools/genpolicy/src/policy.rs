@@ -26,6 +26,7 @@ use std::boxed;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::read_to_string;
 use std::io::Write;
+use std::process::exit;
 
 /// Intermediary format of policy data.
 pub struct AgentPolicy {
@@ -46,11 +47,72 @@ pub struct AgentPolicy {
     pub config: utils::Config,
 }
 
+/// A trusted policy fragment reference: composed fragments are gated by
+/// issuer, feed and a minimum acceptable security version number (SVN).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct FragmentSpec {
+    pub issuer: String,
+    pub feed: String,
+    pub minimum_svn: i64,
+
+    /// BL-8: whether the guest must refuse to create containers until this fragment has
+    /// been delivered and verified. Optional in the settings and defaulting to false, which
+    /// is C-ACI/hcsshim behaviour — the declaration authorizes the fragment and fixes the
+    /// terms it must meet, but its absence is tolerated because an undelivered fragment
+    /// simply grants nothing. Set it only for fragments whose absence is not fail-safe.
+    #[serde(default)]
+    pub required: bool,
+
+    /// BL-8: whether this fragment may itself declare further fragments, and whose. Passed
+    /// through verbatim so the agent validates it — genpolicy has no trust context with
+    /// which to judge an issuer scope, and a settings-time check here would only be a
+    /// second place to keep the accepted forms in sync. Omitted from the emitted policy
+    /// when unset, so existing settings produce byte-identical output.
+    ///
+    /// Accepted forms: `false`, `"none"`, `"same-issuer"`, `"any-authorized"`, or a list of
+    /// issuer strings. Bare `true` is rejected by the agent, because it enables delegation
+    /// without saying to whom.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_nested: Option<serde_json::Value>,
+
+    /// FR-1c (F-62): policy namespaces under `agent_policy.fragments.` this fragment may
+    /// contribute a module to. The fragment's own signed `includes` cannot widen this — the
+    /// effective scope is the intersection — so the measured policy stays in control of
+    /// which issuer may populate which namespace. Omitted when unset.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub includes: Vec<String>,
+
+    /// FR-1c: whether the fragment's Rego module may be applied at all. Defaults to true;
+    /// `false` accepts the fragment for its SVN/receipt/ordering record while contributing
+    /// no rules. Emitted only when explicitly disabled, so existing settings produce
+    /// byte-identical output.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub allow_module: bool,
+
+    /// FR-1k: values to instantiate a parameterised fragment with, passed through verbatim.
+    /// The fragment reads them via `parameter("name")`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<serde_json::Value>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
 /// Representation of the policy_data field from the output policy text.
 #[derive(Debug, Serialize)]
 pub struct PolicyData {
     /// Policy properties for each container allowed to be executed in a pod.
     pub containers: Vec<ContainerPolicy>,
+
+    /// Trusted policy fragments (issuer/feed/minimum_svn) composed into this
+    /// policy's allowed container set. Empty ⇒ behaviour identical to a
+    /// monolithic policy (no fragment composition).
+    pub fragments: Vec<FragmentSpec>,
 
     /// Settings read from genpolicy-settings.json.
     pub common: CommonData,
@@ -138,6 +200,38 @@ pub struct KataProcess {
     /// NoNewPrivileges controls whether additional privileges could be gained by processes in the container.
     #[serde(default)]
     pub NoNewPrivileges: bool,
+
+    /// Rlimits specifies rlimit options to apply to the process. Modeled so the
+    /// policy can exact-match the rlimits forwarded by the host, instead of
+    /// leaving them unconstrained.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub Rlimits: Vec<KataPosixRlimit>,
+
+    /// ApparmorProfile is the expected apparmor profile for the container.
+    /// Modeled as an Option so the policy can exact-match a profile the pod spec
+    /// pins (or that an operator configures via settings), while leaving it
+    /// unconstrained (None -> field omitted) when no expected value is known -
+    /// the emitted profile for the RuntimeDefault case depends on whether
+    /// apparmor is enabled on the host, which is not derivable from the pod spec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ApparmorProfile: Option<String>,
+}
+
+/// OCI POSIXRlimit struct, mirroring the POSIXRlimit message from oci.proto,
+/// preserving the upper case field names for consistency with agent's rpc.rs.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct KataPosixRlimit {
+    /// Type of the rlimit to set.
+    #[serde(default)]
+    pub Type: String,
+
+    /// Hard is the hard limit for the specified type.
+    #[serde(default)]
+    pub Hard: u64,
+
+    /// Soft is the soft limit for the specified type.
+    #[serde(default)]
+    pub Soft: u64,
 }
 
 /// OCI container User struct. This struct is very similar to the User
@@ -379,9 +473,37 @@ pub struct AddARPNeighborsRequestDefaults {
     allowed_states: Vec<u32>,
 }
 
+/// SignalProcessRequest settings from genpolicy-settings.json.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SignalProcessRequestDefaults {
+    /// Signal numbers the Host is allowed to send to Guest container processes.
+    /// Any signal not in this list is rejected, and signals targeting a container
+    /// that was not created under this policy are rejected regardless of the signal.
+    pub allowed_signals: Vec<u32>,
+}
+
+/// Default signal allowlist used when `SignalProcessRequest` is absent from
+/// genpolicy-settings.json. Covers the standard container-lifecycle signals
+/// (SIGHUP/INT/QUIT/KILL/USR1/USR2/TERM/CONT/STOP/WINCH) while rejecting less
+/// common signals that a malicious Host could otherwise inject into a workload.
+fn default_signal_process_request() -> SignalProcessRequestDefaults {
+    SignalProcessRequestDefaults {
+        allowed_signals: vec![1, 2, 3, 9, 10, 12, 15, 18, 19, 28],
+    }
+}
+
 /// Settings specific to each kata agent endpoint, loaded from
 /// genpolicy-settings.json.
+///
+/// `deny_unknown_fields` is load-bearing, not hygiene (RM-21). These settings are
+/// deserialized here and then *re-serialized* into the generated policy, so a key this
+/// binary does not know would be dropped silently -- and `rules.rego` reads several of
+/// them by path. When `SignalProcessRequest.allowed_signals` went missing that way, the
+/// signal rule became undefined, every signal was denied fail-closed, and no pod on the
+/// cluster could be killed. Failing at generation time turns a version skew between the
+/// binary, `rules.rego` and `genpolicy-settings.json` into an error a human reads.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RequestDefaults {
     /// Settings for CreateContainerRequest.
     pub CreateContainerRequest: CreateContainerRequestDefaults,
@@ -400,6 +522,10 @@ pub struct RequestDefaults {
 
     /// Allow the host to configure only used raw_flags and reject names/mac addresses of the loopback.
     pub AddARPNeighborsRequest: AddARPNeighborsRequestDefaults,
+
+    /// Signals the Host is allowed to send to Guest container processes via SignalProcess.
+    #[serde(default = "default_signal_process_request")]
+    pub SignalProcessRequest: SignalProcessRequestDefaults,
 
     /// Allow the Host to close stdin for a container. Typically used with WriteStreamRequest.
     pub CloseStdinRequest: bool,
@@ -449,6 +575,21 @@ pub struct CommonData {
 
     /// Default capabilities for a privileged container.
     pub privileged_caps: Vec<String>,
+
+    /// Expected apparmor profile for containers whose pod spec does not pin a
+    /// specific (Localhost/Unconfined) profile. Defaults to empty, meaning the
+    /// apparmor profile is left unconstrained for such containers, because the
+    /// profile emitted for the RuntimeDefault case depends on whether apparmor
+    /// is enabled on the host (not derivable from the pod spec). Set this to the
+    /// host's runtime-default profile name (e.g. "cri-containerd.apparmor.d") to
+    /// exact-match it cluster-wide.
+    #[serde(default)]
+    pub default_apparmor_profile: String,
+
+    /// Expected rlimits forwarded by the host. Defaults to empty (enforce that no
+    /// rlimits are set). Populate for environments that inject default rlimits.
+    #[serde(default)]
+    pub default_rlimits: Vec<KataPosixRlimit>,
 }
 
 /// Configuration from "kubectl config".
@@ -457,9 +598,7 @@ pub struct ClusterConfig {
     /// Pause container image reference.
     pub pause_container_image: String,
 
-    /// Whether or not the cluster uses the guest pull mechanism
-    /// In guest pull, host can't look into layers to determine GID.
-    /// See issue https://github.com/kata-containers/kata-containers/issues/11162
+    /// Whether or not the cluster uses the guest pull mechanism.
     pub guest_pull: bool,
 
     /// Supported values:
@@ -476,9 +615,9 @@ pub struct ClusterConfig {
     ///           as the only value* in AdditionalGids.
     pub pause_container_id_policy: String,
 
-    /// Whether emptyDirs are encrypted with modified metadata in the
-    /// mount and a storage object for the block device.
-    pub encrypted_emptydir: bool,
+    /// How emptyDirs are represented in the policy.
+    /// Supported values are "shared-fs", "block-encrypted", and "block-plain".
+    pub emptydir_type: String,
 
     /// Cgroup v2 mount options that may appear beyond what genpolicy embeds
     /// (e.g. "nsdelegate", "memory_recursiveprot" on newer kernels).
@@ -648,6 +787,7 @@ impl AgentPolicy {
 
         let policy_data = policy::PolicyData {
             containers: policy_containers,
+            fragments: self.config.settings.fragments.clone(),
             request_defaults: self.config.settings.request_defaults.clone(),
             common: self.config.settings.common.clone(),
             sandbox: self.config.settings.sandbox.clone(),
@@ -854,6 +994,103 @@ impl AgentPolicy {
         }
     }
 
+    fn exit_if_guest_pull_needs_security_context(
+        &self,
+        resource: &dyn yaml::K8sResource,
+        yaml_container: &pod::Container,
+        is_pause_container: bool,
+        process: &KataProcess,
+    ) {
+        if is_pause_container || !self.config.settings.cluster_config.guest_pull {
+            return;
+        }
+
+        let pod_security_context = resource.get_pod_security_context();
+        let uid = i64::from(process.User.UID);
+        let gid = i64::from(process.User.GID);
+
+        let effective_run_as_user = yaml_container
+            .run_as_user()
+            .or_else(|| pod_security_context.and_then(|context| context.runAsUser));
+        let explicit_uid = effective_run_as_user == Some(uid);
+
+        let effective_run_as_group = yaml_container
+            .run_as_group()
+            .or_else(|| pod_security_context.and_then(|context| context.runAsGroup));
+        let explicit_gid = effective_run_as_group == Some(gid);
+
+        let mut explicitly_added_gids = BTreeSet::new();
+        if let Some(context) = pod_security_context {
+            if let Some(fs_group) = context.fsGroup {
+                explicitly_added_gids.insert(u32::try_from(fs_group).unwrap());
+            }
+            if let Some(supplemental_groups) = &context.supplementalGroups {
+                explicitly_added_gids.extend(supplemental_groups.iter().copied());
+            }
+        }
+
+        let missing_uid = process.User.UID != 0 && !explicit_uid;
+        let missing_gid = process.User.GID != 0 && !explicit_gid;
+
+        let missing_supplemental_groups: Vec<u32> = process
+            .User
+            .AdditionalGids
+            .iter()
+            .copied()
+            .filter(|additional_gid| {
+                *additional_gid != process.User.GID
+                    && !explicitly_added_gids.contains(additional_gid)
+            })
+            .collect();
+
+        if !missing_uid && !missing_gid && missing_supplemental_groups.is_empty() {
+            return;
+        }
+
+        let mut recommendations = Vec::new();
+        if missing_uid || missing_gid {
+            let mut container_recommendation = format!(
+                "containers:\n  - name: {}\n    securityContext:",
+                yaml_container.name
+            );
+            if process.User.UID != 0 {
+                container_recommendation
+                    .push_str(&format!("\n      runAsUser: {}", process.User.UID));
+            }
+            if process.User.GID != 0 {
+                container_recommendation
+                    .push_str(&format!("\n      runAsGroup: {}", process.User.GID));
+            }
+            recommendations.push(container_recommendation);
+        }
+        if !missing_supplemental_groups.is_empty() {
+            let supplemental_groups = missing_supplemental_groups
+                .iter()
+                .map(|gid| gid.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            recommendations.push(format!(
+                "securityContext:\n  supplementalGroups: [{supplemental_groups}]"
+            ));
+        }
+        let recommendation = recommendations.join("\n");
+
+        eprintln!(
+            "ERROR: guest_pull is enabled for container '{}' using image '{}'. \
+             The generated policy expects UID={}, GID={}, AdditionalGids={:?}; \
+             containerd may not reproduce image-derived user/group values when image layers are pulled in the guest. \
+             Set explicit Kubernetes securityContext values, for example:\n{}\n\
+             See docs/Limitations.md#guest-pulled-container-images.",
+            yaml_container.name,
+            yaml_container.image,
+            process.User.UID,
+            process.User.GID,
+            process.User.AdditionalGids,
+            recommendation
+        );
+        exit(1);
+    }
+
     fn get_container_process(
         &self,
         resource: &dyn yaml::K8sResource,
@@ -1023,6 +1260,12 @@ impl AgentPolicy {
         debug!(
             "get_container_process: returning: User = {:?}",
             &process.User
+        );
+        self.exit_if_guest_pull_needs_security_context(
+            resource,
+            yaml_container,
+            is_pause_container,
+            &process,
         );
         process
     }

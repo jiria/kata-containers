@@ -1,0 +1,364 @@
+// Copyright (c) 2026 Kata Containers community
+//
+// SPDX-License-Identifier: Apache-2.0
+
+//! FR-1 offline fragment signer / key generator (developer tooling).
+//!
+//! Reuses [`PolicyFragment::signing_bytes`] so the signature format is guaranteed to match
+//! what the guest verifies. Not a production signing tool — for tests, demos, and local
+//! development of the signed-policy-fragment feature.
+//!
+//! Usage:
+//!   # generate an Ed25519 keypair (hex); put the public key in fragment-issuers.toml
+//!   cargo run --example sign-fragment -- gen-key
+//!
+//!   # sign a fragment; prints the detached signature (hex)
+//!   cargo run --example sign-fragment -- sign \
+//!       --issuer issuerA --svn 1 --receipt r1 \
+//!       --includes exec \
+//!       --module /path/to/fragment.rego \
+//!       --key <privkey-hex>
+//!
+//! The signer prints the signature hex; feed it, the module file, and the other fields to
+//! `kata-agent-ctl`'s `LoadPolicyFragment` command.
+
+use ed25519_dalek::{Signer, SigningKey};
+use kata_security_reference_monitor::PolicyFragment;
+use std::collections::HashMap;
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
+    let s = s.trim();
+    if s.len() % 2 != 0 {
+        return Err("hex string has odd length".into());
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
+        .collect()
+}
+
+/// Decode the first `CERTIFICATE` block of a PEM string into DER (for the x5chain header).
+fn pem_cert_to_der(pem: &str) -> Result<Vec<u8>, String> {
+    use base64ct::{Base64, Encoding};
+    let mut b64 = String::new();
+    let mut in_block = false;
+    for line in pem.lines() {
+        let t = line.trim();
+        if t == "-----BEGIN CERTIFICATE-----" {
+            in_block = true;
+            continue;
+        }
+        if t == "-----END CERTIFICATE-----" {
+            break;
+        }
+        if in_block {
+            b64.push_str(t);
+        }
+    }
+    if b64.is_empty() {
+        return Err("no CERTIFICATE block in pem".into());
+    }
+    Base64::decode_vec(&b64).map_err(|e| e.to_string())
+}
+
+/// Parse `--flag value` pairs from args. A `--flag` with no following value (end of args
+/// or immediately followed by another `--flag`) is recorded as a boolean (value "true").
+fn parse_flags(args: &[String]) -> HashMap<String, String> {
+    let mut m = HashMap::new();
+    let mut i = 0;
+    while i < args.len() {
+        if let Some(flag) = args[i].strip_prefix("--") {
+            let next_is_value = i + 1 < args.len() && !args[i + 1].starts_with("--");
+            if next_is_value {
+                m.insert(flag.to_string(), args[i + 1].clone());
+                i += 2;
+            } else {
+                m.insert(flag.to_string(), "true".to_string());
+                i += 1;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    m
+}
+
+fn main() {
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.len() < 2 {
+        eprintln!("usage: sign-fragment <gen-key|sign> [--flags]");
+        std::process::exit(2);
+    }
+
+    match argv[1].as_str() {
+        "gen-key" => {
+            // 32 random bytes from the OS as the Ed25519 secret scalar seed.
+            use std::io::Read;
+            let mut seed = [0u8; 32];
+            std::fs::File::open("/dev/urandom")
+                .expect("open /dev/urandom")
+                .read_exact(&mut seed)
+                .expect("read 32 random bytes");
+            let sk = SigningKey::from_bytes(&seed);
+            let pk = sk.verifying_key().to_bytes();
+            println!("private_key_hex={}", hex_encode(&seed));
+            println!("public_key_hex={}", hex_encode(&pk));
+        }
+        "sign" => {
+            let f = parse_flags(&argv[2..]);
+            let issuer = f.get("issuer").cloned().unwrap_or_default();
+            let svn: u64 = f.get("svn").and_then(|s| s.parse().ok()).unwrap_or(0);
+            let receipt = f.get("receipt").cloned();
+            let includes: Vec<String> = f
+                .get("includes")
+                .map(|s| {
+                    s.split(',')
+                        .map(|x| x.trim().to_string())
+                        .filter(|x| !x.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let module = f.get("module").map(|p| {
+                String::from_utf8(std::fs::read(p).expect("read module file")).expect("module utf8")
+            });
+            let key_hex = match f.get("key") {
+                Some(k) => k.clone(),
+                None => {
+                    eprintln!("--key <privkey-hex> is required");
+                    std::process::exit(2);
+                }
+            };
+            let seed_vec = hex_decode(&key_hex).expect("decode key hex");
+            if seed_vec.len() != 32 {
+                eprintln!("key must be 32 bytes ({} hex chars)", 64);
+                std::process::exit(2);
+            }
+            let mut seed = [0u8; 32];
+            seed.copy_from_slice(&seed_vec);
+            let sk = SigningKey::from_bytes(&seed);
+
+            let fragment = PolicyFragment {
+                issuer,
+                feed: f.get("feed").cloned().unwrap_or_default(),
+                svn,
+                grants: vec![],
+                policy_module: module,
+                includes,
+                requires: f
+                    .get("requires")
+                    .map(|s| {
+                        s.split(',')
+                            .map(|x| x.trim().to_string())
+                            .filter(|x| !x.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                receipt,
+                receipt_ledger: f.get("ledger").cloned(),
+                receipt_proof: f.get("proof").cloned(),
+                // FR-1f: further countersignatures, for a conjunctive
+                // `required_receipt_from`. Comma-separated `<ledger>:<receipt>` pairs;
+                // the ledger name is what the requirement list matches on.
+                extra_receipts: f
+                    .get("extra-receipts")
+                    .map(|s| {
+                        s.split(',')
+                            .map(|x| x.trim())
+                            .filter(|x| !x.is_empty())
+                            .map(|x| match x.split_once(':') {
+                                Some((ledger, receipt)) => {
+                                    (ledger.to_string(), receipt.to_string())
+                                }
+                                None => {
+                                    eprintln!(
+                                        "--extra-receipts entries must be <ledger>:<receipt>, got {x:?}"
+                                    );
+                                    std::process::exit(2);
+                                }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                // FR-1j: the append-only log head this fragment is applied on top of.
+                prev_log_head: f
+                    .get("prev-head")
+                    .map(|h| hex_decode(h).expect("decode prev-head hex")),
+                signature: vec![],
+            };
+            let sig = sk.sign(&fragment.signing_bytes());
+            println!("signature_hex={}", hex_encode(&sig.to_bytes()));
+
+            // FR-1j: print the next log head = sha256(prev_head || sha256(statement)), so a
+            // client can chain the following fragment onto this one.
+            if let Some(prev_hex) = f.get("prev-head") {
+                use sha2::{Digest, Sha256};
+                let prev = hex_decode(prev_hex).expect("decode prev-head hex");
+                let stmt_hash = Sha256::digest(fragment.signing_bytes());
+                let mut h = Sha256::new();
+                h.update(&prev);
+                h.update(stmt_hash);
+                println!("next_log_head={}", hex_encode(&h.finalize()));
+            }
+
+            // FR-1f Stage 2: optionally write this fragment's canonical statement bytes to a
+            // file so a (mock) transparency ledger can record it as a Merkle leaf.
+            if let Some(path) = f.get("emit-statement") {
+                std::fs::write(path, fragment.signing_bytes()).expect("write statement file");
+            }
+
+            // FR-1f: optionally also emit a transparency receipt = a signature over the
+            // same statement by a transparency ledger key (--receipt-key <hex>). Tag the
+            // originating ledger with --ledger <id> so the trust list can scope/verify it.
+            if let Some(rk_hex) = f.get("receipt-key") {
+                let rk_vec = hex_decode(rk_hex).expect("decode receipt key hex");
+                if rk_vec.len() == 32 {
+                    let mut rk = [0u8; 32];
+                    rk.copy_from_slice(&rk_vec);
+                    let ask = SigningKey::from_bytes(&rk);
+                    let rsig = ask.sign(&fragment.signing_bytes());
+                    println!("receipt_hex={}", hex_encode(&rsig.to_bytes()));
+                    if let Some(ledger) = f.get("ledger") {
+                        println!("receipt_ledger={}", ledger);
+                    }
+                }
+            }
+
+            // FR-1h: optionally emit a COSE_Sign1 (CBOR) envelope carrying the statement as
+            // payload, signed by the issuer key (EdDSA) — for the COSE load path.
+            if f.contains_key("cose") {
+                use coset::{iana, CborSerializable, CoseSign1Builder, HeaderBuilder};
+                let protected = HeaderBuilder::new()
+                    .algorithm(iana::Algorithm::EdDSA)
+                    .build();
+                let sign1 = CoseSign1Builder::new()
+                    .protected(protected)
+                    .payload(fragment.signing_bytes())
+                    .create_signature(b"", |tbs| sk.sign(tbs).to_bytes().to_vec())
+                    .build();
+                println!("cose_sign1_hex={}", hex_encode(&sign1.to_vec().unwrap()));
+            }
+
+            // FR-1d: optionally emit a did:x509 COSE_Sign1 envelope: the statement is signed
+            // by an EC P-256 leaf key (ES256) and the leaf→CA chain is carried in the
+            // x5chain header (COSE label 33). --x509-key <leaf-priv-pem>
+            // --x509-chain <leaf.pem,intermediate.pem,...,ca.pem> (leaf first).
+            if let (Some(key_pem), Some(chain_paths)) = (f.get("x509-key"), f.get("x509-chain")) {
+                use coset::cbor::value::Value;
+                use coset::{iana, CborSerializable, CoseSign1Builder, HeaderBuilder};
+                use p256::ecdsa::{signature::Signer, Signature, SigningKey};
+                use p256::pkcs8::DecodePrivateKey;
+
+                let key_text = std::fs::read_to_string(key_pem).expect("read x509 key pem");
+                let leaf_sk = SigningKey::from_pkcs8_pem(&key_text)
+                    .expect("parse EC P-256 leaf private key (PKCS#8 PEM)");
+
+                let mut chain: Vec<Value> = Vec::new();
+                for path in chain_paths
+                    .split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                {
+                    let pem = std::fs::read_to_string(path).expect("read cert pem");
+                    let der = pem_cert_to_der(&pem).expect("decode CERTIFICATE pem");
+                    chain.push(Value::Bytes(der));
+                }
+                let mut unprotected = coset::Header::default();
+                unprotected
+                    .rest
+                    .push((coset::Label::Int(33), Value::Array(chain)));
+                let protected = HeaderBuilder::new()
+                    .algorithm(iana::Algorithm::ES256)
+                    .build();
+                let sign1 = CoseSign1Builder::new()
+                    .protected(protected)
+                    .unprotected(unprotected)
+                    .payload(fragment.signing_bytes())
+                    .create_signature(b"", |tbs| {
+                        let sig: Signature = leaf_sk.sign(tbs);
+                        sig.to_bytes().to_vec()
+                    })
+                    .build();
+                println!("cose_sign1_hex={}", hex_encode(&sign1.to_vec().unwrap()));
+            }
+        }
+        // FR-1d dev/verification tool: verify a did:x509 COSE fragment offline against a CA
+        // fingerprint + policy, exactly as the agent would. Proves openssl-minted PKI interop.
+        //   verify-x509 --issuer <did> --svn <n> --includes <csv> --module <rego> \
+        //       --cose <hex> --ca-fp <sha256-hex> [--eku <oid>] [--revoked <sha256-hex,...>]
+        "verify-x509" => {
+            use kata_security_reference_monitor::did_x509::{DidX509Anchor, DidX509Policy};
+            use kata_security_reference_monitor::{FragmentStore, PolicyFragment};
+            let f = parse_flags(&argv[2..]);
+            let issuer = f.get("issuer").cloned().unwrap_or_default();
+            let svn: u64 = f.get("svn").and_then(|s| s.parse().ok()).unwrap_or(0);
+            let includes: Vec<String> = f
+                .get("includes")
+                .map(|s| {
+                    s.split(',')
+                        .map(|x| x.trim().to_string())
+                        .filter(|x| !x.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let module = f.get("module").map(|p| {
+                String::from_utf8(std::fs::read(p).expect("read module")).expect("module utf8")
+            });
+            let cose =
+                hex_decode(f.get("cose").expect("--cose required")).expect("decode cose hex");
+            let ca_fp_vec =
+                hex_decode(f.get("ca-fp").expect("--ca-fp required")).expect("decode ca-fp");
+            let mut ca_fp = [0u8; 32];
+            ca_fp.copy_from_slice(&ca_fp_vec);
+
+            let mut store = FragmentStore::new(false);
+            store.set_require_x509(true);
+            store.authorize_did_x509(DidX509Anchor {
+                did: issuer.clone(),
+                ca_fingerprint: ca_fp,
+                policy: DidX509Policy {
+                    require_eku: f
+                        .get("eku")
+                        .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
+                        .unwrap_or_default(),
+                    ..Default::default()
+                },
+            });
+            if let Some(rev) = f.get("revoked") {
+                let fps: Vec<[u8; 32]> = rev
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(|h| {
+                        let v = hex_decode(h).expect("decode revoked fp");
+                        let mut a = [0u8; 32];
+                        a.copy_from_slice(&v);
+                        a
+                    })
+                    .collect();
+                store.set_revoked_certs(fps);
+            }
+            let fragment = PolicyFragment {
+                issuer,
+                feed: f.get("feed").cloned().unwrap_or_default(),
+                svn,
+                includes,
+                policy_module: module,
+                ..Default::default()
+            };
+            match store.verify_cose_x509(&fragment, &cose) {
+                Ok(v) => println!("verify=OK issuer={} svn={}", v.issuer, v.svn),
+                Err(e) => {
+                    println!("verify=ERR {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        other => {
+            eprintln!("unknown subcommand: {other}");
+            std::process::exit(2);
+        }
+    }
+}

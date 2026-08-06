@@ -120,6 +120,8 @@ pub struct Sandbox {
     pub network: Network,
     pub mounts: Vec<String>,
     pub container_mounts: HashMap<String, Vec<String>>,
+    /// dm-verity devices per container for cleanup
+    pub container_verity_devices: HashMap<String, Vec<String>>,
     pub uevent_map: HashMap<String, Uevent>,
     pub uevent_watchers: Vec<Option<UeventWatcher>>,
     pub shared_utsns: Namespace,
@@ -154,6 +156,7 @@ impl Sandbox {
             containers: HashMap::new(),
             mounts: Vec::new(),
             container_mounts: HashMap::new(),
+            container_verity_devices: HashMap::new(),
             uevent_map: HashMap::new(),
             uevent_watchers: Vec::new(),
             shared_utsns: Namespace::new(&logger),
@@ -300,8 +303,20 @@ impl Sandbox {
             .find(|&c| c.config.container_name == name)
     }
 
-    pub fn find_process(&mut self, pid: pid_t) -> Option<&mut Process> {
-        for (_, c) in self.containers.iter_mut() {
+    /// FR-9: the id of the container whose *init* process has this pid, if any.
+    ///
+    /// Used by the SIGCHLD reaper to stop the container's occurrence when its init exits,
+    /// so the recorded lifecycle state follows the container rather than the host's
+    /// say-so: a host that never calls `WaitProcess` or `RemoveContainer` cannot keep an
+    /// occurrence in `running` after the process behind it is gone.
+    pub fn find_init_container_id(&self, pid: pid_t) -> Option<String> {
+        self.containers
+            .iter()
+            .find(|(_, c)| c.init_process_pid == pid)
+            .map(|(id, _)| id.clone())
+    }
+
+    pub fn find_process(&mut self, pid: pid_t) -> Option<&mut Process> {        for (_, c) in self.containers.iter_mut() {
             for p in c.processes.values_mut() {
                 if p.pid == pid {
                     return Some(p);

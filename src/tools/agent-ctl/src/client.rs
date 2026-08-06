@@ -301,6 +301,11 @@ static AGENT_CMDS: &[AgentCmd] = &[
         fp: agent_cmd_sandbox_set_policy,
     },
     AgentCmd {
+        name: "LoadPolicyFragment",
+        st: ServiceType::Agent,
+        fp: agent_cmd_load_policy_fragment,
+    },
+    AgentCmd {
         name: "MemAgentMemcgSet",
         st: ServiceType::Agent,
         fp: agent_cmd_mem_agent_memcg_set,
@@ -2209,6 +2214,96 @@ fn agent_cmd_sandbox_add_swap(
     info!(sl!(), "response received";
         "response" => format!("{:?}", reply));
 
+    Ok(())
+}
+
+// FR-1: load a signed policy fragment. Arguments are space-separated key=value pairs to
+// avoid protobuf-bytes-in-JSON ambiguity:
+//   LoadPolicyFragment issuer=<id> svn=<n> includes=<csv> receipt=<r> \
+//       receipt_ledger=<ledger-id> prev_head=<hex> proof=<ttl-proof-file> \
+//       module=<path-to-rego> sig=<hex> cose=<hex>
+fn agent_cmd_load_policy_fragment(
+    ctx: &Context,
+    client: &AgentServiceClient,
+    _health: &HealthClient,
+    _options: &mut Options,
+    args: &str,
+) -> Result<()> {
+    let mut kv = std::collections::HashMap::new();
+    for tok in args.split_whitespace() {
+        if let Some((k, v)) = tok.split_once('=') {
+            kv.insert(k.to_string(), v.to_string());
+        }
+    }
+    let get = |k: &str| kv.get(k).cloned().unwrap_or_default();
+
+    let hex_decode = |s: &str| -> Result<Vec<u8>> {
+        let s = s.trim();
+        if s.len() % 2 != 0 {
+            return Err(anyhow!("hex string has odd length"));
+        }
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| anyhow!("bad hex: {e}")))
+            .collect()
+    };
+
+    let includes: Vec<String> = get("includes")
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+    let policy_module = match kv.get("module") {
+        Some(p) if !p.is_empty() => {
+            std::fs::read(p).map_err(|e| anyhow!("read fragment module file: {e}"))?
+        }
+        _ => Vec::new(),
+    };
+    let signature = hex_decode(&get("sig"))?;
+    let svn: u64 = get("svn").parse().unwrap_or(0);
+
+    let mut req = protocols::agent::LoadPolicyFragmentRequest::new();
+    req.issuer = get("issuer");
+    req.feed = get("feed");
+    req.svn = svn;
+    req.includes = includes;
+    req.requires = get("requires")
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+    req.receipt = get("receipt");
+    req.receipt_ledger = get("receipt_ledger");
+    // FR-1j: append-only ordering — the log head this fragment applies on top of.
+    if let Some(ph) = kv.get("prev_head") {
+        if !ph.is_empty() {
+            req.prev_log_head = hex_decode(ph)?;
+        }
+    }
+    // FR-1f Stage 2: transparency inclusion + consistency proof (from a file or inline).
+    if let Some(pf) = kv.get("proof") {
+        if !pf.is_empty() {
+            req.receipt_proof = match std::fs::read_to_string(pf) {
+                Ok(s) => s,
+                Err(_) => pf.clone(),
+            };
+        }
+    }
+    req.signature = signature;
+    req.policy_module = policy_module;
+    // FR-1h: optional COSE_Sign1 envelope (hex) — verified instead of the detached sig.
+    if let Some(c) = kv.get("cose") {
+        if !c.is_empty() {
+            req.cose_sign1 = hex_decode(c)?;
+        }
+    }
+
+    let ctx = clone_context(ctx);
+    info!(sl!(), "sending request"; "request" => format!("{:?}", req));
+    let reply = client
+        .load_policy_fragment(ctx, &req)
+        .map_err(|e| anyhow!("{:?}", e).context(ERR_API_FAILED))?;
+    info!(sl!(), "response received"; "response" => format!("{:?}", reply));
     Ok(())
 }
 

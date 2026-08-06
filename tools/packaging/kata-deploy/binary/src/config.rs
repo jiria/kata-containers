@@ -199,6 +199,22 @@ pub struct Config {
     pub daemonset_name: String,
     pub custom_runtimes_enabled: bool,
     pub custom_runtimes: Vec<CustomRuntime>,
+    /// EROFS snapshotter rw-layer backing mode ("disk" or "memory").
+    pub erofs_snapshotter_mode: Option<String>,
+    /// Enable dm-verity integrity for EROFS lower layers.
+    /// Independent of rw-layer backing; works with both disk and memory modes.
+    pub erofs_dmverity: bool,
+    /// Startup taints to remove from the node once Kata is installed and the
+    /// node has been labeled `katacontainers.io/kata-runtime=true`. Each entry
+    /// is either a bare taint key (matches any effect) or `key:effect` (matches
+    /// only that effect). Empty means "remove nothing" and is the default, so
+    /// the behavior is opt-in and a no-op for users who don't configure it.
+    ///
+    /// This lets a node be provisioned with a startup taint that keeps Kata
+    /// workloads from being scheduled before the runtime binaries exist; kata-deploy
+    /// removes the taint as its final install step, closing the window in which a
+    /// pod could land on a not-yet-ready node.
+    pub startup_taints: Vec<String>,
 }
 
 impl Config {
@@ -227,7 +243,8 @@ impl Config {
             .map(|s| s.to_string())
             .collect();
 
-        let default_shim_for_arch = get_arch_var("DEFAULT_SHIM", "qemu", &arch);
+        let default_shim_for_arch =
+            get_arch_var("DEFAULT_SHIM", get_default_shim_for_arch(&arch), &arch);
 
         // Only use arch-specific variable for allowed hypervisor annotations
         let allowed_hypervisor_annotations_for_arch =
@@ -337,6 +354,25 @@ impl Config {
             Vec::new()
         };
 
+        let erofs_snapshotter_mode = env::var("EROFS_SNAPSHOTTER_MODE")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let erofs_dmverity = env::var("EROFS_DMVERITY")
+            .unwrap_or_default()
+            .trim()
+            .eq_ignore_ascii_case("dmverity");
+
+        // Startup taints to remove after install+label. Comma- or whitespace-separated
+        // list of `key` or `key:effect` entries. Empty/unset means "remove nothing".
+        let startup_taints = env::var("STARTUP_TAINTS")
+            .unwrap_or_default()
+            .split([',', ' ', '\t', '\n'])
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
         let config = Config {
             node_name,
             debug,
@@ -365,6 +401,9 @@ impl Config {
             daemonset_name,
             custom_runtimes_enabled,
             custom_runtimes,
+            erofs_snapshotter_mode,
+            erofs_dmverity,
+            startup_taints,
         };
 
         // Validate the configuration
@@ -546,6 +585,19 @@ impl Config {
             }
         }
 
+        // Validate EROFS_SNAPSHOTTER_MODE.
+        if let Some(mode) = self.erofs_snapshotter_mode.as_ref() {
+            match mode.as_str() {
+                "disk" | "memory" => {}
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "Unsupported EROFS_SNAPSHOTTER_MODE: '{}'. Supported values: disk, memory",
+                        mode
+                    ));
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -590,6 +642,7 @@ impl Config {
             "* CUSTOM_RUNTIMES_ENABLED: {}",
             self.custom_runtimes_enabled
         );
+        info!("* STARTUP_TAINTS: {}", self.startup_taints.join(" "));
         if !self.custom_runtimes.is_empty() {
             info!("* CUSTOM_RUNTIMES:");
             for runtime in &self.custom_runtimes {
@@ -834,11 +887,26 @@ fn parse_custom_runtimes() -> Result<Vec<CustomRuntime>> {
 /// Returns only shims that are supported for that architecture
 fn get_default_shims_for_arch(arch: &str) -> &'static str {
     match arch {
-        "x86_64" => "clh clh-runtime-rs dragonball fc qemu qemu-coco-dev qemu-coco-dev-runtime-rs qemu-runtime-rs qemu-nvidia-gpu qemu-nvidia-gpu-runtime-rs qemu-nvidia-gpu-snp qemu-nvidia-gpu-snp-runtime-rs qemu-nvidia-gpu-tdx qemu-nvidia-gpu-tdx-runtime-rs qemu-snp qemu-snp-runtime-rs qemu-tdx qemu-tdx-runtime-rs",
-        "aarch64" => "clh clh-runtime-rs dragonball fc qemu qemu-coco-dev-runtime-rs qemu-runtime-rs qemu-nvidia-gpu qemu-cca",
+        "x86_64" => "clh clh-runtime-rs dragonball fc qemu qemu-coco-dev qemu-coco-dev-runtime-rs qemu-runtime-rs qemu-nvidia-cpu qemu-nvidia-cpu-runtime-rs qemu-nvidia-gpu qemu-nvidia-gpu-runtime-rs qemu-nvidia-gpu-snp qemu-nvidia-gpu-snp-runtime-rs qemu-nvidia-gpu-tdx qemu-nvidia-gpu-tdx-runtime-rs qemu-snp qemu-snp-runtime-rs qemu-tdx qemu-tdx-runtime-rs",
+        "aarch64" => "clh clh-runtime-rs dragonball fc qemu qemu-coco-dev-runtime-rs qemu-runtime-rs qemu-nvidia-cpu qemu-nvidia-cpu-runtime-rs qemu-nvidia-gpu qemu-cca",
         "s390x" => "qemu qemu-runtime-rs qemu-se qemu-se-runtime-rs qemu-coco-dev qemu-coco-dev-runtime-rs",
         "ppc64le" => "qemu",
         _ => "qemu", // Fallback to qemu for unknown architectures
+    }
+}
+
+/// Get the default shim for a specific architecture.
+///
+/// Since the Kata Containers 4.0 release, the Rust runtime (runtime-rs,
+/// "qemu-runtime-rs") is the default wherever a runtime-rs build exists.
+/// ppc64le has no runtime-rs build yet, so it keeps the Go runtime ("qemu").
+/// This only acts as a fallback: the Helm chart normally provides DEFAULT_SHIM
+/// explicitly via values.yaml (`defaultShim`).
+fn get_default_shim_for_arch(arch: &str) -> &'static str {
+    match arch {
+        "x86_64" | "aarch64" | "s390x" => "qemu-runtime-rs",
+        "ppc64le" => "qemu",
+        _ => "qemu", // Fallback to the Go runtime for unknown architectures
     }
 }
 
@@ -918,6 +986,7 @@ mod tests {
             "EXPERIMENTAL_FORCE_GUEST_PULL_S390X",
             "EXPERIMENTAL_FORCE_GUEST_PULL_PPC64LE",
             "CONTAINERD_CONFIG_FILE_NAME",
+            "STARTUP_TAINTS",
         ];
         for var in &vars {
             std::env::remove_var(var);
@@ -982,6 +1051,16 @@ mod tests {
         let arch = get_arch().unwrap();
         assert!(!arch.is_empty());
         cleanup_env_vars();
+    }
+
+    #[rstest]
+    #[case("x86_64", "qemu-runtime-rs")]
+    #[case("aarch64", "qemu-runtime-rs")]
+    #[case("s390x", "qemu-runtime-rs")]
+    #[case("ppc64le", "qemu")]
+    #[case("riscv64", "qemu")]
+    fn test_get_default_shim_for_arch(#[case] arch: &str, #[case] expected: &str) {
+        assert_eq!(get_default_shim_for_arch(arch), expected);
     }
 
     #[serial]

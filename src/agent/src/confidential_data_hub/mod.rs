@@ -32,7 +32,10 @@ pub mod image;
 
 pub static CDH_CLIENT: OnceCell<CDHClient> = OnceCell::const_new();
 
-const SEALED_SECRET_PREFIX: &str = "sealed.";
+// Visible to the crate so that the FR-3 plan-binding check can recognise which
+// environment values the policy authorized as sealed references, and therefore
+// which values the unsealing transform is permitted to rewrite.
+pub(crate) const SEALED_SECRET_PREFIX: &str = "sealed.";
 
 // Convenience function to obtain the scope logger.
 fn sl() -> slog::Logger {
@@ -53,8 +56,8 @@ pub struct CDHClient {
 }
 
 impl CDHClient {
-    pub fn new(cdh_socket_uri: &str) -> Result<Self> {
-        let client = ttrpc::asynchronous::Client::connect(cdh_socket_uri)?;
+    pub async fn new(cdh_socket_uri: &str) -> Result<Self> {
+        let client = ttrpc::asynchronous::Client::connect(cdh_socket_uri).await?;
         let sealed_secret_client =
             confidential_data_hub_ttrpc_async::SealedSecretServiceClient::new(client.clone());
         let image_pull_client =
@@ -145,7 +148,9 @@ impl CDHClient {
 pub async fn init_cdh_client(cdh_socket_uri: &str) -> Result<()> {
     CDH_CLIENT
         .get_or_try_init(|| async {
-            CDHClient::new(cdh_socket_uri).context("Failed to create CDH Client")
+            CDHClient::new(cdh_socket_uri)
+                .await
+                .context("Failed to create CDH Client")
         })
         .await?;
 

@@ -117,13 +117,16 @@ REPO_URL="${REPO_URL:-}"
 REPO_URL_X86_64="${REPO_URL_X86_64:-}"
 REPO_COMPONENTS="${REPO_COMPONENTS:-}"
 AGENT_POLICY="${AGENT_POLICY:-yes}"
+STRICT_POLICY="${STRICT_POLICY:-no}"
 RUNTIME_CHOICE="${RUNTIME_CHOICE:-both}"
 IMAGE_SIZE_ALIGNMENT_MB=${IMAGE_SIZE_ALIGNMENT_MB:-}
 KERNEL_DEBUG_ENABLED="${KERNEL_DEBUG_ENABLED:-}"
 INIT_DATA="${INIT_DATA:-yes}"
+USE_DEVMAPPER="${USE_DEVMAPPER:-no}"
 
 docker run \
 	-v "${HOME}"/.docker:/root/.docker \
+	-v "${HOME}"/.docker:"${HOME}"/.docker \
 	-v /var/run/docker.sock:/var/run/docker.sock \
 	-v "${kata_dir}:${kata_dir}" \
 	--env USER="${USER}" \
@@ -159,7 +162,10 @@ docker run \
 	--env REPO_URL_X86_64="${REPO_URL_X86_64}" \
 	--env REPO_COMPONENTS="${REPO_COMPONENTS}" \
 	--env AGENT_POLICY="${AGENT_POLICY}" \
+	--env STRICT_POLICY="${STRICT_POLICY}" \
+	--env USE_DEVMAPPER="${USE_DEVMAPPER}" \
 	--env RUNTIME_CHOICE="${RUNTIME_CHOICE}" \
+	--env STATIC_RUNTIME="${STATIC_RUNTIME:-}" \
 	--env IMAGE_SIZE_ALIGNMENT_MB="${IMAGE_SIZE_ALIGNMENT_MB}" \
 	--env KERNEL_DEBUG_ENABLED="${KERNEL_DEBUG_ENABLED}" \
 	--env AA_KBC="${AA_KBC:-}" \
@@ -169,6 +175,12 @@ docker run \
 	--env CROSS_BUILD="${CROSS_BUILD}" \
 	--env TARGET_ARCH="${TARGET_ARCH}" \
 	--env ARCH="${ARCH}" \
+	--env http_proxy="${http_proxy}" \
+	--env https_proxy="${https_proxy}" \
+	--env no_proxy="${no_proxy:-}" \
+	--env HTTP_PROXY="${http_proxy}" \
+	--env HTTPS_PROXY="${https_proxy}" \
+	--env NO_PROXY="${no_proxy:-}" \
 	--rm \
 	-w "${script_dir}" \
 	build-kata-deploy "${kata_deploy_create}" "$@"

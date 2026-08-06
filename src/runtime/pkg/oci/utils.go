@@ -172,7 +172,7 @@ type RuntimeConfig struct {
 	DisableGuestEmptyDir bool
 
 	// EmptyDirMode specifies how Kubernetes emptyDir volumes are handled.
-	// Valid values are "shared-fs" (default) or "block-encrypted".
+	// Valid values are "shared-fs" (default), "block-encrypted", or "block-plain".
 	EmptyDirMode string
 
 	// CreateContainer timeout which, if provided, indicates the createcontainer request timeout
@@ -1400,6 +1400,16 @@ func SandboxConfig(ocispec specs.Spec, runtime RuntimeConfig, bundlePath, cid st
 		// default_maxvcpus=0 resolves to the host physical core count, and the
 		// guest reports that many possible vCPUs via `nproc --all`.
 		sandboxConfig.HypervisorConfig.DefaultMaxVCPUs = sandboxConfig.HypervisorConfig.NumVCPUs()
+
+		// A sandbox sized to 0 vCPUs (e.g. default_vcpus=0 with no workload CPU
+		// limit) would collapse DefaultMaxVCPUs to 0, which the hypervisor later
+		// expands to the host maximum. That in turn drives the SMP topology to
+		// sockets=maxcpus=host_max, which fails to boot on hosts where KVM caps
+		// the recommended vCPU count. Floor it at the single vCPU the VM boots
+		// with instead.
+		if sandboxConfig.HypervisorConfig.DefaultMaxVCPUs == 0 {
+			sandboxConfig.HypervisorConfig.DefaultMaxVCPUs = 1
+		}
 
 		ociLog.WithFields(logrus.Fields{
 			"workload cpu":       sandboxConfig.SandboxResources.WorkloadCPUs,

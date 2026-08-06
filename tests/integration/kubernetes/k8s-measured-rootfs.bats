@@ -19,14 +19,17 @@ case "${KATA_HYPERVISOR}" in
 esac
 
 check_and_skip() {
-	if is_confidential_runtime_class "${KATA_HYPERVISOR}"; then
+	# The CPU-only NVIDIA classes are not confidential, but they still boot
+	# the verity-backed nvidia base image, so measured rootfs applies to them
+	# just like it does to the confidential classes.
+	if is_verity_enabled_runtime_class "${KATA_HYPERVISOR}"; then
 		if [[ "$(uname -m)" == "s390x" ]]; then
 			skip "measured rootfs tests not implemented for s390x"
 		fi
 		return
-	else
-		skip "measured rootfs tests not implemented for hypervisor: ${KATA_HYPERVISOR}"
 	fi
+
+	skip "measured rootfs tests not implemented for hypervisor: ${KATA_HYPERVISOR}"
 }
 
 setup() {
@@ -41,7 +44,8 @@ setup() {
 	nginx_digest=$(get_from_kata_deps ".docker_images.nginx.digest")
 	nginx_image="${nginx_registry}@${nginx_digest}"
 
-	pod_config="$(new_pod_config "${nginx_image}" "kata-${KATA_HYPERVISOR}")"
+	pod_config="$(new_pod_config "${nginx_image}" "kata-${KATA_HYPERVISOR}" \
+		"" "" "1, 2, 3, 4, 6, 10, 11, 20, 26, 27")"
 	auto_generate_policy "${pod_config_dir}" "${pod_config}"
 
 	incorrect_hash="1111111111111111111111111111111111111111111111111111111111111111"

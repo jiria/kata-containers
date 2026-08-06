@@ -22,6 +22,7 @@ msrc
 
 # Open source projects
 bootc
+distroless
 materialx
 ostree
 
@@ -39,6 +40,7 @@ MDEV
 MKVP
 MMDS
 mmio
+mshv
 NVDIMM
 OVMF
 SEV
@@ -60,6 +62,7 @@ NCCL
 NRAS
 NVCR
 NVLINK
+NVML
 nvswitch
 nvswitches
 NVRC
@@ -67,6 +70,7 @@ nvlib
 pgpu
 PPCIE
 Quadro
+RCAR
 
 # Storage & Filesystems
 AUFS
@@ -102,6 +106,7 @@ ttrpc
 vsock
 
 # Security & Encryption
+LUKS
 ocicrypt
 
 # Container, Runtime & Misc terms

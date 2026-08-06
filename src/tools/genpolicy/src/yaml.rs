@@ -278,8 +278,7 @@ pub fn get_yaml_header(yaml: &str) -> anyhow::Result<YamlHeader> {
 
 pub async fn k8s_resource_init(spec: &mut pod::PodSpec, config: &Config) {
     for container in &mut spec.containers {
-        let is_pause_container = false;
-        container.init(config, is_pause_container).await;
+        container.init(config).await;
     }
 
     pod::add_pause_container(&mut spec.containers, config).await;
@@ -287,8 +286,7 @@ pub async fn k8s_resource_init(spec: &mut pod::PodSpec, config: &Config) {
     if let Some(init_containers) = &spec.initContainers {
         for container in init_containers {
             let mut new_container = container.clone();
-            let is_pause_container = false;
-            new_container.init(config, is_pause_container).await;
+            new_container.init(config).await;
             spec.containers.insert(1, new_container);
         }
     }
@@ -491,6 +489,10 @@ pub fn get_process_fields(
         if let Some(allow) = context.allowPrivilegeEscalation {
             process.NoNewPrivileges = !allow
         }
+
+        // Pod-level appArmorProfile. A container-level profile, applied later in
+        // Container::get_process_fields, takes precedence over this.
+        pod::apply_apparmor_profile(process, &context.appArmorProfile);
 
         debug!("get_process_fields: returning User = {:?}", &process.User);
     }

@@ -26,7 +26,7 @@ KATA_TESTS_DATADIR="${KATA_TESTS_DATADIR:-${KATA_TESTS_BASEDIR}/data}"
 # Directory that can be used for storing cache kata components
 KATA_TESTS_CACHEDIR="${KATA_TESTS_CACHEDIR:-${KATA_TESTS_BASEDIR}/cache}"
 
-KATA_HYPERVISOR="${KATA_HYPERVISOR:-qemu}"
+KATA_HYPERVISOR="${KATA_HYPERVISOR:-qemu-runtime-rs}"
 
 RUNTIME="${RUNTIME:-containerd-shim-kata-v2}"
 
@@ -644,7 +644,7 @@ function overwrite_containerd_config() {
 	drop_in="${conf_dir}/50-kata-containers-ci.toml"
 
 	schema="$(_containerd_resolved_schema_version)"
-	hv="${KATA_HYPERVISOR:-qemu}"
+	hv="${KATA_HYPERVISOR:-qemu-runtime-rs}"
 	cfg_path="${KATA_CONFIG_PATH:-/opt/kata/share/defaults/kata-containers/configuration-${hv}.toml}"
 	shim_binary="$(command -v "containerd-shim-kata-${hv}-v2" 2>/dev/null || true)"
 	[[ -n "${shim_binary}" ]] || shim_binary="/usr/local/bin/containerd-shim-kata-${hv}-v2"
@@ -789,7 +789,7 @@ function enabling_hypervisor() {
 	declare -r CONTAINERD_SHIM_KATA="/usr/local/bin/containerd-shim-kata-${KATA_HYPERVISOR}-v2"
 
 	case "${KATA_HYPERVISOR}" in
-		dragonball|clh-runtime-rs|clh-azure-runtime-rs|qemu-runtime-rs|qemu-se-runtime-rs)
+		dragonball|*-runtime-rs)
 			sudo ln -sf "${KATA_DIR}/runtime-rs/bin/containerd-shim-kata-v2" "${CONTAINERD_SHIM_KATA}"
 			declare -r CONFIG_DIR="${KATA_DIR}/share/defaults/kata-containers/runtime-rs"
 			;;
@@ -812,7 +812,7 @@ function check_containerd_config_for_kata() {
 	declare -r containerd_path="/etc/containerd/config.toml"
 	local hv dump
 
-	hv="${KATA_HYPERVISOR:-qemu}"
+	hv="${KATA_HYPERVISOR:-qemu-runtime-rs}"
 
 	dump="$(PATH="${PATH}:/usr/local/bin:/usr/local/sbin" containerd config dump 2>/dev/null || true)"
 
