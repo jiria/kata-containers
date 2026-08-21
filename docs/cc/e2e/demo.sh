@@ -37,6 +37,11 @@
 #
 #   Stage 05 is *not* required. Nothing here depends on it.
 #
+# Re-runnable on the same host: verified by running it twice back to back, which
+# produced byte-identical evidence both times, including the same two initdata
+# digests. Every pod it creates is deleted on exit, including the one the
+# fragment demo would otherwise leave running.
+#
 # Also needed: kubectl, jq, passwordless sudo (acts 1 and 2 read the journal and
 # the containerd snapshot dirs, both root-only), a cargo toolchain, and the
 # source tree at E2E_REPO_DIR — acts 2 and 3 quote versions.yaml, rpc.rs and
@@ -65,7 +70,7 @@ export E2E_PLATFORM
 NS="${E2E_NS:-coco-e2e}"
 ACTS="${DEMO_ACTS:-0,1,2,3,4}"
 WORK=$(mktemp -d)
-trap 'rm -rf "${WORK}"; kubectl delete pod -n "${NS}" -l demo=parma --ignore-not-found >/dev/null 2>&1 || true' EXIT
+trap 'rm -rf "${WORK}"; kubectl delete pod -n "${NS}" -l demo=parma --ignore-not-found >/dev/null 2>&1 || true; kubectl delete pod -n "${NS}" demo-frag-sidecar --ignore-not-found >/dev/null 2>&1 || true' EXIT
 
 pause() {
   [[ "${DEMO_PAUSE:-0}" = "1" ]] || return 0
@@ -236,6 +241,12 @@ EOF
     warn "could not read both digests from the journal — check 'journalctl -t kata'"
   fi
   cat <<'EOF'
+
+  Worth noting what does *not* change: run this again, on this host or another,
+  and the same workload yields the same digest. The measurement is a pure
+  function of the policy document. That reproducibility is what makes pinning a
+  digest meaningful — a relying party can compute the expected value itself
+  rather than being told what to trust.
 
   And the guest checks this itself: the agent reads its own SNP report and
   aborts unless the delivered document hashes to HOST_DATA. So a pod that
