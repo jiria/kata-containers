@@ -172,9 +172,11 @@ act0() {
   step "act 0 — this is a confidential host, and the guest is a real CVM"
   cat <<'EOF'
 
-  C-ACI runs its UVM on a confidential host. Until this branch, the Kata CoCo
-  e2e ran under nested virt on an ordinary host: the policy work was real, the
-  hardware root of trust was not. That is no longer true.
+  MSHV plus Cloud Hypervisor with real SEV-SNP is not new work in itself — that
+  path existed before, and then it was suspended. What is new is that it has
+  been rebased onto current Kata and brought back into working order, so the
+  hardening in the acts that follow is demonstrated on real confidential
+  hardware rather than under nested virt on an ordinary host.
 EOF
   show "the node runs an MSHV Dom0 kernel, not a stock one" \
     "uname -r"
@@ -188,7 +190,7 @@ EOF
   [[ -r "${cfg}" ]] || cfg="${E2E_KATA_PREFIX}/share/defaults/kata-containers/runtime-rs/configuration.toml"
   show "the runtime is configured for an IGVM-launched SEV-SNP guest" \
     "grep -nE '^(igvm|confidential_guest|sev_snp_guest)' ${cfg}"
-  show "and the IGVM file is the artefact the launch measurement covers" \
+  show "and the IGVM file is the artifact the launch measurement covers" \
     "sha256sum ${E2E_GUEST_IGVM}"
   pause
 }
