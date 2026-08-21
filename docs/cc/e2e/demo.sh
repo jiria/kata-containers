@@ -23,9 +23,26 @@
 # coverage is being extended on branch jiria/formal-ci-gate and the numbers will
 # move. Add it once that lands.
 #
-# Prerequisites (all produced by the normal stages):
-#   * cluster with the branch guest stack   — 03-deploy-cluster.sh, 04-build-guest-stack.sh
-#   * for act 4 only: issuer key + registry — 06-policy-fragment-e2e.sh
+# Prerequisites. This runs against a fully built e2e node — it demonstrates the
+# stack, it does not build it. What each act needs:
+#
+#   acts 0-3   stages 01-04. Specifically: an MSHV Dom0 node that has been
+#              rebooted onto the MSHV kernel (01, 02), a cluster (03), and the
+#              branch guest stack installed with its IGVM (04). Stage 04 also
+#              records ~/.coco-e2e/guest-config-paths, which act 0 reads rather
+#              than guessing the config filename.
+#   act 4      additionally stage 06 — it needs the issuer key, the signed
+#              fragment fixture and a reachable registry. Skipped with a warning
+#              if those are absent.
+#
+#   Stage 05 is *not* required. Nothing here depends on it.
+#
+# Also needed: kubectl, jq, passwordless sudo (acts 1 and 2 read the journal and
+# the containerd snapshot dirs, both root-only), a cargo toolchain, and the
+# source tree at E2E_REPO_DIR — acts 2 and 3 quote versions.yaml, rpc.rs and
+# mediation.rs directly, because showing the source is the point.
+#
+# In practice: ./run-all.sh 01 02 03 04 06, then DEMO_PREP=1 ./demo.sh.
 #
 # Env:
 #   DEMO_PAUSE=1     wait for Enter between beats (default: run straight through)
@@ -127,6 +144,23 @@ decode_initdata() {
 }
 
 need kubectl; need jq
+
+# Fail with something actionable. A demo that dies halfway through act 1 in front
+# of an audience is worse than one that refuses to start with a reason.
+preflight() {
+  need cargo
+  sudo -n true 2>/dev/null \
+    || die "passwordless sudo is required — acts 1 and 2 read the journal and containerd's root-only snapshot dirs"
+  [[ -r "${E2E_REPO_DIR}/src/agent/src/mediation.rs" ]] \
+    || die "no source tree at E2E_REPO_DIR=${E2E_REPO_DIR} — acts 2 and 3 quote the source directly"
+  [[ -r "${E2E_GUEST_IGVM}" ]] \
+    || die "no guest IGVM at ${E2E_GUEST_IGVM} — run 04-build-guest-stack.sh first"
+  kubectl get nodes >/dev/null 2>&1 \
+    || die "no reachable cluster — run 03-deploy-cluster.sh first"
+  kubectl get runtimeclass "${E2E_RUNTIMECLASS}" >/dev/null 2>&1 \
+    || die "runtimeclass ${E2E_RUNTIMECLASS} not found — run 03-deploy-cluster.sh first"
+  ok "preflight: cluster, guest stack and source tree present"
+}
 
 # ============================================================ act 0
 act0() {
@@ -364,6 +398,7 @@ EOF
 # ============================================================ run
 load_toolchain
 load_coco_env
+preflight
 
 # Everything slow lives here, so the demo itself only displays evidence. The
 # image pull matters as much as the genpolicy build: a cold pull happens inside
