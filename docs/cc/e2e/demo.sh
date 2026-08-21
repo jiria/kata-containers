@@ -302,8 +302,8 @@ EOF
   reproducing containerd's mkfs.erofs invocation byte-for-byte against a
   matching erofs-utils, so the policy can be generated anywhere.
 EOF
-  show "which is why the erofs-utils version is pinned" \
-    "mkfs.erofs --version 2>&1 | head -1; grep -A3 -i '^  erofs-utils:' ${E2E_REPO_DIR}/versions.yaml | grep -iE 'version' | head -2"
+  show "which is why the erofs-utils version is pinned — installed matches the pin" \
+    "mkfs.erofs --version 2>&1 | head -1; grep -A9 -i '^  erofs-utils:' ${E2E_REPO_DIR}/versions.yaml | grep -iE '^[[:space:]]+version:' | head -1 | sed 's/^/versions.yaml pin: /'"
   pause
 
   show "note where the verity device is NOT: the host has no dm devices at all" \
