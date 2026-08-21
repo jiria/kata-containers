@@ -126,6 +126,7 @@ start_demo_pod() {
   local name="$1"
   kubectl delete pod "${name}" -n "${NS}" --ignore-not-found >/dev/null 2>&1 || true
   kubectl apply -f "${WORK}/${name}.yaml" >/dev/null || die "kubectl apply failed for ${name}"
+  log "starting pod ${name} — this boots a fresh SEV-SNP CVM, so it is not instant"
   wait_for 300 "pod ${name} Running" \
     bash -c "kubectl get pod ${name} -n ${NS} -o jsonpath='{.status.phase}' | grep -qx Running"
 }

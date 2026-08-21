@@ -154,6 +154,7 @@ render_pod "" > "${WORK}/step1.yaml"
 "${GENPOLICY}" -y "${WORK}/step1.yaml" -p "${WORK}/rules-none.rego" -j "${SETTINGS}" \
   --initdata-path="${WORK}/initdata.toml" >/dev/null || die "genpolicy failed"
 kubectl apply -f "${WORK}/step1.yaml" >/dev/null
+log "starting pod ${POD} — this boots a fresh SEV-SNP CVM, so it is not instant"
 wait_for 300 "pod ${POD} Running" pod_running
 ok "busybox is running, authorized by an entry in the measured policy"
 kubectl get pod "${POD}" -n "${NS}"
@@ -169,6 +170,7 @@ render_pod "" > "${WORK}/step2.yaml"
   --initdata-path="${WORK}/initdata.toml" >/dev/null || die "genpolicy failed"
 append_sidecar "${WORK}/step2.yaml"
 kubectl apply -f "${WORK}/step2.yaml" >/dev/null
+log "starting pod ${POD} again — another fresh CVM boot"
 wait_for 300 "busybox ready" container_ready busybox
 sleep 20
 sc=$(ready_of sidecar)
@@ -249,6 +251,7 @@ render_pod "${SIDECAR_REF}" > "${WORK}/step4.yaml"
   --initdata-path="${WORK}/initdata.toml" >/dev/null || die "genpolicy failed"
 append_sidecar "${WORK}/step4.yaml"
 kubectl apply -f "${WORK}/step4.yaml" >/dev/null
+log "starting pod ${POD} once more — final fresh CVM boot"
 wait_for 300 "sidecar ready" container_ready sidecar
 [[ "$(ready_of busybox)" = "true" ]] || die "busybox is not ready"
 ok "both containers running — the fragment authorized a container the measured policy never contained"
