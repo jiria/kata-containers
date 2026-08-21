@@ -134,10 +134,20 @@ start_demo_pod() {
 # The shim logs the digest it stamped into HOST_DATA. Note the double space in
 # "initdata  digest" — it is not a typo, and a single-space grep silently
 # matches nothing, which would look like the feature is missing.
-initdata_digest_since() {
-  local since="$1"
+#
+# Do NOT identify a pod's digest by position in the journal (e.g. tail -1): the
+# value you get then depends on how many sandboxes have booted since, so a
+# second pod silently retroactively changes the "first" pod's answer. Compute
+# the expected digest from that pod's own document and look that value up.
+initdata_digest_expected() {
+  openssl dgst -sha256 -binary "$1" | base64
+}
+
+initdata_digest_in_journal() {
+  local since="$1" want="$2"
   sudo journalctl -t kata --since "${since}" --no-pager 2>/dev/null \
-    | grep -o 'initdata  digest [^ ]*' | tail -1 | awk '{print $3}' | tr -d '"'
+    | grep -o 'initdata  digest [^ ]*' | tr -d '"' | awk '{print $3}' \
+    | grep -qxF "${want}"
 }
 
 # The measured document itself, straight out of the pod spec.
@@ -149,7 +159,7 @@ decode_initdata() {
     || die "could not decode initdata for ${name}"
 }
 
-need kubectl; need jq
+need kubectl; need jq; need openssl
 
 # Fail with something actionable. A demo that dies halfway through act 1 in front
 # of an audience is worse than one that refuses to start with a reason.
@@ -221,35 +231,50 @@ EOF
     "head -4 ${WORK}/a.toml; echo '   ...'; grep -c . ${WORK}/a.toml | xargs -I{} echo '   ({} lines total)'; grep -nE '^default policy_fragments := \[\]|\"fragments\": \[\]|\"image_layer_verification\": \"[a-z-]*\"' ${WORK}/a.toml | sed 's/^/   /'"
   pause
 
-  local d1; d1=$(initdata_digest_since "${t0}")
-  printf '\n  %s->%s the runtime hashed that document into the SNP report'"'"'s HOST_DATA field\n' "${_c_blu}" "${_c_off}"
-  printf '     %s$ sudo journalctl -t kata | grep "initdata  digest"%s\n' "${_c_yel}" "${_c_off}"
+  local d1; d1=$(initdata_digest_expected "${WORK}/a.toml")
+  printf '\n  %s->%s anyone can compute the expected measurement from that document alone\n' "${_c_blu}" "${_c_off}"
+  printf '     %s$ openssl dgst -sha256 -binary a.toml | base64%s\n' "${_c_yel}" "${_c_off}"
   printf '     %s\n' "${d1}"
+  printf '\n  %s->%s and that is the value the runtime stamped into the SNP report'"'"'s HOST_DATA\n' "${_c_blu}" "${_c_off}"
+  printf '     %s$ sudo journalctl -t kata | grep "initdata  digest"%s\n' "${_c_yel}" "${_c_off}"
+  if initdata_digest_in_journal "${t0}" "${d1}"; then
+    ok "the host logged exactly the digest we computed ourselves"
+  else
+    warn "did not find that digest in the journal — check 'journalctl -t kata'"
+  fi
   cat <<'EOF'
 
-  Now the point of the whole exercise. Change one byte of the workload — sleep
-  3600 becomes sleep 3601 — and the measurement moves. A relying party pinned to
-  the first digest rejects the second.
+  Now the point of the whole exercise. The workload here is the container's
+  command, and we change one byte of it — sleep 3600 becomes sleep 3601. That
+  is the entire difference: same image, same everything else. The measurement
+  moves anyway, because the command is part of the policy that gets hashed. A
+  relying party pinned to the first digest rejects the second.
 EOF
   pause
 
   local t1; t1=$(date '+%Y-%m-%d %H:%M:%S')
   demo_pod_yaml demo-b '"sleep", "3601"'
   start_demo_pod demo-b
-  local d2; d2=$(initdata_digest_since "${t1}")
+  decode_initdata demo-b "${WORK}/b.toml"
+  local d2; d2=$(initdata_digest_expected "${WORK}/b.toml")
   printf '\n     sleep 3600  ->  %s\n     sleep 3601  ->  %s\n' "${d1}" "${d2}"
-  if [[ -n "${d1}" && -n "${d2}" && "${d1}" != "${d2}" ]]; then
-    ok "one byte of workload, an entirely different measurement"
+  if [[ -z "${d1}" || -z "${d2}" ]]; then
+    warn "could not compute both digests"
+  elif [[ "${d1}" = "${d2}" ]]; then
+    warn "the two digests are identical — that should not happen; the workload change did not reach the policy"
+  elif initdata_digest_in_journal "${t1}" "${d2}"; then
+    ok "one byte of workload, an entirely different measurement — and the host stamped it"
   else
-    warn "could not read both digests from the journal — check 'journalctl -t kata'"
+    warn "digests differ as expected, but the second was not found in the journal"
   fi
   cat <<'EOF'
 
   Worth noting what does *not* change: run this again, on this host or another,
   and the same workload yields the same digest. The measurement is a pure
-  function of the policy document. That reproducibility is what makes pinning a
-  digest meaningful — a relying party can compute the expected value itself
-  rather than being told what to trust.
+  function of the policy document — which is why we could compute it above with
+  nothing but sha256 and the document itself. That is what makes pinning a
+  digest meaningful: a relying party computes the expected value rather than
+  being told what to trust.
 
   And the guest checks this itself: the agent reads its own SNP report and
   aborts unless the delivered document hashes to HOST_DATA. So a pod that
