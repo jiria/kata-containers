@@ -217,8 +217,8 @@ EOF
 
   start_demo_pod demo-a
   decode_initdata demo-a "${WORK}/a.toml"
-  show "decoded, it is one TOML document — and it carries the fragment trust roots too" \
-    "head -4 ${WORK}/a.toml; echo '   ...'; grep -c . ${WORK}/a.toml | xargs -I{} echo '   ({} lines total)'; grep -oE '^\[data\..*|\"image_layer_verification\": \"[a-z-]*\"' ${WORK}/a.toml | sort -u | head"
+  show "decoded, it is one TOML document: the whole policy, plus the fragment machinery — declared empty for this pod, and fail-closed" \
+    "head -4 ${WORK}/a.toml; echo '   ...'; grep -c . ${WORK}/a.toml | xargs -I{} echo '   ({} lines total)'; grep -nE '^default policy_fragments := \[\]|\"fragments\": \[\]|\"image_layer_verification\": \"[a-z-]*\"' ${WORK}/a.toml | sed 's/^/   /'"
   pause
 
   local d1; d1=$(initdata_digest_since "${t0}")
