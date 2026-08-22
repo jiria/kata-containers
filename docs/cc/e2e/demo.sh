@@ -143,11 +143,10 @@ initdata_digest_expected() {
   openssl dgst -sha256 -binary "$1" | base64
 }
 
-initdata_digest_in_journal() {
+initdata_journal_line() {
   local since="$1" want="$2"
   sudo journalctl -t kata --since "${since}" --no-pager 2>/dev/null \
-    | grep -o 'initdata  digest [^ ]*' | tr -d '"' | awk '{print $3}' \
-    | grep -qxF "${want}"
+    | grep -F "initdata  digest" | grep -F "${want}" | tail -1
 }
 
 # Any act that may have to generate a policy needs this, not just act 1: acts
@@ -163,10 +162,10 @@ ensure_policy_toolchain() {
 }
 
 # The measured document itself, straight out of the pod spec.
+INITDATA_JSONPATH='{.metadata.annotations.io\.katacontainers\.config\.hypervisor\.cc_init_data}'
 decode_initdata() {
   local name="$1" out="$2"
-  kubectl get pod "${name}" -n "${NS}" \
-    -o jsonpath='{.metadata.annotations.io\.katacontainers\.config\.hypervisor\.cc_init_data}' \
+  kubectl get pod "${name}" -n "${NS}" -o jsonpath="${INITDATA_JSONPATH}" \
     | base64 -d | gunzip > "${out}" 2>/dev/null \
     || die "could not decode initdata for ${name}"
 }
@@ -237,8 +236,20 @@ EOF
 
   start_demo_pod demo-a
   decode_initdata demo-a "${WORK}/a.toml"
-  show "decoded, it is one TOML document: the whole policy, plus the fragment machinery — declared empty for this pod, and fail-closed" \
-    "head -4 ${WORK}/a.toml; echo '   ...'; grep -c . ${WORK}/a.toml | xargs -I{} echo '   ({} lines total)'; grep -nE '^default policy_fragments := \[\]|\"fragments\": \[\]|\"image_layer_verification\": \"[a-z-]*\"' ${WORK}/a.toml | sed 's/^/   /'"
+  show "that annotation is an initdata document — decode it straight out of the running pod" \
+    "kubectl get pod demo-a -n ${NS} -o jsonpath='${INITDATA_JSONPATH}' | base64 -d | gunzip | head -5"
+  cat <<'EOF'
+
+  That is the whole shape of it. Two header fields, then a [data] table with a
+  single key: "policy.rego", whose value is the entire generated policy —
+  everything below that line. Nothing else is in the document, so "the
+  measurement covers the policy" is not a figure of speech; the document *is*
+  the policy. Note algorithm = 'sha256': that is how its digest gets computed
+  in a moment.
+EOF
+  pause
+  show "and the fragment machinery rides inside it — declared empty for this pod, and fail-closed" \
+    "grep -c . ${WORK}/a.toml | xargs -I{} echo 'policy lines: {}'; grep -nE '^default policy_fragments := \[\]|\"fragments\": \[\]|\"image_layer_verification\": \"[a-z-]*\"' ${WORK}/a.toml"
   pause
 
   local d1; d1=$(initdata_digest_expected "${WORK}/a.toml")
@@ -247,7 +258,9 @@ EOF
   printf '     %s\n' "${d1}"
   printf '\n  %s->%s and that is the value the runtime stamped into the SNP report'"'"'s HOST_DATA\n' "${_c_blu}" "${_c_off}"
   printf '     %s$ sudo journalctl -t kata | grep "initdata  digest"%s\n' "${_c_yel}" "${_c_off}"
-  if initdata_digest_in_journal "${t0}" "${d1}"; then
+  local jline; jline=$(initdata_journal_line "${t0}" "${d1}")
+  if [[ -n "${jline}" ]]; then
+    printf '     %s\n' "${jline}"
     ok "the host logged exactly the digest we computed ourselves"
   else
     warn "did not find that digest in the journal — check 'journalctl -t kata'"
@@ -272,7 +285,7 @@ EOF
     warn "could not compute both digests"
   elif [[ "${d1}" = "${d2}" ]]; then
     warn "the two digests are identical — that should not happen; the workload change did not reach the policy"
-  elif initdata_digest_in_journal "${t1}" "${d2}"; then
+  elif [[ -n "$(initdata_journal_line "${t1}" "${d2}")" ]]; then
     ok "one byte of workload, an entirely different measurement — and the host stamped it"
   else
     warn "digests differ as expected, but the second was not found in the journal"
