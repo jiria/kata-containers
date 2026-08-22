@@ -99,7 +99,7 @@ heading() { _CUR_STEP="$*"; _lib_step "$@"; _vo "$*"; }
 NS="${E2E_NS:-coco-e2e}"
 ACTS="${DEMO_ACTS:-0,1,2,3,4}"
 WORK=$(mktemp -d)
-trap 'rm -rf "${WORK}"; kubectl delete pod -n "${NS}" -l demo=parma --ignore-not-found >/dev/null 2>&1 || true; kubectl delete pod -n "${NS}" demo-frag-sidecar --ignore-not-found >/dev/null 2>&1 || true' EXIT
+trap 'rm -rf "${WORK}"; sudo pkill -f initdata-tamper.py >/dev/null 2>&1 || true; kubectl delete pod -n "${NS}" -l demo=parma --ignore-not-found >/dev/null 2>&1 || true; kubectl delete pod -n "${NS}" demo-frag-sidecar --ignore-not-found >/dev/null 2>&1 || true' EXIT
 
 pause() {
   [[ "${DEMO_PAUSE:-0}" = "1" ]] || return 0
@@ -278,6 +278,123 @@ show_sandbox_backing() {
   scene
 }
 
+# ---------------------------------------------------- live binding experiment
+# Stage the swap the measurement is supposed to prevent, on this hardware, and
+# watch what happens. Run twice, because one run on its own proves nothing:
+#
+#   flip     serve a policy that differs from the measured one
+#   control  serve the same policy, re-compressed — new bytes, same digest
+#
+# If flip is refused and control boots, the only variable that mattered is the
+# content digest. Without the control, "the pod did not start" is equally well
+# explained by "we corrupted the image".
+_TAMPER_PHASE=""
+_tamper_run() {
+  local mode="$1" pod="$2" want="$3"
+  local logf="${WORK}/tamper-${mode}.log"
+  local harness="${E2E_REPO_DIR}/docs/cc/e2e/initdata-tamper.py"
+  _TAMPER_PHASE=""
+  [[ -r "${harness}" ]] || { warn "no tamper harness at ${harness} — skipping"; return 1; }
+
+  kubectl delete pod "${pod}" -n "${NS}" --ignore-not-found >/dev/null 2>&1 || true
+  sudo nohup python3 "${harness}" --mode "${mode}" --deadline 150 >"${logf}" 2>&1 &
+  local watcher=$!
+  # The watcher only rewrites images created after it starts, so it has to be
+  # up before the sandbox is. Give it its first poll.
+  sleep 1
+
+  kubectl apply -f "${WORK}/${pod}.yaml" >/dev/null || die "kubectl apply failed for ${pod}"
+  log "starting pod ${pod} with the watcher armed (${mode})"
+
+  local i
+  for i in $(seq 1 30); do
+    _TAMPER_PHASE=$(kubectl get pod "${pod}" -n "${NS}" -o jsonpath='{.status.phase}' 2>/dev/null)
+    [[ "${_TAMPER_PHASE}" = "Running" ]] && break
+    # A refused sandbox shows up as a kubelet retry, which is the signal the
+    # guest declined — there is no message from inside the guest to wait for.
+    # Only ever believe that once the watcher says it rewrote something: an
+    # untampered pod that is merely slow to boot looks identical otherwise.
+    if [[ "${want}" = "refused" ]] \
+       && grep -q 'rewrote the initdata image' "${logf}" 2>/dev/null \
+       && _tamper_events "${pod}" | grep -q .; then
+      break
+    fi
+    sleep 5
+  done
+
+  sudo pkill -f "initdata-tamper.py --mode ${mode}" >/dev/null 2>&1 || true
+  wait "${watcher}" 2>/dev/null || true
+
+  # The experiment is only an experiment if the manipulation landed. Without
+  # this, a watcher that missed its window produces a Pending pod and a very
+  # convincing-looking conclusion drawn from nothing.
+  grep -q 'rewrote the initdata image' "${logf}" 2>/dev/null || {
+    warn "the ${mode} watcher never caught an initdata image — nothing was staged, so this run proves nothing"
+    return 1
+  }
+}
+
+# Kubelet's own account of the refusal. Kept separate because it is both the
+# loop's stop condition and the evidence shown afterwards, and those must agree.
+_tamper_events() {
+  kubectl get events -n "${NS}" --field-selector "involvedObject.name=$1" \
+    -o custom-columns=REASON:.reason,MESSAGE:.message --no-headers 2>/dev/null \
+    | grep -i 'sandbox' || true
+}
+
+live_binding_experiment() {
+  # Distinct pod names per run, deliberately. Events outlive the pod they
+  # describe, so reusing one name lets the flip run's failure events answer for
+  # the control run -- or, worse, a previous demo's events answer for this one.
+  demo_pod_yaml demo-tampered '"sleep", "3600"'
+  demo_pod_yaml demo-control  '"sleep", "3600"'
+
+  _tamper_run flip demo-tampered refused || return 0
+  show "the host stamped one policy and served another — same sandbox, one token apart" \
+    "cat ${WORK}/tamper-flip.log"
+  show "and the pod never ran — this is kubelet's account, from outside the guest" \
+    "kubectl get pod demo-tampered -n ${NS} -o custom-columns=NAME:.metadata.name,STATUS:.status.phase --no-headers; kubectl get events -n ${NS} --field-selector involvedObject.name=demo-tampered -o custom-columns=REASON:.reason,MESSAGE:.message --no-headers | grep -i sandbox | cut -c1-150 | head -2"
+  if [[ "${_TAMPER_PHASE}" = "Running" ]]; then
+    warn "the pod reached Running under a swapped policy — that is the failure this act exists to catch"
+  else
+    ok "phase=${_TAMPER_PHASE:-Pending} — the guest refused a policy it had not been launched with"
+  fi
+  kubectl delete pod demo-tampered -n "${NS}" --ignore-not-found >/dev/null 2>&1 || true
+  say <<'EOF'
+
+  Kubelet keeps retrying and the watcher keeps rewriting, so the pod never gets
+  a sandbox at all. But on its own that is not yet proof: a pod that fails to
+  start is just as well explained by us having corrupted the image. So run the
+  experiment again with the manipulation neutered — re-compress the document
+  instead of editing it. Different bytes on disk, identical digest. It is a
+  second pod, so it has its own policy and its own measurement; what is held
+  constant is the rewrite itself.
+EOF
+  pause
+
+  _tamper_run control demo-control running || return 0
+  show "same rewrite, same code path — only the content is unchanged" \
+    "cat ${WORK}/tamper-control.log"
+  show "and this time the pod is up" \
+    "kubectl get pod demo-control -n ${NS} -o custom-columns=NAME:.metadata.name,STATUS:.status.phase --no-headers"
+  if [[ "${_TAMPER_PHASE}" = "Running" ]]; then
+    ok "phase=Running — rewriting the image is not what refused the pod; the digest is"
+  else
+    warn "the control did not reach Running (phase=${_TAMPER_PHASE:-unknown}) — the flip result above is inconclusive"
+  fi
+  kubectl delete pod demo-control -n "${NS}" --ignore-not-found >/dev/null 2>&1 || true
+  say <<'EOF'
+
+  Two runs, one variable. The guest will not enforce a policy other than the one
+  named in its own launch measurement — so an SNP report cannot lie about which
+  policy is in force. Note what this does *not* claim: a host is free to launch a
+  CVM under any policy it likes, stamping that policy's digest honestly. Catching
+  that is attestation's job, and it can do it precisely because the digest in the
+  report is trustworthy.
+EOF
+  scene
+}
+
 # The measured document itself, straight out of the pod spec.
 INITDATA_JSONPATH='{.metadata.annotations.io\.katacontainers\.config\.hypervisor\.cc_init_data}'
 decode_initdata() {
@@ -364,13 +481,28 @@ EOF
     "kubectl get pod demo-a -n ${NS} -o jsonpath='${INITDATA_JSONPATH}' | base64 -d | gunzip | head -5"
   say <<'EOF'
 
-  That is the whole shape of it. Two header fields, then a [data] table with a
-  single key: "policy.rego", whose value is the entire generated policy —
-  everything below that line. Nothing else is in the document, so "the
-  measurement covers the policy" is not a figure of speech; the document *is*
-  the policy. Note algorithm = 'sha256': that is how its digest gets computed
-  in a moment.
+  Initdata is not a policy file. It is a small envelope: two header fields, then
+  a [data] table of named documents. What makes it interesting is that the
+  digest is taken over the whole envelope — so whatever is in the table is
+  measured, not just the policy.
 EOF
+  pause
+  show "so ask the document what it actually carries — the header, and every key in the table" \
+    "grep -nE '^(version|algorithm) = |^\[data\]|^\"[^\"]+\" = ' ${WORK}/a.toml; grep -c . ${WORK}/a.toml | xargs -I{} echo \"whole document: {} lines\""
+  say <<'EOF'
+
+  One entry for this pod: "policy.rego", holding the entire generated policy. So
+  here the document effectively *is* the policy — but that is this pod's
+  content, not the format's limit. The agent recognizes four keys, and act 4
+  uses a second one: the fragment issuer allow-list travels as its own entry in
+  this same table, which is what lets that act call the trust root "measured"
+  without putting it in the policy.
+
+  Note algorithm = 'sha256'. That is how the digest gets computed in a moment.
+EOF
+  pause
+  show "the keys the guest will look for, from the agent's own source" \
+    "grep -n 'const [A-Z_]*KEY: &str' ${E2E_REPO_DIR}/src/agent/src/initdata.rs"
   pause
   show "and the fragment machinery rides inside it — declared empty for this pod, and fail-closed" \
     "grep -c . ${WORK}/a.toml | xargs -I{} echo 'policy lines: {}'; grep -nE '^default policy_fragments := \[\]|\"fragments\": \[\]|\"image_layer_verification\": \"[a-z-]*\"' ${WORK}/a.toml"
@@ -431,10 +563,31 @@ EOF
   measurement it was launched with — because that is the case an attacker
   actually needs: keep the attested measurement, swap the policy.
 
-  We cannot stage that against live hardware — it would mean lying to the
-  hardware about a launch that already happened. What we can do is drive the
-  same verification path the agent runs at boot, against a fake TEE tree, and
-  watch it refuse.
+  That opening is real, and it needs no trickery beyond being the host. The
+  runtime does two independent things with the document: it hashes it for the
+  launch, and it separately writes it into a block image the guest reads.
+  Nothing re-checks that the second still matches the first.
+EOF
+  pause
+  show "the digest and the delivered document are produced independently" \
+    "grep -n -E 'let initdata_digest = match|initdata_block::push_data|host_data: init_data' ${E2E_REPO_DIR}/src/runtime-rs/crates/runtimes/virt_container/src/sandbox.rs"
+  say <<'EOF'
+
+  So we can stage the attack for real, on this hardware, with no lie told to the
+  hardware at all: let the runtime stamp the honest digest, then rewrite the
+  image before the guest reads it. What we serve is the same policy with one
+  token changed — AllowRequestsFailingPolicy from false to true, which rules.rego
+  itself labels an unsecure configuration. It disables every rule at once and
+  leaves every dm-verity root hash intact, so nothing else in the guest has
+  cause to object.
+EOF
+  pause
+  live_binding_experiment
+  say <<'EOF'
+
+  What the experiment cannot show is the edges — the cases that never arise on a
+  healthy node. Those the agent's own tests cover, driving the same check
+  against a synthetic TEE tree.
 EOF
   pause
   show "the agent's own binding check, exercised in both directions" \
@@ -480,12 +633,12 @@ EOF
   No log, no port, no debug console, no tracing — and the host cannot re-enable
   any of them, because those settings arrive on the kernel command line and this
   build refuses to honor them. Note what that costs us right here: the demo
-  would be more satisfying if the guest could just tell us. It does not, and it
-  should not.
+  would be more satisfying if the guest could just say "digest mismatch". It
+  does not, and it should not.
 
-  So the evidence is not a line of output. It is that the pod reached Running at
-  all. Had the delivered document not hashed to HOST_DATA, the agent would have
-  aborted and there would be nothing to look at.
+  So the evidence is never a line of output from inside the guest. It is which
+  pods ran: the honest one reached Running, and the one handed a policy it was
+  not launched with never got a sandbox at all.
 EOF
   pause
 }
