@@ -271,13 +271,13 @@ gen_policy_for() {
 gen_policy_shown() {
   local name="$1"
   show "the input is an ordinary pod spec — no policy, no annotations, nothing measured yet" \
-    "cat ${WORK}/${name}.yaml"
+    "awk '{ l = \$0; if (l ~ /runtimeClassName:/) l = l \"        <-- act 0'\"'\"'s runtime class\"; print l }' ${WORK}/${name}.yaml"
   show "generate the policy for this exact pod spec — genpolicy rewrites that file in place" \
     "${GENPOLICY} -y ${WORK}/${name}.yaml -p ${GP_RULES} -j ${GP_SETTINGS} && grep -c . ${WORK}/${name}.yaml | xargs -I{} echo \"${name}.yaml is now {} lines\""
   grep -q 'cc_init_data' "${WORK}/${name}.yaml" \
     || die "no cc_init_data annotation — genpolicy did not inject a measured policy"
-  show "and this is what it added: the same spec, now carrying the policy it derived" \
-    "awk '{ l = \$0; if (length(l) > 78) l = substr(l,1,78) \"...\"; if (l ~ /runtimeClassName:/) l = l \"        <-- act 0'\"'\"'s runtime class\"; else if (l ~ /cc_init_data:/) l = l \"   <-- the measured policy\"; print l }' ${WORK}/${name}.yaml"
+  show "and this is what it added: the same spec, now carrying one new annotation" \
+    "awk '{ l = \$0; if (length(l) > 78) l = substr(l,1,78) \"...\"; if (l ~ /cc_init_data:/) l = l \"   <-- the measured policy\"; print l }' ${WORK}/${name}.yaml"
 }
 
 start_demo_pod() {
@@ -345,8 +345,6 @@ ensure_policy_toolchain() {
 # something the audience can follow rather than something we assert.
 show_sandbox_backing() {
   local name="$1"
-  show "the pod asked for the confidential runtime class from act 0, and the node honored it" \
-    "kubectl get pod ${name} -n ${NS} -o custom-columns=NAME:.metadata.name,RUNTIMECLASS:.spec.runtimeClassName,STATUS:.status.phase,NODE:.spec.nodeName"
 
   local sid
   sid=$(sudo crictl pods --name "${name}" --state Ready -o json 2>/dev/null | jq -r '.items[0].id // empty')
@@ -473,19 +471,13 @@ live_binding_experiment() {
 
   Kubelet keeps retrying and the watcher keeps rewriting, so the pod never gets
   a sandbox at all. But on its own that is not yet proof: a pod that fails to
-  start is just as well explained by us having corrupted the image. So run the
-  experiment again with the manipulation neutered — re-compress the document
-  instead of editing it. Different bytes on disk, identical digest. It is a
-  second pod, so it has its own policy and its own measurement; what is held
-  constant is the rewrite itself.
+  start is just as well explained by us having corrupted the image. So run it
+  again with the manipulation neutered — re-compress the document instead of
+  editing it. Different bytes on disk, identical digest.
 EOF
   pause
 
   _tamper_run control demo-control running || return 0
-  show "same rewrite, same code path — only the content is unchanged" \
-    "cat ${WORK}/tamper-control.log"
-  show "and this time the pod is up" \
-    "kubectl get pod demo-control -n ${NS} -o custom-columns=NAME:.metadata.name,STATUS:.status.phase --no-headers"
   if [[ "${_TAMPER_PHASE}" = "Running" ]]; then
     ok "phase=Running — rewriting the image is not what refused the pod; the digest is"
   else
@@ -494,13 +486,23 @@ EOF
   kubectl delete pod demo-control -n "${NS}" --ignore-not-found >/dev/null 2>&1 || true
   say <<'EOF'
 
-  Two runs, one variable. The guest will not enforce a policy other than the one
-  named in its own launch measurement — so an SNP report cannot lie about which
-  policy is in force. Note what this does *not* claim: a host is free to launch a
-  CVM under any policy it likes, stamping that policy's digest honestly. Catching
-  that is attestation's job, and it can do it precisely because the digest in the
+  Two runs, one variable. Same watcher, same rewrite, same code path — only the
+  content differed, and only the edited one was refused. So the guest will not
+  enforce a policy other than the one named in its own launch measurement, and
+  an SNP report cannot lie about which policy is in force.
+
+  And the refusal is fatal, not a warning. On a mismatch the agent records the
+  reason and calls process::abort(); it is pid 1 in that guest, so aborting it
+  takes the VM with it. There is no degraded mode in which the workload runs
+  under a policy that was never measured — which is why the evidence here is
+  which pods ran, rather than any message from inside the guest.
+
+  Note what this does *not* claim: a host is free to launch a CVM under any
+  policy it likes, stamping that policy's digest honestly. Catching that is
+  attestation's job, and it can do it precisely because the digest in the
   report is trustworthy.
 EOF
+  pause
   scene
 }
 
@@ -570,9 +572,12 @@ EOF
   local cfg; cfg=$(runtime_config_path)
   say <<'EOF'
 
-  Nothing so far says which pods get any of this. That is what a runtime class
-  is: a name a pod asks for, which containerd resolves to a shim of its own
-  rather than the default one.
+  On top of that hardware this node runs an ordinary Kubernetes with containerd
+  — nothing bespoke, and nothing that knows about confidential computing by
+  default. So nothing so far says which pods get any of this.
+
+  That is what a runtime class is: a name a pod asks for, which containerd
+  resolves to a shim of its own rather than the default one.
 EOF
   show "workloads opt into this stack by name — the runtime class the rest of this demo uses" \
     "kubectl get runtimeclass ${E2E_RUNTIMECLASS}"
@@ -599,7 +604,23 @@ act1() {
   # understanding on its own, and a running pod would only add the question of
   # whether what we are reading is what the pod got.
   decode_initdata_yaml "${WORK}/demo-a.yaml" "${WORK}/a-pre.toml"
-  show "open that annotation — it is base64 of gzip, and it decodes to a TOML document" \
+  show "that annotation is a document in transport form — base64 of gzip" \
+    "B=\$(sed -n 's/^[[:space:]]*io\.katacontainers\.config\.hypervisor\.cc_init_data: //p' ${WORK}/demo-a.yaml); echo \"annotation      : \${#B} base64 characters\"; echo \"gzip payload    : \$(echo \"\${B}\" | base64 -d | wc -c) bytes\"; echo \"decoded document: \$(echo \"\${B}\" | base64 -d | gunzip | wc -c) bytes\""
+  say <<'EOF'
+
+  The encoding is transport, and that is all. The host decodes it on the way in
+  (kata-types annotations/mod.rs, add_hypervisor_initdata_overrides), and
+  everything downstream — the digest it stamps into the hardware report, the
+  document it serves the guest — is computed from that decoded text, not from
+  these bytes. Re-compress it differently and nothing moves; the experiment at
+  the end of this act does exactly that, deliberately.
+
+  Nor is it trusted for being an annotation. It arrives in the pod spec, which
+  the host controls, and the runtime only looks at it because this confidential
+  configuration opts in to that annotation by name.
+EOF
+  pause
+  show "so decode it — those 150 kilobytes are TOML, and the format has a name: initdata" \
     "head -5 ${WORK}/a-pre.toml"
   say <<'EOF'
 
@@ -622,7 +643,7 @@ EOF
   Note algorithm = 'sha256'. That is how the digest gets computed later in this
   act.
 EOF
-  show "and that entry has a shape of its own — one rule per request the agent can be asked to serve" \
+  show "and that one entry, policy.rego, has a shape of its own — one rule per request the agent can be asked to serve" \
     "grep -E '^default [A-Za-z]+Request' ${WORK}/a-pre.toml | head -12; echo; grep -cE '^default ' ${WORK}/a-pre.toml | xargs -I{} echo \"{} default rules in all — the guest's whole API surface, each answered before it is asked\""
   say <<'EOF'
 
@@ -634,32 +655,18 @@ EOF
   So the policy is not a document the pod author wrote and the guest is asked to
   trust. It is derived from this exact spec, and it rides back in the spec.
 
-  What happens next: applying that file boots a fresh CVM whose measurement is
-  fixed by that annotation before the guest runs a single instruction. Then we
-  follow it all the way into the hardware report — where a disagreement is
-  refused, not reported.
+  What happens next: applying that pod spec, with its initdata annotation, boots
+  a fresh CVM whose measurement is fixed by that annotation before the guest
+  runs a single instruction. Then we follow it all the way into the hardware
+  report — where a disagreement is refused, not reported.
 EOF
   pause
   start_demo_pod demo-a
 
-  show "and it reached the pod now running — one annotation, measured three ways" \
-    "B=\$(kubectl get pod demo-a -n ${NS} -o jsonpath='${INITDATA_JSONPATH}'); echo \"annotation      : \${#B} base64 characters\"; echo \"gzip payload    : \$(echo \"\${B}\" | base64 -d | wc -c) bytes\"; echo \"decoded document: \$(echo \"\${B}\" | base64 -d | gunzip | wc -c) bytes of TOML\""
   say <<'EOF'
 
-  The encoding is transport, and that is all. The host decodes it on the way in
-  (kata-types annotations/mod.rs, add_hypervisor_initdata_overrides), and
-  everything downstream — the digest it stamps into the hardware report, the
-  document it serves the guest — is computed from that decoded text, not from
-  these bytes. Re-compress it differently and nothing moves; the experiment at
-  the end of this act does exactly that, deliberately.
-
-  Nor is it trusted for being an annotation. It arrives in the pod spec, which
-  the host controls, and the runtime only looks at it because this confidential
-  configuration opts in to that annotation by name.
-
-  Before following the document into the hardware, though, it is worth
-  establishing what just booted — a pod is only as confidential as the sandbox
-  underneath it.
+  Before following the document into the hardware, it is worth establishing what
+  just booted — a pod is only as confidential as the sandbox underneath it.
 EOF
   show_sandbox_backing demo-a
 
@@ -688,11 +695,12 @@ EOF
   fi
   say <<'EOF'
 
-  Now the point of the whole exercise. The workload here is the container's
-  command, and we change one byte of it — sleep 3600 becomes sleep 3601. That
-  is the entire difference: same image, same everything else. The measurement
-  moves anyway, because the command is part of the policy that gets hashed. A
-  relying party pinned to the first digest rejects the second.
+  Now the point of the whole exercise. The workload here is the command the pod
+  starts its container with, and we change one byte of it — the container's
+  startup command goes from sleep 3600 to sleep 3601. That is the entire
+  difference: same image, same everything else. The measurement moves anyway,
+  because that command is part of the policy that gets hashed. A relying party
+  pinned to the first digest rejects the second.
 EOF
   pause
 
@@ -702,7 +710,7 @@ EOF
   decode_initdata demo-b "${WORK}/b.toml"
   local d2; d2=$(initdata_digest_expected "${WORK}/b.toml")
   show "the two measurements, side by side" \
-    "printf 'sleep 3600  ->  '; openssl dgst -sha256 -binary ${WORK}/a.toml | base64; printf 'sleep 3601  ->  '; openssl dgst -sha256 -binary ${WORK}/b.toml | base64"
+    "printf 'demo-a  sleep 3600  ->  '; openssl dgst -sha256 -binary ${WORK}/a.toml | base64; printf 'demo-b  sleep 3601  ->  '; openssl dgst -sha256 -binary ${WORK}/b.toml | base64"
   if [[ -z "${d1}" || -z "${d2}" ]]; then
     warn "could not compute both digests"
   elif [[ "${d1}" = "${d2}" ]]; then
@@ -731,12 +739,12 @@ EOF
 
   That opening is real, and it needs no trickery beyond being the host. The
   runtime does two independent things with the document: it hashes it for the
-  launch, and it separately writes it into a block image the guest reads.
+  launch, and it separately writes it into a block image the guest reads. Both
+  happen in one file — runtime-rs virt_container sandbox.rs, where the digest
+  goes into host_data and the document goes through initdata_block::push_data.
   Nothing re-checks that the second still matches the first.
 EOF
   pause
-  show "the digest and the delivered document are produced independently" \
-    "grep -n -E 'let initdata_digest = match|initdata_block::push_data|host_data: init_data' ${E2E_REPO_DIR}/src/runtime-rs/crates/runtimes/virt_container/src/sandbox.rs"
   say <<'EOF'
 
   So we can stage the attack for real, on this hardware, with no lie told to the
@@ -753,63 +761,6 @@ EOF
 EOF
   pause
   live_binding_experiment
-  say <<'EOF'
-
-  What the experiment cannot show is the edges — the cases that never arise on a
-  healthy node. Those the agent's own tests cover, driving the same check
-  against a synthetic TEE tree.
-EOF
-  pause
-  show "the agent's own binding check, exercised in both directions" \
-    "cd ${E2E_REPO_DIR}/src/agent && cargo test --features strict-policy,tsm-test-override hostdata::tests::binding 2>&1 | grep -E '^test |^test result'"
-  say <<'EOF'
-
-  Four cases, and the two middle ones are the point: a matching measurement is
-  accepted, a tampered one is refused. The other two are the fail-closed edges —
-  a guest that should be able to measure but cannot is refused, while a plain
-  non-confidential VM is skipped rather than failed.
-
-  Note the feature those tests need. KATA_AGENT_TSM_ROOT can only redirect the
-  lookup when the agent is built with tsm-test-override, which no shipped image
-  enables — the agent's environment is host-influenced, so a host that could set
-  that variable could point the check at a tree it controls.
-EOF
-  pause
-  show "and a mismatch is fatal, not a warning — the agent aborts the VM" \
-    "grep -n -B2 -A2 'initdata does not match the launch measurement, aborting VM' ${E2E_REPO_DIR}/src/agent/src/main.rs; grep -n -A4 'async fn fatal_abort' ${E2E_REPO_DIR}/src/agent/src/main.rs"
-  say <<'EOF'
-
-  fatal_abort records the reason and calls process::abort(). The agent is pid 1
-  in that guest, so aborting it takes the VM with it: there is no degraded mode
-  in which the workload runs under a policy that was never measured.
-EOF
-  scene
-  say <<'EOF'
-
-  Which raises the obvious question: can we watch the guest do that check —
-  print the value it saw? We cannot, and the reason is worth more than the
-  number would be. This build closes every channel that could carry it out.
-EOF
-  pause
-  show "the agent's log stream is wired to a sink — a strict build forwards nothing" \
-    "grep -n -B4 'Box::new(tokio::io::sink())' ${E2E_REPO_DIR}/src/agent/src/main.rs"
-  show "and it cannot even construct a vsock listener: the socket import is compiled out" \
-    "grep -n -B1 'use nix::sys::socket' ${E2E_REPO_DIR}/src/agent/src/main.rs"
-  show "nor can the host ask for it back — the guest overrides what it is told" \
-    "grep -n -A6 '\*debug_console = false;' ${E2E_REPO_DIR}/src/agent/src/config.rs"
-  say <<'EOF'
-
-  No log, no port, no debug console, no tracing — and the host cannot re-enable
-  any of them, because those settings arrive on the kernel command line and this
-  build refuses to honor them. Note what that costs us right here: the demo
-  would be more satisfying if the guest could just say "digest mismatch". It
-  does not, and it should not.
-
-  So the evidence is never a line of output from inside the guest. It is which
-  pods ran: the honest one reached Running, and the one handed a policy it was
-  not launched with never got a sandbox at all.
-EOF
-  pause
 }
 
 # ============================================================ act 2
@@ -841,8 +792,8 @@ EOF
   grep -oE 'X-kata\.dmverity\.roothash=[a-f0-9]{64}' "${WORK}/a.toml" \
     | cut -d= -f2 | sort -u > "${WORK}/policy-hashes.txt"
 
-  show "count both sides — the layers this host built, and the hashes the policy names" \
-    "wc -l ${WORK}/host-hashes.txt ${WORK}/policy-hashes.txt"
+  show "so put the two sets side by side — the layers this host built, and the hashes the policy names" \
+    "paste -d' ' ${WORK}/host-hashes.txt ${WORK}/policy-hashes.txt | awk '{ printf \"%s  %s  %s\\n\", substr(\$1,1,32), (\$1==\$2 ? \"==\" : \"!=\"), substr(\$2,1,32) }'; echo; diff -q ${WORK}/host-hashes.txt ${WORK}/policy-hashes.txt >/dev/null && echo 'the two sets are identical — every layer, every hash' || echo 'THE TWO SETS DIFFER'"
   local matched missing
   matched=$(comm -12 "${WORK}/host-hashes.txt" "${WORK}/policy-hashes.txt" | wc -l)
   missing=$(comm -13 "${WORK}/host-hashes.txt" "${WORK}/policy-hashes.txt" | wc -l)
@@ -864,6 +815,7 @@ EOF
   erofs-utils — which is why the policy can be generated anywhere, and why the
   match above is a result rather than a copy.
 EOF
+  pause
   scene
 
   show "note where the verity device is NOT: the host has no dm devices at all" \
@@ -886,11 +838,20 @@ act3() {
     ensure_policy_toolchain
     demo_pod_yaml demo-a '"sleep", "3600"'; start_demo_pod demo-a
   }
+  [[ -s "${WORK}/a.toml" ]] || decode_initdata demo-a "${WORK}/a.toml"
 
   say <<'EOF'
 
-  Nothing in the generated policy permits an exec. So the agent refuses one —
-  and the refusal is not a string, it is a structured object.
+  Back to act 1's 50 default rules: every request the agent can serve starts at
+  false, and genpolicy only turns on the ones this pod's spec justifies. Nobody
+  asked to exec into this pod, so ExecProcessRequest was never turned on.
+EOF
+  show "the rule that decides it, in this pod's own measured policy" \
+    "grep -nE '^default ExecProcessRequest' ${WORK}/a.toml; grep -cE '^ExecProcessRequest' ${WORK}/a.toml | xargs -I{} echo '{} conditional rules could turn it on — this exec matched none of them'"
+  say <<'EOF'
+
+  So the agent refuses — and the refusal is not a string, it is a structured
+  object.
 EOF
   local out
   out=$(kubectl exec -n "${NS}" demo-a -- /bin/true 2>&1) && die "exec SUCCEEDED — policy is not being enforced"
@@ -913,6 +874,7 @@ EOF
   record cannot become an exfil channel. And failed_rule names only the
   endpoint — "reasons" is what actually attributes the denial.
 EOF
+    pause
   else
     warn "no decision object in the error text — expected the policyDecision sentinel"
   fi
@@ -961,8 +923,9 @@ act4() {
   say <<'EOF'
 
   A measured policy is fixed at launch. Fragments are how it is extended
-  afterwards without unmeasuring it: signed by an issuer the measured document
-  already named, and bounded by what that document already permits.
+  afterwards without invalidating that measurement: the launch digest never
+  moves, and the extension is signed by an issuer the measured document already
+  named and bounded by what that document already permits.
 EOF
   pause
   DEMO_PAUSE="${DEMO_PAUSE:-0}" bash "$(dirname "${BASH_SOURCE[0]}")/demo-fragment-sidecar.sh"

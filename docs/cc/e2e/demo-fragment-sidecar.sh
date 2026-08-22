@@ -586,6 +586,13 @@ wait_for 300 "sidecar ready" container_ready sidecar
 ok "both containers running — the fragment authorized a container the measured policy never contained"
 kubectl get pod "${POD}" -n "${NS}"
 kubectl logs "${POD}" -n "${NS}" -c sidecar 2>/dev/null | head -1 || true
+say <<'EOF'
+
+  Nothing here is specific to a sidecar injected after the fact. The same holds
+  for an ordinary multi-container pod: whatever the measured policy does not
+  already contain has to arrive as a signed fragment, or not at all.
+EOF
+pause
 scene
 
 # ---------------------------------------------------------------------------
