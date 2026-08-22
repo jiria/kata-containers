@@ -48,21 +48,50 @@ _demo_clear() {
 # `|| true` matters: this script runs under `set -e`, and _demo_clear returns
 # non-zero whenever clearing is off (piped runs, DEMO_PAUSE=0). Without it the
 # whole script exits silently at the first heading.
-step() { _CUR_STEP="$*"; _demo_clear || true; _lib_step "$@"; }
+step() { _CUR_STEP="$*"; _demo_clear || true; _lib_step "$@"; _vo "$*"; }
 
 # A heading that deliberately does not clear: use it when the section reads the
 # evidence still on screen. The closing summary refers to the pod that step 4
 # just brought up, so wiping it first would leave the summary unsupported.
-heading() { _CUR_STEP="$*"; _lib_step "$@"; }
+heading() { _CUR_STEP="$*"; _lib_step "$@"; _vo "$*"; }
+
+# Narration, mirroring demo.sh: prose can be suppressed for a live voice-over
+# (DEMO_NARRATE=0) and captured to a plain-text script (DEMO_SCRIPT), while the
+# commands and their output are always shown.
+_HOST_LABEL="$(whoami)@$(hostname -s 2>/dev/null || echo host)"
+
+_vo() {
+  [[ -n "${DEMO_SCRIPT:-}" ]] || return 0
+  printf '%s\n' "$*" >> "${DEMO_SCRIPT}"
+  return 0
+}
+
+say() {
+  local line para=""
+  while IFS= read -r line; do
+    [[ "${DEMO_NARRATE:-1}" = "1" ]] && printf '%s\n' "${line}"
+    if [[ -z "${line//[[:space:]]/}" ]]; then
+      [[ -n "${para}" ]] && _vo "${para}"
+      para=""
+    else
+      line="${line#"${line%%[![:space:]]*}"}"
+      para="${para:+${para} }${line%"${line##*[![:space:]]}"}"
+    fi
+  done
+  [[ -n "${para}" ]] && _vo "${para}"
+  return 0
+}
 
 # Same contract as demo.sh's: state the claim, then show the command that
 # substantiates it. Duplicated rather than shared because each demo script has
 # to stand on its own when run directly.
 show() {
   local desc="$1"; shift
-  printf '\n  %s->%s %s\n' "${_c_blu}" "${_c_off}" "${desc}"
-  printf '     %s$ %s%s\n' "${_c_yel}" "$*" "${_c_off}"
-  bash -c "$*" 2>&1 | sed 's/^/     /'
+  _vo "${desc}"
+  [[ "${DEMO_NARRATE:-1}" = "1" ]] && printf '\n  %s->%s %s\n' "${_c_blu}" "${_c_off}" "${desc}"
+  printf '\n     %s[%s]$ %s%s\n' "${_c_yel}" "${_HOST_LABEL}" "$*" "${_c_off}"
+  bash -c "$*" 2>&1 | sed 's/^/     | /'
+  return 0
 }
 
 NS="${E2E_NS:-coco-e2e}"
@@ -222,7 +251,7 @@ show "the refusal is a pod event written by kubelet, relaying the shim's error" 
   "kubectl get events -n ${NS} --field-selector involvedObject.name=${POD} -o jsonpath='{range .items[*]}{.source.component}{\" -> \"}{.message}{\"\\n\"}{end}' 2>/dev/null | grep -m1 'blocked by policy' | cut -c1-240"
 show "and this is the sentence the guest itself produced" \
   "kubectl get events -n ${NS} --field-selector involvedObject.name=${POD} -o jsonpath='{range .items[*]}{.message}{\"\\n\"}{end}' 2>/dev/null | grep -o 'blocked by policy[^\\\\]*' | head -1 | cut -c1-200"
-cat <<'EOF'
+say <<'EOF'
 
   Worth being clear about where that sentence comes from, because it reaches the
   screen through the host and the host is not trusted. The framing -- "<endpoint>
@@ -318,7 +347,7 @@ kubectl get pod "${POD}" -n "${NS}"
 kubectl logs "${POD}" -n "${NS}" -c sidecar 2>/dev/null | head -1 || true
 
 heading "what just happened"
-cat <<EOF
+say <<EOF
   step 2 and step 4 run the same image, the same command, the same pod.
   The difference is a signed, versioned artifact fetched from a registry by the
   host and verified inside the guest before it can authorize anything:

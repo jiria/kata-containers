@@ -54,6 +54,11 @@
 #   DEMO_CLEAR=0     keep the screen when paused (default: clear between beats,
 #                    redrawing the act heading; scrollback is preserved)
 #   DEMO_ACTS=0,2    run only these acts (default: 0,1,2,3,4)
+#   DEMO_NARRATE=0   suppress the written prose, leaving only the headings,
+#                    commands and their output — for narrating live over the top
+#   DEMO_SCRIPT=path write the spoken script to this file as well, one line per
+#                    beat, for generating a voice-over track. Works with the
+#                    prose on or off; the file is truncated at startup.
 #   DEMO_PREP=1      do the slow work and exit — build genpolicy, warm the image
 #                    pull, then stop. Run this *before* the demo: otherwise act 1
 #                    pays ~70s to compile genpolicy while the audience watches.
@@ -84,12 +89,12 @@ _demo_clear() {
   printf '\033[H\033[2J'
 }
 
-step() { _CUR_STEP="$*"; _demo_clear; _lib_step "$@"; }
+step() { _CUR_STEP="$*"; _demo_clear; _lib_step "$@"; _vo "$*"; }
 
 # A heading that deliberately does not clear: for a section that reads the
 # evidence still on screen. The closing summary sums up the act that just ran,
 # so wiping it first would leave the summary unsupported.
-heading() { _CUR_STEP="$*"; _lib_step "$@"; }
+heading() { _CUR_STEP="$*"; _lib_step "$@"; _vo "$*"; }
 
 NS="${E2E_NS:-coco-e2e}"
 ACTS="${DEMO_ACTS:-0,1,2,3,4}"
@@ -114,14 +119,55 @@ scene() {
 
 want_act() { [[ ",${ACTS}," == *",$1,"* ]]; }
 
+# ------------------------------------------------------------------- narration
+# The prose is separable from the evidence. A presenter narrating live wants the
+# commands and their output on screen but not a wall of text competing with what
+# they are saying, and a recorded version wants that same prose as an audio
+# track. So every spoken line goes through one place: it can be suppressed on
+# screen (DEMO_NARRATE=0) and it can be captured to a plain-text script
+# (DEMO_SCRIPT=path), one line per spoken beat, ready for a TTS pass.
+#
+# The evidence itself is never suppressed — with the prose gone the commands have
+# to carry the explanation, which is why they are shown with the host they run on
+# and their output is bracketed rather than left to run into the next beat.
+_HOST_LABEL="$(whoami)@$(hostname -s 2>/dev/null || echo host)"
+
+_vo() {
+  [[ -n "${DEMO_SCRIPT:-}" ]] || return 0
+  printf '%s\n' "$*" >> "${DEMO_SCRIPT}"
+}
+
+# Reads the block from stdin so the call sites stay ordinary heredocs. Wrapped
+# lines are rejoined into one line per paragraph: a TTS engine wants sentences,
+# not the 78-column layout the terminal wants.
+say() {
+  local line para=""
+  while IFS= read -r line; do
+    [[ "${DEMO_NARRATE:-1}" = "1" ]] && printf '%s\n' "${line}"
+    if [[ -z "${line//[[:space:]]/}" ]]; then
+      [[ -n "${para}" ]] && _vo "${para}"
+      para=""
+    else
+      line="${line#"${line%%[![:space:]]*}"}"
+      para="${para:+${para} }${line%"${line##*[![:space:]]}"}"
+    fi
+  done
+  [[ -n "${para}" ]] && _vo "${para}"
+  return 0
+}
+
 # Narration helper: a claim, then the command that substantiates it. Printing the
 # command matters — an audience that cannot see what produced a number has been
 # asked to take it on trust, which is the thing this whole branch is against.
+#
+# The claim is prose and follows DEMO_NARRATE; the command and its output do not.
 show() {
   local desc="$1"; shift
-  printf '\n  %s->%s %s\n' "${_c_blu}" "${_c_off}" "${desc}"
-  printf '     %s$ %s%s\n' "${_c_yel}" "$*" "${_c_off}"
-  bash -c "$*" 2>&1 | sed 's/^/     /'
+  _vo "${desc}"
+  [[ "${DEMO_NARRATE:-1}" = "1" ]] && printf '\n  %s->%s %s\n' "${_c_blu}" "${_c_off}" "${desc}"
+  printf '\n     %s[%s]$ %s%s\n' "${_c_yel}" "${_HOST_LABEL}" "$*" "${_c_off}"
+  bash -c "$*" 2>&1 | sed 's/^/     | /'
+  return 0
 }
 
 # ---------------------------------------------------------------- pod fixtures
@@ -263,7 +309,7 @@ preflight() {
 # ============================================================ act 0
 act0() {
   step "act 0 — this is a confidential host, and the guest is a real CVM"
-  cat <<'EOF'
+  say <<'EOF'
 
   MSHV plus Cloud Hypervisor with real SEV-SNP is not new work in itself — that
   path existed before, and then it was suspended. What is new is that it has
@@ -291,7 +337,7 @@ EOF
 # ============================================================ act 1
 act1() {
   step "act 1 — the policy is measured, not asserted"
-  cat <<'EOF'
+  say <<'EOF'
 
   The policy does not arrive as an annotation the guest is asked to trust. It
   arrives as a document whose digest is in the SNP report, and the guest refuses
@@ -306,7 +352,7 @@ EOF
   pause
 
   start_demo_pod demo-a
-  cat <<'EOF'
+  say <<'EOF'
 
   Before opening the document, it is worth establishing what just booted — a
   pod is only as confidential as the sandbox underneath it.
@@ -316,7 +362,7 @@ EOF
   decode_initdata demo-a "${WORK}/a.toml"
   show "that annotation is an initdata document — decode it straight out of the running pod" \
     "kubectl get pod demo-a -n ${NS} -o jsonpath='${INITDATA_JSONPATH}' | base64 -d | gunzip | head -5"
-  cat <<'EOF'
+  say <<'EOF'
 
   That is the whole shape of it. Two header fields, then a [data] table with a
   single key: "policy.rego", whose value is the entire generated policy —
@@ -343,7 +389,7 @@ EOF
   else
     warn "did not find that digest in the journal — check 'journalctl -t kata'"
   fi
-  cat <<'EOF'
+  say <<'EOF'
 
   Now the point of the whole exercise. The workload here is the container's
   command, and we change one byte of it — sleep 3600 becomes sleep 3601. That
@@ -368,7 +414,7 @@ EOF
   else
     warn "digests differ as expected, but the second was not found in the journal"
   fi
-  cat <<'EOF'
+  say <<'EOF'
 
   Worth noting what does *not* change: run this again, on this host or another,
   and the same workload yields the same digest. The measurement is a pure
@@ -378,7 +424,7 @@ EOF
   being told what to trust.
 EOF
   scene
-  cat <<'EOF'
+  say <<'EOF'
 
   A relying party rejecting the second digest is one half. The other half is
   what the guest does when the host serves a document that does not match the
@@ -393,7 +439,7 @@ EOF
   pause
   show "the agent's own binding check, exercised in both directions" \
     "cd ${E2E_REPO_DIR}/src/agent && cargo test --features strict-policy,tsm-test-override hostdata::tests::binding 2>&1 | grep -E '^test |^test result'"
-  cat <<'EOF'
+  say <<'EOF'
 
   Four cases, and the two middle ones are the point: a matching measurement is
   accepted, a tampered one is refused. The other two are the fail-closed edges —
@@ -408,14 +454,14 @@ EOF
   pause
   show "and a mismatch is fatal, not a warning — the agent aborts the VM" \
     "grep -n -B2 -A2 'initdata does not match the launch measurement, aborting VM' ${E2E_REPO_DIR}/src/agent/src/main.rs; grep -n -A4 'async fn fatal_abort' ${E2E_REPO_DIR}/src/agent/src/main.rs"
-  cat <<'EOF'
+  say <<'EOF'
 
   fatal_abort records the reason and calls process::abort(). The agent is pid 1
   in that guest, so aborting it takes the VM with it: there is no degraded mode
   in which the workload runs under a policy that was never measured.
 EOF
   scene
-  cat <<'EOF'
+  say <<'EOF'
 
   Which raises the obvious question: can we watch the guest do that check —
   print the value it saw? We cannot, and the reason is worth more than the
@@ -429,7 +475,7 @@ EOF
   pause
   show "nor can the host ask for it back — the guest overrides what it is told" \
     "grep -n -A6 '\*debug_console = false;' ${E2E_REPO_DIR}/src/agent/src/config.rs"
-  cat <<'EOF'
+  say <<'EOF'
 
   No log, no port, no debug console, no tracing — and the host cannot re-enable
   any of them, because those settings arrive on the kernel command line and this
@@ -447,7 +493,7 @@ EOF
 # ============================================================ act 2
 act2() {
   step "act 2 — the image layers are verified: EROFS + dm-verity"
-  cat <<'EOF'
+  say <<'EOF'
 
   A measured policy is only as good as its grip on what actually gets mounted.
   Here the container image layers are EROFS images produced by containerd's own
@@ -491,7 +537,7 @@ EOF
 
   show "and the policy demands verity for every layer it admits" \
     "grep -o '\"image_layer_verification\": \"[a-z-]*\"' ${WORK}/a.toml | head -1"
-  cat <<'EOF'
+  say <<'EOF'
 
   genpolicy did not read those hashes off this host. It predicted them offline,
   reproducing containerd's mkfs.erofs invocation byte-for-byte against a pinned
@@ -502,7 +548,7 @@ EOF
 
   show "note where the verity device is NOT: the host has no dm devices at all" \
     "sudo dmsetup ls 2>&1"
-  cat <<'EOF'
+  say <<'EOF'
 
   The host builds the layers and can no longer look inside them. The guest
   kernel mounts them with dm-verity and enforces the root hash on every block
@@ -521,7 +567,7 @@ act3() {
     demo_pod_yaml demo-a '"sleep", "3600"'; start_demo_pod demo-a
   }
 
-  cat <<'EOF'
+  say <<'EOF'
 
   Nothing in the generated policy permits an exec. So the agent refuses one —
   and the refusal is not a string, it is a structured object.
@@ -539,10 +585,11 @@ EOF
   local b64; b64=$(echo "${out}" | grep -o 'policyDecision<[^>]*>policyDecision' | head -1 \
     | sed 's/^policyDecision<//; s/>policyDecision$//')
   if [[ -n "${b64}" ]]; then
-    printf '\n  %s->%s decoded — this is FR-8\n' "${_c_blu}" "${_c_off}"
-    echo "${b64}" | base64 -d 2>/dev/null | jq . 2>/dev/null | sed 's/^/     /' \
-      || echo "${b64}" | base64 -d | sed 's/^/     /'
-    cat <<'EOF'
+    _vo "decoded — this is FR-8"
+    [[ "${DEMO_NARRATE:-1}" = "1" ]] && printf '\n  %s->%s decoded — this is FR-8\n' "${_c_blu}" "${_c_off}"
+    echo "${b64}" | base64 -d 2>/dev/null | jq . 2>/dev/null | sed 's/^/     | /' \
+      || echo "${b64}" | base64 -d | sed 's/^/     | /'
+    say <<'EOF'
 
   Three things to notice. The sentinel framing is fixed and machine-parseable,
   so a log consumer can lift this record straight out of containerd's logs.
@@ -555,7 +602,7 @@ EOF
   fi
   scene
 
-  cat <<'EOF'
+  say <<'EOF'
 
   Two more gates, in categories that are easy to leave open.
 EOF
@@ -563,7 +610,7 @@ EOF
     "sed -n '2535,2543p' ${E2E_REPO_DIR}/src/agent/src/rpc.rs"
   show "FR-14: network config is policy-checked and then frozen once the workload starts" \
     "grep -n 'net_phase_authorize' ${E2E_REPO_DIR}/src/agent/src/rpc.rs | head -6"
-  cat <<'EOF'
+  say <<'EOF'
 
   Network configuration is an easy channel to overlook: if a host can reach the
   network-modify path without a policy call, it can add or remove adapters,
@@ -575,7 +622,7 @@ EOF
 
   show "every RPC is classified, per build configuration — this is the strict posture, in source" \
     "sed -n '190,200p' ${E2E_REPO_DIR}/src/agent/src/mediation.rs"
-  cat <<'EOF'
+  say <<'EOF'
 
   SetPolicy is CompiledOut in a strict build — not denied, absent — and the
   fragment channel opens exactly as the policy-mutation channel closes.
@@ -595,7 +642,7 @@ act4() {
     warn "no fragment fixtures — run 06-policy-fragment-e2e.sh first; skipping act 4"
     return 0
   fi
-  cat <<'EOF'
+  say <<'EOF'
 
   A measured policy is fixed at launch. Fragments are how it is extended
   afterwards without unmeasuring it: signed by an issuer the measured document
@@ -609,6 +656,15 @@ EOF
 load_toolchain
 load_coco_env
 preflight
+
+# The voice-over script accumulates across the run, so start from empty rather
+# than appending to whatever a previous run left behind. Exported so the act 4
+# delegate writes into the same file and the script stays in demo order.
+if [[ -n "${DEMO_SCRIPT:-}" ]]; then
+  : > "${DEMO_SCRIPT}" || die "cannot write the voice-over script at ${DEMO_SCRIPT}"
+  export DEMO_SCRIPT
+fi
+export DEMO_NARRATE="${DEMO_NARRATE:-1}"
 
 # Everything slow lives here, so the demo itself only displays evidence. The
 # image pull matters as much as the genpolicy build: a cold pull happens inside
@@ -636,7 +692,7 @@ done
 
 heading "demo complete"
 if [[ "${ACTS}" == "0,1,2,3,4" ]]; then
-  cat <<'EOF'
+  say <<'EOF'
 
   What was shown, end to end: a real CVM on a confidential host; a policy whose
   digest is in the hardware report and moves with a one-byte change; image
