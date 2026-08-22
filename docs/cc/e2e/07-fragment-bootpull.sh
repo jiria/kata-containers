@@ -80,19 +80,13 @@ RULES_SRC="${GP_RULES}"
 # does not look like a stale file -- it looks like a working pod that cannot be
 # signalled, or a container that cannot be created -- and it is expensive to chase.
 #
-# The settings are not compared verbatim: 03 rewrites oci_version on the way in,
-# because containerd emits 1.3.0 while the branch copy still says 1.1.0 and the
-# mismatch denies every pod at CreateContainerRequest. Apply the same rewrite to
-# the branch copy before comparing, so this checks staleness and not that one
-# deliberate edit.
+# Nothing rewrites the settings on the way in any more -- what this platform
+# needs beyond the branch's defaults lives in a genpolicy-settings.d/ drop-in --
+# so both files can be compared verbatim against the branch.
 #
-# On clh-snp this assertion is skipped, and the "tautology costs nothing" reasoning
-# it used to carry was wrong. ensure_genpolicy_defaults re-stages both files from
-# the branch on every invocation there, so there is no staleness left to detect --
-# but it then applies four patches to the settings (oci_version, root_path,
-# image_layer_verification, pause_container_image), and reversing only the first
-# leaves the comparison guaranteed to fail. A check that cannot pass is worse than
-# no check, so gate it on the platform whose staging it actually describes.
+# On clh-snp the check is skipped: ensure_genpolicy_defaults stages both files
+# from the branch at the point of use, so there is no staleness left to detect
+# and the comparison would be a tautology.
 if [[ "${E2E_PLATFORM}" = "qemu-coco-dev" ]]; then
   GP_SRC="${E2E_REPO_DIR}/src/tools/genpolicy"
   have_rules=$(sudo sha256sum "${RULES_SRC}" | cut -d' ' -f1)
@@ -101,8 +95,7 @@ if [[ "${E2E_PLATFORM}" = "qemu-coco-dev" ]]; then
     || die "staged rules.rego is not the branch copy — re-run 03-deploy-cluster.sh"
 
   have_set=$(sudo sha256sum "${SETTINGS}" | cut -d' ' -f1)
-  want_set=$(sed 's/"oci_version": "1.1.0"/"oci_version": "1.3.0"/' "${GP_SRC}/genpolicy-settings.json" \
-             | sha256sum | cut -d' ' -f1)
+  want_set=$(sha256sum "${GP_SRC}/genpolicy-settings.json" | cut -d' ' -f1)
   [[ "${have_set}" = "${want_set}" ]] \
     || die "staged genpolicy-settings.json is not the branch copy — re-run 03-deploy-cluster.sh"
   ok "genpolicy inputs staged from this branch"
