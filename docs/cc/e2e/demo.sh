@@ -243,7 +243,7 @@ spec:
     supplementalGroups: [10]
   containers:
     - name: busybox
-      image: quay.io/prometheus/busybox:latest
+      image: mcr.microsoft.com/azurelinux/busybox:1.36
       command: [${cmd}]
 EOF
   # Generating a policy takes a few seconds and prints nothing. Off screen that
