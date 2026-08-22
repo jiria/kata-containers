@@ -412,7 +412,6 @@ _tamper_run() {
 
   kubectl apply -f "${WORK}/${pod}.yaml" >/dev/null || die "kubectl apply failed for ${pod}"
   log "starting pod ${pod} with the watcher armed (${mode})"
-  log "this boots a fresh SEV-SNP CVM under the rewritten image, so it is not instant"
 
   local i
   for i in $(seq 1 30); do
@@ -582,9 +581,13 @@ EOF
   local cfg; cfg=$(runtime_config_path)
   say <<'EOF'
 
-  On top of that hardware this node runs an ordinary Kubernetes with containerd
-  — nothing bespoke, and nothing that knows about confidential computing by
-  default. So nothing so far says which pods get any of this.
+  On top of that hardware this node runs an ordinary Kubernetes with containerd.
+  The control plane is stock, and nothing in it treats confidential computing as
+  a default: every pod so far is an ordinary pod on an ordinary runtime.
+
+  What has been added to this node is a shim and a VMM sitting beside the
+  default ones, plus a name that selects them. Nothing reaches them unless a pod
+  asks, so up to this point nothing says which pods get any of this.
 
   That is what a runtime class is: a name a pod asks for, which containerd
   resolves to a shim of its own rather than the default one.
@@ -760,6 +763,9 @@ EOF
   it was served is ever evaluated, so what a swapped policy *says* never gets a
   chance to matter. What is on trial here is whether the served bytes have to be
   the measured bytes.
+
+  What follows is a real pod launch: a fresh SEV-SNP CVM boots under the
+  rewritten image, so expect a wait with nothing on screen.
 EOF
   pause
   live_binding_experiment

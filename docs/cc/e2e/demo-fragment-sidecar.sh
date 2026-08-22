@@ -289,7 +289,7 @@ printf '\npolicy_fragments := [{"issuer": "%s", "feed": "%s", "minimum_svn": %s}
 # rather than from any file we wrote — a file we wrote proves nothing about what
 # the guest was launched with.
 cat > "${WORK}/policy-containers.py" <<'PY'
-import json, sys
+import json, re, sys
 policy = sys.stdin.read()
 i = policy.find("policy_data := {")
 data, _ = json.JSONDecoder().raw_decode(policy, policy.index("{", i))
@@ -298,8 +298,27 @@ for c in containers:
     ann = c.get("OCI", {}).get("Annotations", {})
     name = ann.get("io.kubernetes.cri.container-name")
     print("  permitted: %s" % (name if name else "<the sandbox's own pause container>"))
+frags = []
+m = re.search(r"^policy_fragments := \[", policy, re.M)
+if m:
+    frags, _ = json.JSONDecoder().raw_decode(policy, policy.index("[", m.start()))
+for f in frags:
+    iss = f.get("issuer") or ""
+    print("  trusted to add more: feed %s, minimum svn %s" % (f.get("feed"), f.get("minimum_svn")))
+    print("                       issuer %s" % (iss[:52] + "..." if len(iss) > 52 else iss))
 print()
-print("%d container entries in the measured policy — nothing else can be created" % len(containers))
+print("%d container entries in the measured policy%s" %
+      (len(containers),
+       " — nothing else can be created" if not frags
+       else "; the fragment declaration adds no container of its own"))
+PY
+
+# Pull the measured policy back out of a rendered pod spec, so a claim about a
+# pod's policy can be read from the document that will actually be applied.
+cat > "${WORK}/yaml-policy.py" <<'PY'
+import base64, gzip, re, sys
+blob = re.search(r'cc_init_data:\s*"?([A-Za-z0-9+/=]+)"?', open(sys.argv[1]).read())
+sys.stdout.write(gzip.decompress(base64.b64decode(blob.group(1))).decode("utf-8", "replace"))
 PY
 
 # $1 = delivery annotation, empty for none.
@@ -555,6 +574,23 @@ fi
   printf 'containers := [%s]\n' "$(cat "${WORK}/entry.json")"
 } > "${WORK}/sidecar.rego"
 show "the fragment declares" "head -4 ${WORK}/sidecar.rego"
+say <<'EOF'
+
+  The issuer and the SVN appear twice — here in the module, and again in the
+  envelope's signed header — and that is deliberate, not redundancy. The header
+  is what the Rust side checks when the fragment is admitted. But the base
+  policy also re-checks the SVN floor when it decides whether to admit a
+  container, and that decision happens inside the policy engine, which cannot
+  see a COSE header at all. So the module has to restate them in a form Rego
+  can read.
+
+  A restatement the author controls would be worthless as a gate, so before this
+  module is loaded the agent evaluates it in a throwaway engine and requires the
+  issuer and SVN it declares to equal the ones in the signed header. A module
+  that describes itself as a different fragment than the envelope it arrived in
+  is refused, and it is refused before it lands anywhere.
+EOF
+pause
 say <<EOF
 
   Note what the issuer is. Not a key fingerprint and not a name we made up — a
@@ -575,6 +611,28 @@ show "the anchor, as measured into this pod's initdata" \
   "sed -n '/\\[\\[ca_anchor\\]\\]/,/^\$/p' ${WORK}/fragment-issuers.toml"
 show "and the chain that has to satisfy it" \
   "openssl x509 -in ${WORK}/leaf.pem -noout -subject -issuer -ext extendedKeyUsage 2>/dev/null; echo; echo -n 'CA SHA-256: '; openssl x509 -in ${WORK}/ca.pem -outform DER 2>/dev/null | sha256sum | cut -d' ' -f1"
+
+say <<EOF
+
+  That module is just text; nothing about it is trustworthy yet. Two commands
+  turn it into something the guest will accept. The first wraps it in a
+  COSE_Sign1 envelope: the Rego becomes the signed payload, the issuer, feed and
+  SVN become signed headers, and the certificate chain rides along beside them.
+  The second pushes that envelope to a registry so the host can find it.
+EOF
+show "sign the module into an envelope, then publish the envelope" \
+  "echo \"sign-fragment sign --issuer ${ISSUER} \\\\\"; echo '    --feed ${SIDECAR_FEED} --svn ${SVN} \\'; echo '    --module sidecar.rego --key <issuer key> --x509-chain <leaf,ca>'; echo; echo 'fragmentgen --cose cose.hex --push ${SIDECAR_REF}'"
+say <<'EOF'
+
+  Note which side of the boundary that registry sits on. The guest never
+  fetches anything — at the point a policy is being composed it has no network
+  beyond loopback, and it needs none. The host resolves the reference, pulls
+  the bytes, and hands them in. It is a courier, not an authority: it chooses
+  which bytes to offer, and it can refuse to offer any, but every anchor used
+  to judge them was measured into the guest at launch. Withholding is the only
+  move it has left.
+EOF
+pause
 
 SIGN sign --issuer "${ISSUER}" --feed "${SIDECAR_FEED}" --svn "${SVN}" \
      --module "${WORK}/sidecar.rego" --key "${PRIV}" "${X509_ARGS[@]}" > "${WORK}/sign.txt" \
@@ -633,10 +691,19 @@ say <<'EOF'
   This is a freshly launched pod with a different measured policy, and it has to
   be. The fragment declaration is part of what gets measured, so a pod that never
   named the issuer cannot be talked into trusting one later — which is exactly
-  why step 2 failed and this will not. What the fragment adds is the sidecar
-  entry; what it cannot add is permission to be trusted in the first place.
+  why step 2 failed and this will not.
+
+  But notice what that policy does *not* contain. It has no entry for the
+  sidecar, no image, no argv — nothing describing the second container at all.
+  All it carries is a name, a signing identity and an SVN floor: permission for
+  one specific issuer to say something about one specific feed. The container
+  entry itself only ever exists inside the signed fragment. So what is measured
+  at launch is the *authority*, not the payload — which is what lets the payload
+  be written later without the launch measurement changing.
 EOF
 pause
+show "the pod's own policy still admits only what act 1's did — the sidecar is not in it" \
+  "python3 ${WORK}/yaml-policy.py ${WORK}/step4.yaml | python3 ${WORK}/policy-containers.py"
 _prompt "kubectl apply -f ${WORK}/step4.yaml"
 kubectl apply -f "${WORK}/step4.yaml"
 log "starting pod ${POD} — a fresh CVM, this time declaring the fragment"
