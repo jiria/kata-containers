@@ -240,8 +240,30 @@ spec:
       image: quay.io/prometheus/busybox:latest
       command: [${cmd}]
 EOF
+  # Generating a policy takes a few seconds and prints nothing. Off screen that
+  # is dead air in the middle of the narration; act 1 therefore shows it as a
+  # beat of its own (see gen_policy_shown) rather than hiding it here.
+  [[ "${3:-}" = "--defer" ]] && return 0
+  gen_policy_for "${name}"
+}
+
+# Run genpolicy over a pod yaml, in place. It rewrites the file, adding the
+# measured policy as an annotation.
+gen_policy_for() {
+  local name="$1"
   "${GENPOLICY}" -y "${WORK}/${name}.yaml" -p "${GP_RULES}" -j "${GP_SETTINGS}" >/dev/null \
     || die "genpolicy failed for ${name}"
+  grep -q 'cc_init_data' "${WORK}/${name}.yaml" \
+    || die "no cc_init_data annotation — genpolicy did not inject a measured policy"
+}
+
+# Same, but on screen: the command that produces the policy, and the annotation
+# it left behind. The claim in the narration is that the policy is generated for
+# this exact spec, so the generation is worth watching rather than asserting.
+gen_policy_shown() {
+  local name="$1"
+  show "generate the policy for this exact pod spec — genpolicy writes it back into the yaml" \
+    "${GENPOLICY} -y ${WORK}/${name}.yaml -p ${GP_RULES} -j ${GP_SETTINGS} && grep -c . ${WORK}/${name}.yaml | xargs -I{} echo \"${name}.yaml is now {} lines\""
   grep -q 'cc_init_data' "${WORK}/${name}.yaml" \
     || die "no cc_init_data annotation — genpolicy did not inject a measured policy"
 }
@@ -544,14 +566,15 @@ EOF
   ensure_policy_toolchain
 
   local t0; t0=$(date '+%Y-%m-%d %H:%M:%S')
-  demo_pod_yaml demo-a '"sleep", "3600"'
+  demo_pod_yaml demo-a '"sleep", "3600"' --defer
+  gen_policy_shown demo-a
   say <<'EOF'
 
-  What happens next: we apply an ordinary pod. genpolicy has already generated a
-  policy for exactly this spec and written it into the pod as an annotation, so
-  applying it boots a fresh CVM whose measurement is fixed by that annotation
-  before the guest runs a single instruction. Then we open the annotation, and
-  follow it all the way into the hardware report.
+  What happens next: we apply that pod. The policy just generated for it is now
+  in the yaml as an annotation, so applying it boots a fresh CVM whose
+  measurement is fixed by that annotation before the guest runs a single
+  instruction. Then we open the annotation, and follow it all the way into the
+  hardware report.
 EOF
   pause
   start_demo_pod demo-a
