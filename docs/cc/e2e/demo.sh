@@ -150,6 +150,18 @@ initdata_digest_in_journal() {
     | grep -qxF "${want}"
 }
 
+# Any act that may have to generate a policy needs this, not just act 1: acts
+# can be run individually, and act 2 falls back to creating its own pod. Doing
+# it once and guarding with a flag keeps a full run from paying for it twice.
+_TOOLCHAIN_READY=0
+ensure_policy_toolchain() {
+  [[ "${_TOOLCHAIN_READY}" = "1" ]] && return 0
+  ensure_branch_genpolicy
+  ensure_genpolicy_defaults
+  kubectl get ns "${NS}" >/dev/null 2>&1 || kubectl create ns "${NS}"
+  _TOOLCHAIN_READY=1
+}
+
 # The measured document itself, straight out of the pod spec.
 decode_initdata() {
   local name="$1" out="$2"
@@ -215,9 +227,7 @@ act1() {
   arrives as a document whose digest is in the SNP report, and the guest refuses
   to run if the two disagree.
 EOF
-  ensure_branch_genpolicy
-  ensure_genpolicy_defaults
-  kubectl get ns "${NS}" >/dev/null 2>&1 || kubectl create ns "${NS}"
+  ensure_policy_toolchain
 
   local t0; t0=$(date '+%Y-%m-%d %H:%M:%S')
   demo_pod_yaml demo-a '"sleep", "3600"'
@@ -288,12 +298,13 @@ act2() {
   step "act 2 — the image layers are verified: EROFS + dm-verity"
   cat <<'EOF'
 
-  hcsshim converts OCI layers to ext4 with a filesystem writer maintained inside
-  its own repository. We consume EROFS layers produced by containerd's own
-  snapshotter — the upstream-standard format. The integrity guarantee is
-  equivalent; the difference is adoption, and it is a migration argument.
+  A measured policy is only as good as its grip on what actually gets mounted.
+  Here the container image layers are EROFS images produced by containerd's own
+  snapshotter, each with a dm-verity root hash, and the policy names those exact
+  hashes — so the guest will mount a layer only if its contents hash to what the
+  measurement already committed to.
 EOF
-  [[ -s "${WORK}/a.toml" ]] || { demo_pod_yaml demo-a '"sleep", "3600"'; start_demo_pod demo-a; decode_initdata demo-a "${WORK}/a.toml"; }
+  [[ -s "${WORK}/a.toml" ]] || { ensure_policy_toolchain; demo_pod_yaml demo-a '"sleep", "3600"'; start_demo_pod demo-a; decode_initdata demo-a "${WORK}/a.toml"; }
 
   local SNAP=/var/lib/containerd/io.containerd.snapshotter.v1.erofs/snapshots
   show "containerd built each layer as an EROFS image, with verity metadata beside it" \
@@ -348,7 +359,7 @@ EOF
 act3() {
   step "act 3 — the strict gates, live"
   [[ -n "$(kubectl get pod demo-a -n "${NS}" --ignore-not-found -o name 2>/dev/null)" ]] || {
-    ensure_branch_genpolicy; ensure_genpolicy_defaults
+    ensure_policy_toolchain
     demo_pod_yaml demo-a '"sleep", "3600"'; start_demo_pod demo-a
   }
 
@@ -444,9 +455,7 @@ preflight
 # the pod-start wait in act 1, where it looks like the platform being slow.
 if [[ "${DEMO_PREP:-0}" = "1" ]]; then
   step "prep — doing the slow work now so the demo does not"
-  ensure_branch_genpolicy
-  ensure_genpolicy_defaults
-  kubectl get ns "${NS}" >/dev/null 2>&1 || kubectl create ns "${NS}"
+  ensure_policy_toolchain
   demo_pod_yaml demo-prep '"sleep", "5"'
   start_demo_pod demo-prep
   kubectl delete pod demo-prep -n "${NS}" --ignore-not-found >/dev/null 2>&1 || true
