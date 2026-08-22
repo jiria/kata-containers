@@ -5,7 +5,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # shellcheck source-path=SCRIPTDIR
-# Hand-runnable demo of the C-ACI sidecar shape: a measured base policy that pins
+# Hand-runnable demo of the sidecar shape: a measured base policy that pins
 # one workload, and a separately signed fragment that admits a second container.
 # What `pins` a container depends on the image path: dm-verity layer root hashes
 # under host-pull, image reference plus argv/env/mounts/user under guest-pull.
@@ -181,7 +181,7 @@ kubectl get events -n "${NS}" --field-selector involvedObject.name="${POD}" \
   -o jsonpath='{range .items[*]}{.message}{"\n"}{end}' 2>/dev/null \
   | grep -o 'blocked by policy[^\\]*' | head -1 | cut -c1-200 || true
 log "note the pod is not dead: the sandbox and the authorized container keep running."
-log "that is the C-ACI behavior — the policy denies the request, it does not kill the pod."
+log "the policy denies the request; it does not kill the pod."
 pause
 
 # ---------------------------------------------------------------------------

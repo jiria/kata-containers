@@ -5,7 +5,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # shellcheck source-path=SCRIPTDIR
-# Hand-runnable demo of what Kata CoCo Strict adds over the C-ACI / hcsshim stack.
+# Hand-runnable demo of what Kata CoCo Strict enforces, end to end.
 #
 #   act 0  the guest is a real CVM on a confidential host
 #   act 1  the policy is measured, not asserted
@@ -376,8 +376,8 @@ EOF
   pause
 
   # The sentinel wraps the payload in angle brackets: policyDecision<...>policyDecision.
-  # It is deliberately byte-identical to the one C-ACI emits, so existing
-  # containerd-log consumers parse this record without modification.
+  # The framing is fixed and machine-parseable, so a log consumer can lift the
+  # record straight out of containerd's logs without modification.
   local b64; b64=$(echo "${out}" | grep -o 'policyDecision<[^>]*>policyDecision' | head -1 \
     | sed 's/^policyDecision<//; s/>policyDecision$//')
   if [[ -n "${b64}" ]]; then
@@ -386,11 +386,11 @@ EOF
       || echo "${b64}" | base64 -d | sed 's/^/     /'
     cat <<'EOF'
 
-  Three things to notice. The sentinel is deliberately the same one C-ACI uses,
-  so existing log consumers parse this unchanged. bound_state_keys lists field
-  *names* and never their values, so a denial record cannot become an exfil
-  channel. And failed_rule names only the endpoint — "reasons" is what actually
-  attributes the denial.
+  Three things to notice. The sentinel framing is fixed and machine-parseable,
+  so a log consumer can lift this record straight out of containerd's logs.
+  bound_state_keys lists field *names* and never their values, so a denial
+  record cannot become an exfil channel. And failed_rule names only the
+  endpoint — "reasons" is what actually attributes the denial.
 EOF
   else
     warn "no decision object in the error text — expected the policyDecision sentinel"
@@ -399,7 +399,7 @@ EOF
 
   cat <<'EOF'
 
-  Two more gates, both categories C-ACI leaves open.
+  Two more gates, in categories that are easy to leave open.
 EOF
   show "FR-10: the host-to-guest file copy channel is refused outright in strict builds" \
     "sed -n '2535,2543p' ${E2E_REPO_DIR}/src/agent/src/rpc.rs"
@@ -407,9 +407,11 @@ EOF
     "grep -n 'net_phase_authorize' ${E2E_REPO_DIR}/src/agent/src/rpc.rs | head -6"
   cat <<'EOF'
 
-  hcsshim reaches modifyNetwork with no policy call anywhere on the path, so a
-  host there can add or remove adapters, addresses and routes unchecked. Which
-  raises the obvious question: how do we know *we* have no such hole?
+  Network configuration is an easy channel to overlook: if a host can reach the
+  network-modify path without a policy call, it can add or remove adapters,
+  addresses and routes unchecked, and the measured policy says nothing about the
+  pod's connectivity. Which raises the obvious question: how do we know there is
+  no such hole anywhere else in the agent?
 EOF
   pause
 
