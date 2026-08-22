@@ -86,6 +86,11 @@ _demo_clear() {
 
 step() { _CUR_STEP="$*"; _demo_clear; _lib_step "$@"; }
 
+# A heading that deliberately does not clear: for a section that reads the
+# evidence still on screen. The closing summary sums up the act that just ran,
+# so wiping it first would leave the summary unsupported.
+heading() { _CUR_STEP="$*"; _lib_step "$@"; }
+
 NS="${E2E_NS:-coco-e2e}"
 ACTS="${DEMO_ACTS:-0,1,2,3,4}"
 WORK=$(mktemp -d)
@@ -629,7 +634,7 @@ for a in 0 1 2 3 4; do
   want_act "${a}" && "act${a}"
 done
 
-step "demo complete"
+heading "demo complete"
 if [[ "${ACTS}" == "0,1,2,3,4" ]]; then
   cat <<'EOF'
 

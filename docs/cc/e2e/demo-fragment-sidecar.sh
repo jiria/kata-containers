@@ -50,6 +50,11 @@ _demo_clear() {
 # whole script exits silently at the first heading.
 step() { _CUR_STEP="$*"; _demo_clear || true; _lib_step "$@"; }
 
+# A heading that deliberately does not clear: use it when the section reads the
+# evidence still on screen. The closing summary refers to the pod that step 4
+# just brought up, so wiping it first would leave the summary unsupported.
+heading() { _CUR_STEP="$*"; _lib_step "$@"; }
+
 # Same contract as demo.sh's: state the claim, then show the command that
 # substantiates it. Duplicated rather than shared because each demo script has
 # to stand on its own when run directly.
@@ -312,7 +317,7 @@ ok "both containers running — the fragment authorized a container the measured
 kubectl get pod "${POD}" -n "${NS}"
 kubectl logs "${POD}" -n "${NS}" -c sidecar 2>/dev/null | head -1 || true
 
-step "what just happened"
+heading "what just happened"
 cat <<EOF
   step 2 and step 4 run the same image, the same command, the same pod.
   The difference is a signed, versioned artifact fetched from a registry by the

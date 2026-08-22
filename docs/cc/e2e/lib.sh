@@ -437,8 +437,19 @@ ensure_branch_genpolicy() {
   gp_commit=$(git -C "${E2E_REPO_DIR}" rev-parse HEAD 2>/dev/null || echo unknown)
   [[ -n "$(git -C "${E2E_REPO_DIR}" status --porcelain --untracked-files=no 2>/dev/null)" ]] \
     && gp_commit="${gp_commit}-dirty"
-  sed -e "s|@COMMIT_INFO@|${gp_commit}|g" "${gp_src}/src/version.rs.in" > "${gp_src}/src/version.rs" \
-    || die "could not generate ${gp_src}/src/version.rs"
+  # Only replace version.rs when the stamp actually changed. Writing it
+  # unconditionally updates the mtime, which invalidates cargo's fingerprint and
+  # forces a full genpolicy recompile (~30s) on every single run, even though
+  # the generated content is usually identical.
+  local gp_ver="${gp_src}/src/version.rs" gp_tmp
+  gp_tmp=$(mktemp)
+  sed -e "s|@COMMIT_INFO@|${gp_commit}|g" "${gp_src}/src/version.rs.in" > "${gp_tmp}" \
+    || die "could not generate ${gp_ver}"
+  if cmp -s "${gp_tmp}" "${gp_ver}" 2>/dev/null; then
+    rm -f "${gp_tmp}"
+  else
+    mv "${gp_tmp}" "${gp_ver}" || die "could not install ${gp_ver}"
+  fi
 
   # genpolicy is a member of the root workspace (see the repo-root Cargo.toml),
   # so the artifact lands in the workspace target dir, not under src/tools.
