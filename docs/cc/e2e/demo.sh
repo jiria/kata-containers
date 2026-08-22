@@ -293,11 +293,13 @@ ensure_policy_toolchain() {
     || { cat "${logf}"; die "could not stage genpolicy inputs (see ${logf})"; }
   kubectl get ns "${NS}" >/dev/null 2>&1 || kubectl create ns "${NS}"
   _TOOLCHAIN_READY=1
-  # version.rs.in stamps the commit into the binary at build time, so the binary
-  # itself can be asked what it was built from — no rebuild, and no taking the
-  # path's word for it.
-  show "the policy is produced by this branch's own genpolicy, and the binary says so" \
-    "H=\$(git -C ${E2E_REPO_DIR} rev-parse HEAD); echo \"tree HEAD           : \${H}\"; echo \"stamped in genpolicy: \$(strings ${E2E_REPO_DIR}/target/release/genpolicy | grep -m1 -o \"\${H}[a-z-]*\")\""
+  # Provenance is checked in prep, not shown as a beat: it says something about
+  # how the demo was assembled, not about how the guest defends itself.
+  local head_sha stamp
+  head_sha=$(git -C "${E2E_REPO_DIR}" rev-parse HEAD 2>/dev/null || echo unknown)
+  stamp=$(strings "${GENPOLICY}" 2>/dev/null | grep -m1 -o "${head_sha}[a-z-]*" || true)
+  [[ -n "${stamp}" ]] \
+    || warn "genpolicy was not built from this tree's HEAD (${head_sha:0:12}) — rerun DEMO_PREP=1 ./demo.sh"
 }
 
 # Tie the pod that just booted to the CVM underneath it. The link is the sandbox
@@ -512,21 +514,19 @@ act0() {
   hardening in the acts that follow is demonstrated on real confidential
   hardware rather than under nested virt on an ordinary host.
 EOF
-  show "the node runs an MSHV Dom0 kernel, not a stock one" \
-    "uname -r"
   show "the hypervisor device is /dev/mshv; there is no /dev/sev (that is the guest's side)" \
     "ls -l /dev/mshv 2>&1; ls -l /dev/sev 2>&1 || true"
+  # Not a module on this kernel, so lsmod/modinfo say nothing. The binding is
+  # visible instead in the misc class node carrying the same major:minor as the
+  # device, and in the driver's own boot lines.
+  show "and that device belongs to the in-kernel mshv driver — same major:minor, and this is what it reported at boot" \
+    "cat /sys/class/misc/mshv/dev; sudo journalctl -k --no-pager | grep -m3 'misc mshv:'"
   scene
   local cfg; cfg=$(runtime_config_path)
-  show "the runtime is configured for an IGVM-launched SEV-SNP guest" \
+  show "the kata runtime's own configuration for this runtime class asks for an IGVM-launched SEV-SNP guest" \
     "grep -nE '^(igvm|confidential_guest|sev_snp_guest)' ${cfg}"
-  # Deliberately not a sha256sum of the IGVM file. The launch measurement is
-  # computed by the PSP over the pages and directives the file describes, not
-  # over the file's bytes, so a file digest printed here would be a number nobody
-  # could check against anything. What is checkable is that this hypervisor has
-  # SNP, and act 1 goes on to read a field out of an actual report.
-  show "and the hypervisor found SEV-SNP on this hardware at boot" \
-    "sudo journalctl -k --no-pager | grep -i 'SEV-SNP' | head -2"
+  # The SNP support lines come from the driver beat above — the same three lines
+  # say who the driver is and what the hardware offers it.
   pause
 }
 
@@ -543,30 +543,37 @@ EOF
 
   local t0; t0=$(date '+%Y-%m-%d %H:%M:%S')
   demo_pod_yaml demo-a '"sleep", "3600"'
-  local cfg; cfg=$(runtime_config_path)
-  show "the policy leaves genpolicy as a pod annotation, compressed — a policy is a large document" \
-    "grep -o 'cc_init_data: [A-Za-z0-9+/]\{0,24\}' ${WORK}/demo-a.yaml; wc -c < ${WORK}/demo-a.yaml | xargs -I{} echo 'annotated pod spec: {} bytes'"
+  say <<'EOF'
+
+  What happens next: we apply an ordinary pod. genpolicy has already generated a
+  policy for exactly this spec and written it into the pod as an annotation, so
+  applying it boots a fresh CVM whose measurement is fixed by that annotation
+  before the guest runs a single instruction. Then we open the annotation, and
+  follow it all the way into the hardware report.
+EOF
+  pause
+  start_demo_pod demo-a
+
+  show "the policy rides in the pod spec — the start of it, on the running pod, and what it is" \
+    "kubectl get pod demo-a -n ${NS} -o yaml | grep -m1 'cc_init_data:' | cut -c1-96; B=\$(kubectl get pod demo-a -n ${NS} -o jsonpath='${INITDATA_JSONPATH}'); echo; echo \"annotation      : \${#B} base64 characters\"; echo \"gzip payload    : \$(echo \"\${B}\" | base64 -d | wc -c) bytes\"; echo \"decoded document: \$(echo \"\${B}\" | base64 -d | gunzip | wc -c) bytes of TOML\""
   say <<'EOF'
 
   Be clear about what that blob is, because the encoding is the least
-  interesting thing about it. It is transport. The host decodes it on the way
-  in, and everything that follows — the digest it stamps into the hardware
-  report, the document it serves the guest — is computed from the decoded text,
-  not from these bytes. Re-compress it differently and nothing downstream moves;
-  the experiment at the end of this act does exactly that, deliberately.
+  interesting thing about it. It is transport — base64 of gzip of a TOML
+  document, and a policy is large enough to want compressing. The host decodes
+  it on the way in (kata-types annotations/mod.rs, add_hypervisor_initdata_overrides),
+  keeps the decoded text, and everything that follows — the digest it stamps
+  into the hardware report, the document it serves the guest — is computed from
+  that text, not from these bytes. Re-compress it differently and nothing
+  downstream moves; the experiment at the end of this act does exactly that,
+  deliberately.
 
   Nor is the annotation trusted for being an annotation. It arrives in the pod
   spec, which the host controls, and the runtime only looks at it because this
-  confidential configuration opts in by name.
+  confidential configuration opts in to that annotation by name.
 EOF
   pause
-  show "the runtime honors that annotation only because the config lists it" \
-    "grep -n 'enable_annotations' ${cfg}"
-  show "and what it does with it: decode first, keep the decoded text" \
-    "grep -n -A2 'KATA_ANNO_CFG_HYPERVISOR_INIT_DATA =>' ${E2E_REPO_DIR}/src/libs/kata-types/src/annotations/mod.rs; grep -n -A2 'pub fn add_hypervisor_initdata_overrides' ${E2E_REPO_DIR}/src/libs/kata-types/src/initdata.rs | tail -3"
-  pause
 
-  start_demo_pod demo-a
   say <<'EOF'
 
   Before opening the document, it is worth establishing what just booted — a
