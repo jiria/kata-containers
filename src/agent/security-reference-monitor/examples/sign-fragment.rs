@@ -402,7 +402,9 @@ fn main() {
         // FR-1d dev/verification tool: verify a did:x509 COSE fragment offline against a CA
         // fingerprint + policy, exactly as the agent would. Proves openssl-minted PKI interop.
         //   verify-x509 --issuer <did> --cose <hex> --ca-fp <sha256-hex> \
-        //       [--eku <oid>] [--revoked <sha256-hex,...>]
+        //       [--subject-cn <cn>] [--eku <oid>] [--revoked <sha256-hex,...>]
+        // The flags must describe the same anchor the DID does: a DID naming a subject CN
+        // requires --subject-cn to match, exactly as a measured anchor would.
         "verify-x509" => {
             use kata_security_reference_monitor::did_x509::{DidX509Anchor, DidX509Policy};
             use kata_security_reference_monitor::FragmentStore;
@@ -420,17 +422,25 @@ fn main() {
 
             let mut store = FragmentStore::new(false);
             store.set_require_x509(true);
-            store.authorize_did_x509(DidX509Anchor {
-                did: issuer.clone(),
-                ca_fingerprint: ca_fp,
-                policy: DidX509Policy {
-                    require_eku: f
-                        .get("eku")
-                        .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
-                        .unwrap_or_default(),
-                    ..Default::default()
-                },
-            });
+            store
+                .authorize_did_x509(DidX509Anchor {
+                    did: issuer.clone(),
+                    ca_fingerprint: ca_fp,
+                    policy: DidX509Policy {
+                        require_subject_cn: f.get("subject-cn").cloned(),
+                        require_eku: f
+                            .get("eku")
+                            .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
+                            .unwrap_or_default(),
+                        ..Default::default()
+                    },
+                })
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "--issuer/--ca-fp/--subject-cn describe an inconsistent anchor: {}",
+                        e
+                    )
+                });
             if let Some(rev) = f.get("revoked") {
                 let fps: Vec<[u8; 32]> = rev
                     .split(',')
