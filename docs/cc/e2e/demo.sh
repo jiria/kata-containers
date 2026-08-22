@@ -940,8 +940,14 @@ if [[ "${DEMO_PREP:-0}" = "1" ]]; then
   log "warming the fragment signing and publishing tools (act 4 uses both)"
   (cd "${E2E_REPO_DIR}" \
     && cargo build -q --example sign-fragment -p kata-security-reference-monitor \
+    && cargo build -q --example mock-ledger -p kata-security-reference-monitor \
     && cargo build -q -p genpolicy-fragmentgen) \
     || warn "could not pre-build the fragment tools — act 4 will compile them itself"
+  # Act 4 step 5 delivers a fragment over the sandbox's own vsock. agent-ctl is a
+  # cold build of several minutes, so it never happens during an act.
+  log "building kata-agent-ctl (act 4 delivers a fragment over ttRPC by hand)"
+  (cd "${E2E_REPO_DIR}/src/tools/agent-ctl" && cargo build --release >/dev/null 2>&1) \
+    || warn "could not build kata-agent-ctl — act 4's receipt step will refuse to start"
   demo_pod_yaml demo-prep '"sleep", "5"'
   start_demo_pod demo-prep
   kubectl delete pod demo-prep -n "${NS}" --ignore-not-found >/dev/null 2>&1 || true

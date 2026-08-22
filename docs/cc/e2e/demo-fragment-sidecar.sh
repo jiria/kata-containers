@@ -14,6 +14,9 @@
 #   2. a sidecar the policy has never seen is refused, and the pod keeps running
 #   3. the sidecar's container entry is signed into a fragment and published
 #   4. the same sidecar starts, because the delivered fragment now authorizes it
+#   5. a fragment on a receipt-required feed is delivered by hand over ttRPC:
+#      refused without a receipt, refused with one that binds other bytes,
+#      accepted with the real one
 #
 # Steps 2 and 4 differ in exactly one thing: whether the pod declares and receives
 # the fragment. Nothing about the sidecar itself changes.
@@ -30,6 +33,11 @@
 #   DEMO_PAUSE=1   wait for Enter between steps (default: run straight through)
 #   E2E_NS         namespace (default coco-e2e)
 set -euo pipefail
+
+# Same default as demo.sh, set before lib.sh derives paths from it: this script
+# is also run standalone, and lib.sh's own default is the qemu dev platform.
+: "${E2E_PLATFORM:=clh-snp}"
+export E2E_PLATFORM
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
@@ -178,19 +186,49 @@ load_toolchain 2>/dev/null || true
 # Built by DEMO_PREP=1 (demo.sh), never here: this runs mid-demo.
 GENPOLICY="${E2E_REPO_DIR}/target/release/genpolicy"
 [[ -x "${GENPOLICY}" ]] || die "genpolicy has not been built — run DEMO_PREP=1 ./demo.sh first"
+[[ -x "${E2E_REPO_DIR}/target/release/kata-agent-ctl" ]] \
+  || die "kata-agent-ctl has not been built — run DEMO_PREP=1 ./demo.sh first"
 rm -f "${_SETUP_LOG}"
 
 SIGN()    { ( cd "${E2E_REPO_DIR}" && cargo run -q --example sign-fragment \
               -p kata-security-reference-monitor -- "$@" ); }
 FRAGGEN() { ( cd "${E2E_REPO_DIR}" && cargo run -q -p genpolicy-fragmentgen -- "$@" ); }
+LEDGER()  { ( cd "${E2E_REPO_DIR}" && cargo run -q --example mock-ledger \
+              -p kata-security-reference-monitor -- "$@" ); }
+
+# Step 5 talks to the guest agent directly over the sandbox's vsock, which is the
+# host's own channel — so it needs the same tool an attacker on this node would
+# use. Built by DEMO_PREP=1, never here.
+CTL="${E2E_REPO_DIR}/target/release/kata-agent-ctl"
 
 WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
 kubectl get ns "${NS}" >/dev/null 2>&1 || kubectl create ns "${NS}" >/dev/null
 
+# FR-1f: a transparency ledger keypair for step 5. Only the public half is
+# measured into initdata; the private half never leaves this directory, and a
+# fresh one per run means nothing here is reusable as a trust anchor elsewhere.
+( umask 077; SIGN gen-key > "${WORK}/ledger.txt" ) \
+  || die "could not generate a ledger keypair"
+LEDGER_ID="e2e-ledger"
+LEDGER_PRIV=$(grep '^private_key_hex=' "${WORK}/ledger.txt" | cut -d= -f2)
+LEDGER_PUB=$(grep  '^public_key_hex='  "${WORK}/ledger.txt" | cut -d= -f2)
+[[ -n "${LEDGER_PRIV}" && -n "${LEDGER_PUB}" ]] || die "could not parse the ledger keypair"
+
+# The receipt requirement is scoped to one feed rather than switched on globally:
+# the sidecar feed above is delivered by boot-pull, which carries no receipt, and
+# the point of step 5 is that the requirement is per issuer and per feed.
+RECEIPT_FEED="${FEED}-receipt-demo"
+{
+  cat "${FRAG}/fragment-issuers.toml"
+  printf '\n[[issuer.feed]]\nname = "%s"\nmin_svn = %s\nrequired_receipt_from = ["%s"]\n' \
+    "${RECEIPT_FEED}" "${SVN}" "${LEDGER_ID}"
+  printf '\n[[ledger]]\nid = "%s"\npubkey_hex = ["%s"]\n' "${LEDGER_ID}" "${LEDGER_PUB}"
+} > "${WORK}/fragment-issuers.toml"
+
 # The issuer allow-list is measured configuration: it travels in initdata, not in
 # the policy, so the guest knows which issuers exist before any policy runs.
 printf 'version = "0.1.0"\nalgorithm = "sha256"\n\n[data]\n"fragment-issuers.toml" = %s\n%s\n%s\n' \
-  "'''" "$(cat "${FRAG}/fragment-issuers.toml")" "'''" > "${WORK}/initdata.toml"
+  "'''" "$(cat "${WORK}/fragment-issuers.toml")" "'''" > "${WORK}/initdata.toml"
 
 # Two rule files: one declaring no fragment, one declaring this fragment. The
 # declaration is part of the measured policy — a fragment cannot be trusted by a
@@ -253,6 +291,49 @@ wipe_pod() {
   done
   kubectl delete pod "${POD}" -n "${NS}" --force --grace-period=0 >/dev/null 2>&1 || true
   sleep 3
+}
+
+# --------------------------------------------------- reaching the agent directly
+# Step 5 does not go through the runtime: it opens the sandbox's own vsock and
+# speaks ttRPC to the agent, which is the channel the host already owns. Same
+# discovery as 08-lifecycle-gates.sh, kept here so this script stands alone.
+container_id() {
+  kubectl get pod "${POD}" -n "${NS}" \
+    -o jsonpath='{.status.containerStatuses[0].containerID}' 2>/dev/null \
+    | sed 's|containerd://||'
+}
+
+sandbox_id() {
+  local ct sb
+  ct=$(container_id) && [[ -n "${ct}" ]] || return 1
+  sb=$(sudo ctr -n k8s.io c info "${ct}" 2>/dev/null \
+    | sed -n 's/.*"io.kubernetes.cri.sandbox-id": "\([a-f0-9]*\)".*/\1/p' | head -1)
+  [[ -n "${sb}" ]] || return 1
+  echo "${sb}"
+}
+
+# Cloud Hypervisor has no host-visible CID: the guest is reached through a hybrid
+# vsock unix socket the shim creates per sandbox. QEMU gives a real CID instead.
+agent_addr() {
+  local sb=$1 sock cid
+  if [[ "${E2E_PLATFORM:-}" = "clh-snp" ]]; then
+    sock="/run/kata/${sb}/ch-vm.sock"
+    for _ in $(seq 1 20); do
+      sudo test -S "${sock}" && { echo "unix://${sock}"; return 0; }
+      sleep 1
+    done
+    return 1
+  fi
+  # shellcheck disable=SC2009  # the full argv is needed to sed guest-cid out of
+  cid=$(ps -ef | grep "[s]andbox-${sb}" | sed -n 's/.*guest-cid=\([0-9]*\).*/\1/p' | head -1)
+  [[ -n "${cid}" ]] || return 1
+  echo "vsock://${cid}:1024"
+}
+
+# A unix:// address is a hybrid vsock socket, not a plain domain socket, and
+# agent-ctl only treats it as one when told so.
+agent_hvsock_flag() {
+  case "$1" in unix://*) printf '%s' "--hybrid-vsock true" ;; *) printf '%s' "" ;; esac
 }
 
 # ---------------------------------------------------------------------------
@@ -392,21 +473,7 @@ say <<'EOF'
   Signature and SVN say who wrote it and how new it is. They do not say that
   anyone else ever saw it — a compromised issuer can sign a fragment for one
   victim and never publish it. That is what a transparency receipt is for, and
-  the reference monitor verifies one cryptographically rather than trusting its
-  presence.
-EOF
-show "a receipt is a ledger's countersignature over the same bytes the issuer signed" \
-  "grep -n 'pub receipt:' -A3 ${E2E_REPO_DIR}/src/agent/security-reference-monitor/src/fragments.rs | head -8"
-show "and it is checked by recomputing the ledger's Merkle root, not by reading a claim" \
-  "grep -n -A9 'pub fn verify_ccf_inclusion' ${E2E_REPO_DIR}/src/agent/security-reference-monitor/src/ccf.rs"
-show "a required receipt that is absent is a refusal, with its own error" \
-  "grep -n 'MissingReceipt' ${E2E_REPO_DIR}/src/agent/security-reference-monitor/src/fragments.rs | head -4"
-say <<'EOF'
-
-  This demo's issuer list does not require a receipt, so what you just saw is
-  the machinery rather than a live rejection — the fragment above carries none.
-  The requirement is per issuer and feed, and the tests cover both directions,
-  including a receipt that verifies against the wrong ledger.
+  step 5 makes the guest prove it verifies one rather than trusting its presence.
 EOF
 pause
 
@@ -426,6 +493,142 @@ wait_for 300 "sidecar ready" container_ready sidecar
 ok "both containers running — the fragment authorized a container the measured policy never contained"
 kubectl get pod "${POD}" -n "${NS}"
 kubectl logs "${POD}" -n "${NS}" -c sidecar 2>/dev/null | head -1 || true
+scene
+
+# ---------------------------------------------------------------------------
+step "5 — a transparency receipt, checked by the guest over the host's own channel"
+say <<EOF
+
+  Steps 1-4 went through the runtime. This one does not: it opens the sandbox's
+  vsock and speaks ttRPC to the agent directly, with kata-agent-ctl, which is the
+  same channel a compromised host already owns. Nothing here is privileged
+  access - it is the ordinary delivery path, driven by hand.
+
+  The pod that is running carries a measured issuer list with one extra rule:
+  fragments on the feed
+
+    ${RECEIPT_FEED}
+
+  must additionally carry a receipt from the ledger "${LEDGER_ID}", whose public
+  key is measured into initdata. The sidecar feed from steps 3-4 has no such
+  requirement - the scope is per issuer and per feed.
+EOF
+show "the requirement and the ledger key, as measured into this pod's initdata" \
+  "sed -n '/\\[\\[issuer.feed\\]\\]/,\$p' ${WORK}/fragment-issuers.toml"
+
+SB=$(sandbox_id) || die "could not find the sandbox for ${POD}"
+AGENT=$(agent_addr "${SB}") || die "could not work out the agent address for sandbox ${SB}"
+HV=$(agent_hvsock_flag "${AGENT}")
+show "the agent's endpoint on this node — a socket the host owns" \
+  "echo ${AGENT}; sudo ls -l ${AGENT#unix://} 2>/dev/null || true"
+
+# A second fragment, on the receipt-required feed. --emit-statement writes the
+# exact bytes the issuer signed (the COSE Sig_structure), which is what a ledger
+# records as a leaf — not the serialized envelope, or an intermediary could add
+# an unprotected header and give one signed fragment two ledger identities.
+{
+  printf 'package agent_policy.fragments["%s"]\n\n' "${RECEIPT_FEED}"
+  printf 'receipt_demo_loaded := true\n'
+} > "${WORK}/receipt.rego"
+SIGN sign --issuer "${ISSUER}" --feed "${RECEIPT_FEED}" --svn "${SVN}" \
+     --module "${WORK}/receipt.rego" --key "${PRIV}" \
+     --emit-statement "${WORK}/receipt.stmt" > "${WORK}/receipt.sign.txt" \
+  || { tail -20 "${WORK}/receipt.sign.txt"; die "signing the receipt-feed fragment failed"; }
+grep '^cose_sign1_hex=' "${WORK}/receipt.sign.txt" | cut -d= -f2 > "${WORK}/receipt.cose.hex"
+ok "signed a fragment on ${RECEIPT_FEED} at svn ${SVN}"
+
+_CTL_CMD="sudo ${CTL} -l error connect --server-address ${AGENT} ${HV} -n true -c"
+# A refusal is carried by the ttRPC status, which -l error already prints. A
+# success has no error to print, so the accepting call is run at -l info: the
+# agent's reply is then visible instead of an empty screen and a claim.
+_CTL_CMD_V="sudo ${CTL} -l info connect --server-address ${AGENT} ${HV} -n true -c"
+
+say <<'EOF'
+
+  First, deliver it with no receipt at all. The envelope is genuine: the issuer
+  signed it, the SVN is in range, the feed is one this issuer may publish.
+EOF
+show "deliver the fragment over ttRPC, receipt withheld" \
+  "${_CTL_CMD} \"LoadPolicyFragment cose=\$(cat ${WORK}/receipt.cose.hex)\" 2>&1 | tail -3"
+say <<'EOF'
+
+  Refused: FAILED_PRECONDITION / MissingReceipt. A valid issuer signature is not
+  enough on a feed that requires publication.
+EOF
+pause
+
+# The ledger records the statement and proves inclusion. --tamper flips the leaf
+# data-hash, which is the interesting negative: the receipt is signed by the real
+# ledger key and is still refused, because the root it signs no longer binds
+# these bytes.
+LEDGER prove-ccf --key "${LEDGER_PRIV}" --leaf "${WORK}/receipt.stmt" > "${WORK}/receipt.proof" \
+  || die "mock-ledger could not mint a receipt"
+LEDGER prove-ccf --key "${LEDGER_PRIV}" --leaf "${WORK}/receipt.stmt" --tamper \
+  > "${WORK}/receipt.bad.proof" || die "mock-ledger could not mint the tampered receipt"
+
+say <<'EOF'
+
+  Now record the statement in the ledger and take a receipt for it. A receipt is
+  not a stamp saying "published": it is an inclusion proof plus the ledger's
+  signature over the Merkle root that proof folds to.
+EOF
+show "the receipt as it comes off the ledger" "cat ${WORK}/receipt.proof | cut -c1-100"
+_RINSPECT="$(dirname "${BASH_SOURCE[0]}")/receipt-inspect.py"
+show "decoded, and folded back to a root the same way the guest does it" \
+  "python3 ${_RINSPECT} ${WORK}/receipt.proof --statement ${WORK}/receipt.stmt"
+say <<'EOF'
+
+  That last line is the whole mechanism. The guest does not read the data hash
+  and believe it: it hashes the statement it just verified the issuer's signature
+  over, and requires the leaf to be that hash. A receipt for some other fragment
+  folds to a root the ledger did sign, but the leaf will not match.
+EOF
+pause
+
+say <<'EOF'
+
+  So try exactly that: a receipt minted by the real ledger key, one byte
+  different in the leaf. Nothing about it is forged — the signature verifies.
+EOF
+show "what the tampered receipt binds instead" \
+  "python3 ${_RINSPECT} ${WORK}/receipt.bad.proof --statement ${WORK}/receipt.stmt | tail -4"
+show "deliver it" \
+  "${_CTL_CMD} \"LoadPolicyFragment cose=\$(cat ${WORK}/receipt.cose.hex) receipt_ledger=${LEDGER_ID} proof=${WORK}/receipt.bad.proof\" 2>&1 | tail -3"
+say <<'EOF'
+
+  Refused again, and with a different status — InvalidInclusionProof rather than
+  MissingReceipt. The two failures are distinguishable because they are
+  different checks: one is presence, the other is what the bytes bind.
+EOF
+pause
+
+say <<'EOF'
+
+  Finally the real one, unchanged from what the ledger emitted. This call is run
+  at info level, so the agent's own reply is on screen: a refusal would be a
+  ttRPC status like the two above, and an acceptance is an empty Empty.
+EOF
+show "deliver the fragment with its receipt" \
+  "${_CTL_CMD_V} \"LoadPolicyFragment cose=\$(cat ${WORK}/receipt.cose.hex) receipt_ledger=${LEDGER_ID} proof=${WORK}/receipt.proof\" 2>&1 | grep -E 'response received|RpcStatus' | tail -2"
+say <<'EOF'
+
+  And the same envelope again, receipt and all. It is now a replay, and the
+  refusal is the proof that the acceptance above was real: the guest recorded
+  this feed at SVN 2 and now requires 3, which is a statement about state it
+  only has because the fragment was admitted.
+EOF
+show "deliver it a second time" \
+  "${_CTL_CMD} \"LoadPolicyFragment cose=\$(cat ${WORK}/receipt.cose.hex) receipt_ledger=${LEDGER_ID} proof=${WORK}/receipt.proof\" 2>&1 | tail -3"
+say <<EOF
+
+  Four deliveries of the same signed fragment, over the same channel, to the
+  same running guest: refused for no receipt, refused for a receipt that binds
+  other bytes, accepted, then refused as a replay. What changed between them was
+  only what travelled alongside the envelope — and none of the receipt fields
+  are covered by the issuer's signature, which is exactly why the guest
+  recomputes them rather than reading them.
+EOF
+pause
 
 heading "what just happened"
 say <<EOF
@@ -438,7 +641,10 @@ say <<EOF
     * its SVN must be at or above the floor the policy declares
     * it may only write under its own signed feed's namespace
     * the container it admits is pinned by ${PINNED_BY}
+    * on a feed that requires one, it must also carry a transparency receipt
+      whose ledger signature covers a Merkle root that binds these exact bytes
 
-  Withhold the fragment (step 2) and the container simply never runs.
+  Withhold the fragment (step 2) and the container simply never runs. Withhold
+  the receipt (step 5) and the fragment itself is refused.
 EOF
 log "clean up with: kubectl delete pod ${POD} -n ${NS}"
