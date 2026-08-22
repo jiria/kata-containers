@@ -66,10 +66,38 @@ _vo() {
   return 0
 }
 
+# Beat numbers, so a reviewer can point at one. This runs as its own process, so
+# it carries its own prefix rather than trying to continue demo.sh's count.
+_BEAT_N=0
+_BEAT_PREFIX="${DEMO_BEAT_PREFIX:-F}"
+_beat() {
+  _BEAT_TAG=''
+  [[ "${DEMO_STEPS:-1}" = "1" ]] || return 0
+  _BEAT_N=$((_BEAT_N + 1))
+  _BEAT_TAG=$(printf '[%s%02d]' "${_BEAT_PREFIX}" "${_BEAT_N}")
+}
+
+# A real prompt with real output under it, unindented: the evidence should look
+# like what an engineer would see running the command themselves.
+_prompt() {
+  printf '\n%s%s%s:%s%s%s$ %s\n' \
+    "${_c_grn}" "${_HOST_LABEL}" "${_c_off}" \
+    "${_c_blu}" "${PWD/#${HOME}/\~}" "${_c_off}" "$*"
+}
+
 say() {
-  local line para=""
+  local line para="" tag first=1
+  _beat; tag="${_BEAT_TAG}"
   while IFS= read -r line; do
-    [[ "${DEMO_NARRATE:-1}" = "1" ]] && printf '%s\n' "${line}"
+    if [[ "${DEMO_NARRATE:-1}" = "1" ]]; then
+      if [[ -n "${tag}" && "${first}" = "1" && -z "${line//[[:space:]]/}" ]]; then
+        printf '\n  %s\n' "${tag}"
+      else
+        [[ -n "${tag}" && "${first}" = "1" ]] && printf '\n  %s\n' "${tag}"
+        printf '%s\n' "${line}"
+      fi
+      first=0
+    fi
     if [[ -z "${line//[[:space:]]/}" ]]; then
       [[ -n "${para}" ]] && _vo "${para}"
       para=""
@@ -87,10 +115,15 @@ say() {
 # to stand on its own when run directly.
 show() {
   local desc="$1"; shift
+  local tag; _beat; tag="${_BEAT_TAG}"
   _vo "${desc}"
-  [[ "${DEMO_NARRATE:-1}" = "1" ]] && printf '\n  %s->%s %s\n' "${_c_blu}" "${_c_off}" "${desc}"
-  printf '\n     %s[%s]$ %s%s\n' "${_c_yel}" "${_HOST_LABEL}" "$*" "${_c_off}"
-  bash -c "$*" 2>&1 | sed 's/^/     | /'
+  if [[ "${DEMO_NARRATE:-1}" = "1" ]]; then
+    printf '\n  %s->%s %s%s\n' "${_c_blu}" "${_c_off}" "${tag:+${tag} }" "${desc}"
+  elif [[ -n "${tag}" ]]; then
+    printf '\n  %s\n' "${tag}"
+  fi
+  _prompt "$*"
+  bash -c "$*" 2>&1
   return 0
 }
 
@@ -318,8 +351,7 @@ fi
   printf 'svn := %s\n' "${SVN}"
   printf 'containers := [%s]\n' "$(cat "${WORK}/entry.json")"
 } > "${WORK}/sidecar.rego"
-log "the fragment declares:"
-head -4 "${WORK}/sidecar.rego" | sed 's/^/      /'
+show "the fragment declares" "head -4 ${WORK}/sidecar.rego"
 
 SIGN sign --issuer "${ISSUER}" --feed "${SIDECAR_FEED}" --svn "${SVN}" \
      --module "${WORK}/sidecar.rego" --key "${PRIV}" > "${WORK}/sign.txt" \

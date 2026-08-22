@@ -56,6 +56,8 @@
 #   DEMO_ACTS=0,2    run only these acts (default: 0,1,2,3,4)
 #   DEMO_NARRATE=0   suppress the written prose, leaving only the headings,
 #                    commands and their output — for narrating live over the top
+#   DEMO_STEPS=0     hide the per-beat numbers (default: show them, so a beat can
+#                    be referred to by number when reviewing)
 #   DEMO_SCRIPT=path write the spoken script to this file as well, one line per
 #                    beat, for generating a voice-over track. Works with the
 #                    prose on or off; the file is truncated at startup.
@@ -132,18 +134,53 @@ want_act() { [[ ",${ACTS}," == *",$1,"* ]]; }
 # and their output is bracketed rather than left to run into the next beat.
 _HOST_LABEL="$(whoami)@$(hostname -s 2>/dev/null || echo host)"
 
+# Every beat gets a visible number so a reviewer can say "beat 14 is wrong"
+# instead of quoting a line of output back. Screen only: DEMO_SCRIPT stays clean
+# because a TTS pass would happily read the numbers aloud. The prefix keeps the
+# fragment demo's beats distinguishable, since it runs as its own process with
+# its own counter.
+_BEAT_N=0
+_BEAT_PREFIX="${DEMO_BEAT_PREFIX:-}"
+_beat() {
+  _BEAT_TAG=''
+  [[ "${DEMO_STEPS:-1}" = "1" ]] || return 0
+  _BEAT_N=$((_BEAT_N + 1))
+  _BEAT_TAG=$(printf '[%s%02d]' "${_BEAT_PREFIX}" "${_BEAT_N}")
+}
+
 _vo() {
   [[ -n "${DEMO_SCRIPT:-}" ]] || return 0
   printf '%s\n' "$*" >> "${DEMO_SCRIPT}"
+}
+
+# A real prompt, and real output under it. The evidence is the point of this
+# demo, so it should look like what an engineer would see if they ran the
+# command themselves — same host, same working directory, no indentation and no
+# gutter characters wrapped around it.
+_prompt() {
+  printf '\n%s%s%s:%s%s%s$ %s\n' \
+    "${_c_grn}" "${_HOST_LABEL}" "${_c_off}" \
+    "${_c_blu}" "${PWD/#${HOME}/\~}" "${_c_off}" "$*"
 }
 
 # Reads the block from stdin so the call sites stay ordinary heredocs. Wrapped
 # lines are rejoined into one line per paragraph: a TTS engine wants sentences,
 # not the 78-column layout the terminal wants.
 say() {
-  local line para=""
+  local line para="" tag first=1
+  _beat; tag="${_BEAT_TAG}"
   while IFS= read -r line; do
-    [[ "${DEMO_NARRATE:-1}" = "1" ]] && printf '%s\n' "${line}"
+    if [[ "${DEMO_NARRATE:-1}" = "1" ]]; then
+      # Every block opens with a blank line; spend it on the beat number rather
+      # than adding one, so numbering costs no vertical space.
+      if [[ -n "${tag}" && "${first}" = "1" && -z "${line//[[:space:]]/}" ]]; then
+        printf '\n  %s\n' "${tag}"
+      else
+        [[ -n "${tag}" && "${first}" = "1" ]] && printf '\n  %s\n' "${tag}"
+        printf '%s\n' "${line}"
+      fi
+      first=0
+    fi
     if [[ -z "${line//[[:space:]]/}" ]]; then
       [[ -n "${para}" ]] && _vo "${para}"
       para=""
@@ -163,10 +200,17 @@ say() {
 # The claim is prose and follows DEMO_NARRATE; the command and its output do not.
 show() {
   local desc="$1"; shift
+  local tag; _beat; tag="${_BEAT_TAG}"
   _vo "${desc}"
-  [[ "${DEMO_NARRATE:-1}" = "1" ]] && printf '\n  %s->%s %s\n' "${_c_blu}" "${_c_off}" "${desc}"
-  printf '\n     %s[%s]$ %s%s\n' "${_c_yel}" "${_HOST_LABEL}" "$*" "${_c_off}"
-  bash -c "$*" 2>&1 | sed 's/^/     | /'
+  if [[ "${DEMO_NARRATE:-1}" = "1" ]]; then
+    printf '\n  %s->%s %s%s\n' "${_c_blu}" "${_c_off}" "${tag:+${tag} }" "${desc}"
+  elif [[ -n "${tag}" ]]; then
+    # With the prose suppressed the number would vanish with it, and the
+    # narrated run is exactly where "which beat?" gets asked.
+    printf '\n  %s\n' "${tag}"
+  fi
+  _prompt "$*"
+  bash -c "$*" 2>&1
   return 0
 }
 
@@ -276,6 +320,15 @@ show_sandbox_backing() {
   show "that VM is driven by MSHV — a partition and a vCPU, and no KVM descriptor anywhere" \
     "sudo ls -l /proc/${clh}/fd | awk '/mshv|kvm/{print \$NF}' | sort -u"
   scene
+}
+
+# The stages record the config path they actually installed; guessing the
+# filename is how this breaks when runtime-rs and runtime-go configs diverge.
+runtime_config_path() {
+  local cfg
+  cfg=$(head -1 "${E2E_STATE_DIR}/guest-config-paths" 2>/dev/null)
+  [[ -r "${cfg}" ]] || cfg="${E2E_KATA_PREFIX}/share/defaults/kata-containers/runtime-rs/configuration.toml"
+  printf '%s' "${cfg}"
 }
 
 # ---------------------------------------------------- live binding experiment
@@ -439,11 +492,7 @@ EOF
   show "the hypervisor device is /dev/mshv; there is no /dev/sev (that is the guest's side)" \
     "ls -l /dev/mshv 2>&1; ls -l /dev/sev 2>&1 || true"
   scene
-  # The stages record the config path they actually installed; guessing the
-  # filename is how this breaks when runtime-rs and runtime-go configs diverge.
-  local cfg
-  cfg=$(cat "${E2E_STATE_DIR}/guest-config-paths" 2>/dev/null | head -1)
-  [[ -r "${cfg}" ]] || cfg="${E2E_KATA_PREFIX}/share/defaults/kata-containers/runtime-rs/configuration.toml"
+  local cfg; cfg=$(runtime_config_path)
   show "the runtime is configured for an IGVM-launched SEV-SNP guest" \
     "grep -nE '^(igvm|confidential_guest|sev_snp_guest)' ${cfg}"
   show "and the IGVM file is the artifact the launch measurement covers" \
@@ -464,8 +513,27 @@ EOF
 
   local t0; t0=$(date '+%Y-%m-%d %H:%M:%S')
   demo_pod_yaml demo-a '"sleep", "3600"'
-  show "genpolicy injects the policy as measured initdata — gzip+base64, not plaintext" \
-    "grep -o 'cc_init_data: [A-Za-z0-9+/]\{0,24\}' ${WORK}/demo-a.yaml"
+  local cfg; cfg=$(runtime_config_path)
+  show "the policy leaves genpolicy as a pod annotation, compressed — a policy is a large document" \
+    "grep -o 'cc_init_data: [A-Za-z0-9+/]\{0,24\}' ${WORK}/demo-a.yaml; wc -c < ${WORK}/demo-a.yaml | xargs -I{} echo 'annotated pod spec: {} bytes'"
+  say <<'EOF'
+
+  Be clear about what that blob is, because the encoding is the least
+  interesting thing about it. It is transport. The host decodes it on the way
+  in, and everything that follows — the digest it stamps into the hardware
+  report, the document it serves the guest — is computed from the decoded text,
+  not from these bytes. Re-compress it differently and nothing downstream moves;
+  the experiment at the end of this act does exactly that, deliberately.
+
+  Nor is the annotation trusted for being an annotation. It arrives in the pod
+  spec, which the host controls, and the runtime only looks at it because this
+  confidential configuration opts in by name.
+EOF
+  pause
+  show "the runtime honors that annotation only because the config lists it" \
+    "grep -n 'enable_annotations' ${cfg}"
+  show "and what it does with it: decode first, keep the decoded text" \
+    "grep -n -A2 'KATA_ANNO_CFG_HYPERVISOR_INIT_DATA =>' ${E2E_REPO_DIR}/src/libs/kata-types/src/annotations/mod.rs; grep -n -A2 'pub fn add_hypervisor_initdata_overrides' ${E2E_REPO_DIR}/src/libs/kata-types/src/initdata.rs | tail -3"
   pause
 
   start_demo_pod demo-a
@@ -509,14 +577,12 @@ EOF
   scene
 
   local d1; d1=$(initdata_digest_expected "${WORK}/a.toml")
-  printf '\n  %s->%s anyone can compute the expected measurement from that document alone\n' "${_c_blu}" "${_c_off}"
-  printf '     %s$ openssl dgst -sha256 -binary a.toml | base64%s\n' "${_c_yel}" "${_c_off}"
-  printf '     %s\n' "${d1}"
-  printf '\n  %s->%s and that is the value the runtime stamped into the SNP report'"'"'s HOST_DATA\n' "${_c_blu}" "${_c_off}"
-  printf '     %s$ sudo journalctl -t kata | grep "initdata  digest"%s\n' "${_c_yel}" "${_c_off}"
+  show "anyone can compute the expected measurement from that document alone" \
+    "openssl dgst -sha256 -binary ${WORK}/a.toml | base64"
+  show "and that is the value the runtime stamped into the SNP report's HOST_DATA" \
+    "sudo journalctl -t kata --since '${t0}' --no-pager | grep -F 'initdata  digest' | tail -1"
   local jline; jline=$(initdata_journal_line "${t0}" "${d1}")
   if [[ -n "${jline}" ]]; then
-    printf '     %s\n' "${jline}"
     ok "the host logged exactly the digest we computed ourselves"
   else
     warn "did not find that digest in the journal — check 'journalctl -t kata'"
@@ -536,7 +602,8 @@ EOF
   start_demo_pod demo-b
   decode_initdata demo-b "${WORK}/b.toml"
   local d2; d2=$(initdata_digest_expected "${WORK}/b.toml")
-  printf '\n     sleep 3600  ->  %s\n     sleep 3601  ->  %s\n' "${d1}" "${d2}"
+  show "the two measurements, side by side" \
+    "printf 'sleep 3600  ->  '; openssl dgst -sha256 -binary ${WORK}/a.toml | base64; printf 'sleep 3601  ->  '; openssl dgst -sha256 -binary ${WORK}/b.toml | base64"
   if [[ -z "${d1}" || -z "${d2}" ]]; then
     warn "could not compute both digests"
   elif [[ "${d1}" = "${d2}" ]]; then
@@ -674,8 +741,8 @@ EOF
   grep -oE 'X-kata\.dmverity\.roothash=[a-f0-9]{64}' "${WORK}/a.toml" \
     | cut -d= -f2 | sort -u > "${WORK}/policy-hashes.txt"
 
-  printf '\n     EROFS layers on this host : %s\n' "$(wc -l < "${WORK}/host-hashes.txt")"
-  printf '     root hashes in the policy : %s\n' "$(wc -l < "${WORK}/policy-hashes.txt")"
+  show "count both sides — the layers this host built, and the hashes the policy names" \
+    "wc -l ${WORK}/host-hashes.txt ${WORK}/policy-hashes.txt"
   local matched missing
   matched=$(comm -12 "${WORK}/host-hashes.txt" "${WORK}/policy-hashes.txt" | wc -l)
   missing=$(comm -13 "${WORK}/host-hashes.txt" "${WORK}/policy-hashes.txt" | wc -l)
@@ -727,9 +794,8 @@ act3() {
 EOF
   local out
   out=$(kubectl exec -n "${NS}" demo-a -- /bin/true 2>&1) && die "exec SUCCEEDED — policy is not being enforced"
-  printf '\n  %s->%s kubectl exec, denied\n' "${_c_blu}" "${_c_off}"
-  echo "${out}" | grep -o 'policyDecision<[^>]*>policyDecision' | head -1 \
-    | cut -c1-96 | sed 's/^/     /; s/$/.../'
+  show "so try one: kubectl exec into the running pod" \
+    "kubectl exec -n ${NS} demo-a -- /bin/true 2>&1 | grep -o 'policyDecision<[^>]*>policyDecision' | head -1 | cut -c1-96 | sed 's/\$/.../'"
   pause
 
   # The sentinel wraps the payload in angle brackets: policyDecision<...>policyDecision.
@@ -738,10 +804,8 @@ EOF
   local b64; b64=$(echo "${out}" | grep -o 'policyDecision<[^>]*>policyDecision' | head -1 \
     | sed 's/^policyDecision<//; s/>policyDecision$//')
   if [[ -n "${b64}" ]]; then
-    _vo "decoded — this is FR-8"
-    [[ "${DEMO_NARRATE:-1}" = "1" ]] && printf '\n  %s->%s decoded — this is FR-8\n' "${_c_blu}" "${_c_off}"
-    echo "${b64}" | base64 -d 2>/dev/null | jq . 2>/dev/null | sed 's/^/     | /' \
-      || echo "${b64}" | base64 -d | sed 's/^/     | /'
+    show "decoded — this is FR-8" \
+      "echo '${b64}' | base64 -d | jq ."
     say <<'EOF'
 
   Three things to notice. The sentinel framing is fixed and machine-parseable,
