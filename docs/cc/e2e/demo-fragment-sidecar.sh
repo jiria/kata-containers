@@ -132,6 +132,9 @@ show() {
   fi
   _prompt "$*"
   bash -c "$*" 2>&1
+  # One command per break, as in demo.sh: a beat that runs something always
+  # holds afterwards, so two commands never scroll past between keypresses.
+  pause
   return 0
 }
 
@@ -161,9 +164,9 @@ pause() {
 
 # Same split as demo.sh: `pause` holds while the audience reads something that
 # belongs with what is already on screen; `scene` ends one line of argument and
-# clears so the next step starts on a screen of its own.
+# clears so the next step starts on a screen of its own. `scene` does not pause
+# — every command beat already holds after itself.
 scene() {
-  pause
   { _demo_clear && [[ -n "${_CUR_STEP}" ]] && _lib_step "${_CUR_STEP}"; } || true
 }
 
@@ -407,6 +410,7 @@ kubectl apply -f "${WORK}/step1.yaml"
 log "starting pod ${POD} — this boots a fresh SEV-SNP CVM, so it is not instant"
 wait_for 300 "pod ${POD} Running" pod_running
 ok "busybox is running, authorized by an entry in the measured policy"
+pause
 kubectl get pod "${POD}" -n "${NS}"
 pause
 
@@ -523,7 +527,6 @@ show "the anchor, as measured into this pod's initdata" \
   "sed -n '/\\[\\[ca_anchor\\]\\]/,/^\$/p' ${WORK}/fragment-issuers.toml"
 show "and the chain that has to satisfy it" \
   "openssl x509 -in ${WORK}/leaf.pem -noout -subject -issuer -ext extendedKeyUsage 2>/dev/null; echo; echo -n 'CA SHA-256: '; openssl x509 -in ${WORK}/ca.pem -outform DER 2>/dev/null | sha256sum | cut -d' ' -f1"
-pause
 
 SIGN sign --issuer "${ISSUER}" --feed "${SIDECAR_FEED}" --svn "${SVN}" \
      --module "${WORK}/sidecar.rego" --key "${PRIV}" "${X509_ARGS[@]}" > "${WORK}/sign.txt" \
@@ -557,7 +560,6 @@ say <<'EOF'
 EOF
 show "and this is the Rego it would add — the same module we signed, read back out of the envelope" \
   "python3 ${_INSPECT} ${WORK}/cose.hex --payload | head -4"
-pause
 
 say <<'EOF'
 
@@ -612,7 +614,6 @@ AGENT=$(agent_addr "${SB}") || die "could not work out the agent address for san
 HV=$(agent_hvsock_flag "${AGENT}")
 show "the agent's endpoint on this node — a socket the host owns" \
   "echo ${AGENT}; sudo ls -l ${AGENT#unix://} 2>/dev/null || true"
-pause
 
 # A second fragment, on the receipt-required feed. --emit-statement writes the
 # exact bytes the issuer signed (the COSE Sig_structure), which is what a ledger
@@ -705,7 +706,6 @@ say <<'EOF'
 EOF
 show "deliver the fragment with its receipt" \
   "${_CTL_CMD_V} \"LoadPolicyFragment cose=\$(cat ${WORK}/receipt.cose.hex) receipt_ledger=${LEDGER_ID} proof=${WORK}/receipt.proof\" 2>&1 | grep -E 'response received|RpcStatus' | tail -2"
-pause
 
 say <<'EOF'
 

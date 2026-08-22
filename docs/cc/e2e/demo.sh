@@ -114,8 +114,10 @@ pause() {
 # clears, so the next claim starts on a screen of its own. Beats that are
 # evidence for the same claim have to stay together — clearing between the two
 # halves of a comparison is how the comparison stops being one.
+#
+# `scene` does not pause: every command beat already holds after itself (see
+# `show`), so pausing here too would ask for two keypresses at one break.
 scene() {
-  pause
   _demo_clear && [[ -n "${_CUR_STEP}" ]] && _lib_step "${_CUR_STEP}"
 }
 
@@ -211,6 +213,10 @@ show() {
   fi
   _prompt "$*"
   bash -c "$*" 2>&1
+  # One command per break. A beat that runs something always holds afterwards,
+  # so two commands never scroll past between keypresses — the audience gets to
+  # read every output before the next one replaces it as the thing on screen.
+  pause
   return 0
 }
 
@@ -270,8 +276,8 @@ gen_policy_shown() {
     "${GENPOLICY} -y ${WORK}/${name}.yaml -p ${GP_RULES} -j ${GP_SETTINGS} && grep -c . ${WORK}/${name}.yaml | xargs -I{} echo \"${name}.yaml is now {} lines\""
   grep -q 'cc_init_data' "${WORK}/${name}.yaml" \
     || die "no cc_init_data annotation — genpolicy did not inject a measured policy"
-  show "and this is what it added: one annotation, carrying the policy it just derived" \
-    "grep -m1 'cc_init_data:' ${WORK}/${name}.yaml | cut -c1-88; A=\$(grep -m1 'cc_init_data:' ${WORK}/${name}.yaml | sed 's/^.*cc_init_data: //'); echo \"  ...\"; echo \"  \${#A} base64 characters in total — opened up later in this act\""
+  show "and this is what it added: the same spec, now carrying the policy it derived" \
+    "awk '{ if (length(\$0) > 78) print substr(\$0,1,78) \"...\"; else print }' ${WORK}/${name}.yaml"
 }
 
 start_demo_pod() {
@@ -284,6 +290,9 @@ start_demo_pod() {
   log "this boots a fresh SEV-SNP CVM, so it is not instant"
   wait_for 300 "pod ${name} Running" \
     bash -c "kubectl get pod ${name} -n ${NS} -o jsonpath='{.status.phase}' | grep -qx Running"
+  # Same one-command-per-break rule as `show`: this ran a command of its own, so
+  # it holds before the next one is typed.
+  pause
 }
 
 # The shim logs the digest it stamped into HOST_DATA. Note the double space in
@@ -340,7 +349,6 @@ show_sandbox_backing() {
     "kubectl get pod ${name} -n ${NS} -o custom-columns=NAME:.metadata.name,RUNTIMECLASS:.spec.runtimeClassName,STATUS:.status.phase,NODE:.spec.nodeName"
   show "that class is not a label: containerd routes it to its own shim and snapshotter" \
     "grep -A2 'runtimes.${E2E_RUNTIMECLASS}\]' /etc/containerd/config.toml"
-  pause
 
   local sid
   sid=$(sudo crictl pods --name "${name}" --state Ready -o json 2>/dev/null | jq -r '.items[0].id // empty')
@@ -358,7 +366,6 @@ show_sandbox_backing() {
     "sudo crictl pods --state Ready 2>/dev/null | awk 'NR==1 || \$NF==\"${E2E_RUNTIMECLASS}\"'; echo; echo \"cloud-hypervisor processes: \$(sudo ls -l /proc/*/exe 2>/dev/null | grep -c cloud-hypervisor)\""
   show "and the sandbox id is what ties this pod's shim to this pod's VM" \
     "ps -eo pid,args | grep '[${sid:0:1}]${sid:1:11}' | cut -c1-130"
-  pause
 
   local clh
   clh=$(pgrep -f "/run/kata/${sid}/ch-api.sock" | head -n 1)
@@ -553,22 +560,25 @@ EOF
     "sudo journalctl -k --no-pager | grep -m3 'misc mshv:'"
   scene
   local cfg; cfg=$(runtime_config_path)
-  show "the kata runtime's own configuration for this runtime class asks for an IGVM-launched SEV-SNP guest" \
+  say <<'EOF'
+
+  Nothing so far says which pods get any of this. That is what a runtime class
+  is: a name a pod asks for, which containerd resolves to a shim of its own
+  rather than the default one.
+EOF
+  show "workloads opt into this stack by name — the runtime class the rest of this demo uses" \
+    "kubectl get runtimeclass ${E2E_RUNTIMECLASS}"
+  show "that handler's shim runs from this config, and the VMM it drives is Cloud Hypervisor" \
+    "grep -nE '^\[hypervisor\.clh\]|^path = ' ${cfg} | head -2"
+  show "and the same config asks that VMM for an IGVM-launched SEV-SNP guest" \
     "grep -nE '^(igvm|confidential_guest|sev_snp_guest)' ${cfg}"
   # The SNP support lines come from the driver beat above — the same three lines
   # say who the driver is and what the hardware offers it.
-  pause
 }
 
 # ============================================================ act 1
 act1() {
   step "act 1 — the policy is measured, not asserted"
-  say <<'EOF'
-
-  The policy does not arrive as an annotation the guest is asked to trust. It
-  arrives as a document whose digest is in the SNP report, and the guest refuses
-  to run if the two disagree.
-EOF
   ensure_policy_toolchain
 
   local t0; t0=$(date '+%Y-%m-%d %H:%M:%S')
@@ -576,32 +586,32 @@ EOF
   gen_policy_shown demo-a
   say <<'EOF'
 
-  What happens next: we apply that pod. The policy just generated for it is now
-  in the yaml as an annotation, so applying it boots a fresh CVM whose
-  measurement is fixed by that annotation before the guest runs a single
-  instruction. Then we open the annotation, and follow it all the way into the
-  hardware report.
+  So the policy is not a document the pod author wrote and the guest is asked to
+  trust. It is derived from this exact spec, and it rides back in the spec.
+
+  What happens next: applying that file boots a fresh CVM whose measurement is
+  fixed by that annotation before the guest runs a single instruction. Then we
+  open the annotation and follow it all the way into the hardware report — where
+  a disagreement is refused, not reported.
 EOF
   pause
   start_demo_pod demo-a
 
-  show "the policy rides in the pod spec — the start of it, on the running pod, and what it is" \
-    "kubectl get pod demo-a -n ${NS} -o yaml | grep -m1 'cc_init_data:' | cut -c1-96; B=\$(kubectl get pod demo-a -n ${NS} -o jsonpath='${INITDATA_JSONPATH}'); echo; echo \"annotation      : \${#B} base64 characters\"; echo \"gzip payload    : \$(echo \"\${B}\" | base64 -d | wc -c) bytes\"; echo \"decoded document: \$(echo \"\${B}\" | base64 -d | gunzip | wc -c) bytes of TOML\""
+  show "and it reached the pod now running — one annotation, measured three ways" \
+    "B=\$(kubectl get pod demo-a -n ${NS} -o jsonpath='${INITDATA_JSONPATH}'); echo \"annotation      : \${#B} base64 characters\"; echo \"gzip payload    : \$(echo \"\${B}\" | base64 -d | wc -c) bytes\"; echo \"decoded document: \$(echo \"\${B}\" | base64 -d | gunzip | wc -c) bytes of TOML\""
   say <<'EOF'
 
-  Be clear about what that blob is, because the encoding is the least
-  interesting thing about it. It is transport — base64 of gzip of a TOML
-  document, and a policy is large enough to want compressing. The host decodes
-  it on the way in (kata-types annotations/mod.rs, add_hypervisor_initdata_overrides),
-  keeps the decoded text, and everything that follows — the digest it stamps
-  into the hardware report, the document it serves the guest — is computed from
-  that text, not from these bytes. Re-compress it differently and nothing
-  downstream moves; the experiment at the end of this act does exactly that,
-  deliberately.
+  It is transport, and that is all: base64 of gzip of a TOML document. The host
+  decodes it on the way in (kata-types annotations/mod.rs,
+  add_hypervisor_initdata_overrides), and everything downstream — the digest it
+  stamps into the hardware report, the document it serves the guest — is
+  computed from that decoded text, not from these bytes. Re-compress it
+  differently and nothing moves; the experiment at the end of this act does
+  exactly that, deliberately.
 
-  Nor is the annotation trusted for being an annotation. It arrives in the pod
-  spec, which the host controls, and the runtime only looks at it because this
-  confidential configuration opts in to that annotation by name.
+  Nor is it trusted for being an annotation. It arrives in the pod spec, which
+  the host controls, and the runtime only looks at it because this confidential
+  configuration opts in to that annotation by name.
 
   Before opening the document, though, it is worth establishing what just
   booted — a pod is only as confidential as the sandbox underneath it.
@@ -635,7 +645,6 @@ EOF
   pause
   show "the keys the guest will look for, from the agent's own source" \
     "grep -n 'const [A-Z_]*KEY: &str' ${E2E_REPO_DIR}/src/agent/src/initdata.rs"
-  pause
   show "and the fragment machinery rides inside it — declared empty for this pod, and fail-closed" \
     "grep -c . ${WORK}/a.toml | xargs -I{} echo 'policy lines: {}'; grep -nE '^default policy_fragments := \[\]|\"fragments\": \[\]|\"image_layer_verification\": \"[a-z-]*\"' ${WORK}/a.toml"
   scene
@@ -760,7 +769,6 @@ EOF
     "grep -n -B4 'Box::new(tokio::io::sink())' ${E2E_REPO_DIR}/src/agent/src/main.rs"
   show "and it cannot even construct a vsock listener: the socket import is compiled out" \
     "grep -n -B1 'use nix::sys::socket' ${E2E_REPO_DIR}/src/agent/src/main.rs"
-  pause
   show "nor can the host ask for it back — the guest overrides what it is told" \
     "grep -n -A6 '\*debug_console = false;' ${E2E_REPO_DIR}/src/agent/src/config.rs"
   say <<'EOF'
@@ -794,10 +802,8 @@ EOF
   local SNAP=/var/lib/containerd/io.containerd.snapshotter.v1.erofs/snapshots
   show "containerd built each layer as an EROFS image, with verity metadata beside it" \
     "sudo find ${SNAP} -maxdepth 2 -name 'layer.erofs*' | sort | head"
-  pause
   show "one such file per layer — and a pod has several, across its images and the pause container" \
     "sudo find ${SNAP} -maxdepth 2 -name 'layer.erofs.dmverity' | sort | while read -r f; do echo \"\$f\"; sudo cat \"\$f\"; echo; done | head -20"
-  pause
 
   show "and the measured policy names those same layers, in the mount options the guest must be handed" \
     "grep -oE 'X-kata\.dmverity\.roothash=[a-f0-9]{64}' ${WORK}/a.toml | sort -u"
@@ -864,7 +870,6 @@ EOF
   out=$(kubectl exec -n "${NS}" demo-a -- /bin/true 2>&1) && die "exec SUCCEEDED — policy is not being enforced"
   show "so try one: kubectl exec into the running pod" \
     "kubectl exec -n ${NS} demo-a -- /bin/true 2>&1 | grep -o 'policyDecision<[^>]*>policyDecision' | head -1 | cut -c1-96 | sed 's/\$/.../'"
-  pause
 
   # The sentinel wraps the payload in angle brackets: policyDecision<...>policyDecision.
   # The framing is fixed and machine-parseable, so a log consumer can lift the
