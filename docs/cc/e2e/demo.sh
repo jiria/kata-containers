@@ -277,7 +277,7 @@ gen_policy_shown() {
   grep -q 'cc_init_data' "${WORK}/${name}.yaml" \
     || die "no cc_init_data annotation — genpolicy did not inject a measured policy"
   show "and this is what it added: the same spec, now carrying the policy it derived" \
-    "awk '{ if (length(\$0) > 78) print substr(\$0,1,78) \"...\"; else print }' ${WORK}/${name}.yaml"
+    "awk '{ l = \$0; if (length(l) > 78) l = substr(l,1,78) \"...\"; if (l ~ /runtimeClassName:/) l = l \"        <-- act 0'\"'\"'s runtime class\"; else if (l ~ /cc_init_data:/) l = l \"   <-- the measured policy\"; print l }' ${WORK}/${name}.yaml"
 }
 
 start_demo_pod() {
@@ -345,10 +345,8 @@ ensure_policy_toolchain() {
 # something the audience can follow rather than something we assert.
 show_sandbox_backing() {
   local name="$1"
-  show "the pod asked for the confidential runtime class, and the node honored it" \
+  show "the pod asked for the confidential runtime class from act 0, and the node honored it" \
     "kubectl get pod ${name} -n ${NS} -o custom-columns=NAME:.metadata.name,RUNTIMECLASS:.spec.runtimeClassName,STATUS:.status.phase,NODE:.spec.nodeName"
-  show "that class is not a label: containerd routes it to its own shim and snapshotter" \
-    "grep -A2 'runtimes.${E2E_RUNTIMECLASS}\]' /etc/containerd/config.toml"
 
   local sid
   sid=$(sudo crictl pods --name "${name}" --state Ready -o json 2>/dev/null | jq -r '.items[0].id // empty')
@@ -515,6 +513,16 @@ decode_initdata() {
     || die "could not decode initdata for ${name}"
 }
 
+# Same, but from a generated yaml rather than a running pod: act 1 opens the
+# document before it applies anything, so that nothing about the format has to
+# be taken on trust from a pod that has already booted.
+decode_initdata_yaml() {
+  local yaml="$1" out="$2"
+  sed -n 's/^[[:space:]]*io\.katacontainers\.config\.hypervisor\.cc_init_data: //p' "${yaml}" \
+    | base64 -d | gunzip > "${out}" 2>/dev/null \
+    || die "could not decode initdata from ${yaml}"
+}
+
 need kubectl; need jq; need openssl
 
 # Fail with something actionable. A demo that dies halfway through act 1 in front
@@ -568,7 +576,9 @@ EOF
 EOF
   show "workloads opt into this stack by name — the runtime class the rest of this demo uses" \
     "kubectl get runtimeclass ${E2E_RUNTIMECLASS}"
-  show "that handler's shim runs from this config, and the VMM it drives is Cloud Hypervisor" \
+  show "containerd resolves that handler to a shim of its own, and to one config file" \
+    "grep -n -A12 'runtimes.${E2E_RUNTIMECLASS}\]' /etc/containerd/config.toml | grep -E 'runtimes\.${E2E_RUNTIMECLASS}\]|runtime_type|snapshotter|ConfigPath'"
+  show "that is this file — and the VMM it tells that shim to drive is Cloud Hypervisor" \
     "grep -nE '^\[hypervisor\.clh\]|^path = ' ${cfg} | head -2"
   show "and the same config asks that VMM for an IGVM-launched SEV-SNP guest" \
     "grep -nE '^(igvm|confidential_guest|sev_snp_guest)' ${cfg}"
@@ -584,43 +594,13 @@ act1() {
   local t0; t0=$(date '+%Y-%m-%d %H:%M:%S')
   demo_pod_yaml demo-a '"sleep", "3600"' --defer
   gen_policy_shown demo-a
-  say <<'EOF'
 
-  So the policy is not a document the pod author wrote and the guest is asked to
-  trust. It is derived from this exact spec, and it rides back in the spec.
-
-  What happens next: applying that file boots a fresh CVM whose measurement is
-  fixed by that annotation before the guest runs a single instruction. Then we
-  open the annotation and follow it all the way into the hardware report — where
-  a disagreement is refused, not reported.
-EOF
-  pause
-  start_demo_pod demo-a
-
-  show "and it reached the pod now running — one annotation, measured three ways" \
-    "B=\$(kubectl get pod demo-a -n ${NS} -o jsonpath='${INITDATA_JSONPATH}'); echo \"annotation      : \${#B} base64 characters\"; echo \"gzip payload    : \$(echo \"\${B}\" | base64 -d | wc -c) bytes\"; echo \"decoded document: \$(echo \"\${B}\" | base64 -d | gunzip | wc -c) bytes of TOML\""
-  say <<'EOF'
-
-  It is transport, and that is all: base64 of gzip of a TOML document. The host
-  decodes it on the way in (kata-types annotations/mod.rs,
-  add_hypervisor_initdata_overrides), and everything downstream — the digest it
-  stamps into the hardware report, the document it serves the guest — is
-  computed from that decoded text, not from these bytes. Re-compress it
-  differently and nothing moves; the experiment at the end of this act does
-  exactly that, deliberately.
-
-  Nor is it trusted for being an annotation. It arrives in the pod spec, which
-  the host controls, and the runtime only looks at it because this confidential
-  configuration opts in to that annotation by name.
-
-  Before opening the document, though, it is worth establishing what just
-  booted — a pod is only as confidential as the sandbox underneath it.
-EOF
-  show_sandbox_backing demo-a
-
-  decode_initdata demo-a "${WORK}/a.toml"
-  show "that annotation is an initdata document — decode it straight out of the running pod" \
-    "kubectl get pod demo-a -n ${NS} -o jsonpath='${INITDATA_JSONPATH}' | base64 -d | gunzip | head -5"
+  # Opened from the file, before anything is applied: the format is worth
+  # understanding on its own, and a running pod would only add the question of
+  # whether what we are reading is what the pod got.
+  decode_initdata_yaml "${WORK}/demo-a.yaml" "${WORK}/a-pre.toml"
+  show "open that annotation — it is base64 of gzip, and it decodes to a TOML document" \
+    "head -5 ${WORK}/a-pre.toml"
   say <<'EOF'
 
   Initdata is not a policy file. It is a small envelope: two header fields, then
@@ -628,9 +608,8 @@ EOF
   digest is taken over the whole envelope — so whatever is in the table is
   measured, not just the policy.
 EOF
-  pause
   show "so ask the document what it actually carries — the header, and every key in the table" \
-    "grep -nE '^(version|algorithm) = |^\[data\]|^\"[^\"]+\" = ' ${WORK}/a.toml; grep -c . ${WORK}/a.toml | xargs -I{} echo \"whole document: {} lines\""
+    "grep -nE '^(version|algorithm) = |^\[data\]|^\"[^\"]+\" = ' ${WORK}/a-pre.toml; grep -c . ${WORK}/a-pre.toml | xargs -I{} echo \"whole document: {} lines\""
   say <<'EOF'
 
   One entry for this pod: "policy.rego", holding the entire generated policy. So
@@ -640,9 +619,56 @@ EOF
   this same table, which is what lets that act call the trust root "measured"
   without putting it in the policy.
 
-  Note algorithm = 'sha256'. That is how the digest gets computed in a moment.
+  Note algorithm = 'sha256'. That is how the digest gets computed later in this
+  act.
+EOF
+  show "and that entry has a shape of its own — one rule per request the agent can be asked to serve" \
+    "grep -E '^default [A-Za-z]+Request' ${WORK}/a-pre.toml | head -12; echo; grep -cE '^default ' ${WORK}/a-pre.toml | xargs -I{} echo \"{} default rules in all — the guest's whole API surface, each answered before it is asked\""
+  say <<'EOF'
+
+  That is the shape of the thing being measured: not a list of permissions, but
+  a decision for every request the agent can receive, defaulting to refusal. The
+  entries generated for this pod then turn specific ones on — for this image,
+  this command, these mounts.
+
+  So the policy is not a document the pod author wrote and the guest is asked to
+  trust. It is derived from this exact spec, and it rides back in the spec.
+
+  What happens next: applying that file boots a fresh CVM whose measurement is
+  fixed by that annotation before the guest runs a single instruction. Then we
+  follow it all the way into the hardware report — where a disagreement is
+  refused, not reported.
 EOF
   pause
+  start_demo_pod demo-a
+
+  show "and it reached the pod now running — one annotation, measured three ways" \
+    "B=\$(kubectl get pod demo-a -n ${NS} -o jsonpath='${INITDATA_JSONPATH}'); echo \"annotation      : \${#B} base64 characters\"; echo \"gzip payload    : \$(echo \"\${B}\" | base64 -d | wc -c) bytes\"; echo \"decoded document: \$(echo \"\${B}\" | base64 -d | gunzip | wc -c) bytes of TOML\""
+  say <<'EOF'
+
+  The encoding is transport, and that is all. The host decodes it on the way in
+  (kata-types annotations/mod.rs, add_hypervisor_initdata_overrides), and
+  everything downstream — the digest it stamps into the hardware report, the
+  document it serves the guest — is computed from that decoded text, not from
+  these bytes. Re-compress it differently and nothing moves; the experiment at
+  the end of this act does exactly that, deliberately.
+
+  Nor is it trusted for being an annotation. It arrives in the pod spec, which
+  the host controls, and the runtime only looks at it because this confidential
+  configuration opts in to that annotation by name.
+
+  Before following the document into the hardware, though, it is worth
+  establishing what just booted — a pod is only as confidential as the sandbox
+  underneath it.
+EOF
+  show_sandbox_backing demo-a
+
+  decode_initdata demo-a "${WORK}/a.toml"
+  say <<'EOF'
+
+  Back to the document, now the pod's own copy of it. Those key names are not a
+  convention the demo invented — the guest looks for exactly these.
+EOF
   show "the keys the guest will look for, from the agent's own source" \
     "grep -n 'const [A-Z_]*KEY: &str' ${E2E_REPO_DIR}/src/agent/src/initdata.rs"
   show "and the fragment machinery rides inside it — declared empty for this pod, and fail-closed" \
