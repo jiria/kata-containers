@@ -514,8 +514,13 @@ EOF
   local cfg; cfg=$(runtime_config_path)
   show "the runtime is configured for an IGVM-launched SEV-SNP guest" \
     "grep -nE '^(igvm|confidential_guest|sev_snp_guest)' ${cfg}"
-  show "and the IGVM file is the artifact the launch measurement covers" \
-    "sha256sum ${E2E_GUEST_IGVM}"
+  # Deliberately not a sha256sum of the IGVM file. The launch measurement is
+  # computed by the PSP over the pages and directives the file describes, not
+  # over the file's bytes, so a file digest printed here would be a number nobody
+  # could check against anything. What is checkable is that this hypervisor has
+  # SNP, and act 1 goes on to read a field out of an actual report.
+  show "and the hypervisor found SEV-SNP on this hardware at boot" \
+    "sudo journalctl -k --no-pager | grep -i 'SEV-SNP' | head -2"
   pause
 }
 
