@@ -278,6 +278,23 @@ ready_of() {
     -o jsonpath="{.status.containerStatuses[?(@.name=='$1')].ready}" 2>/dev/null
 }
 
+# An ephemeral container is reported in its own status list, never in
+# containerStatuses, so a refused one is invisible to ready_of.
+eph_ready_of() {
+  kubectl get pod "${POD}" -n "${NS}" \
+    -o jsonpath="{.status.ephemeralContainerStatuses[?(@.name=='$1')].ready}" 2>/dev/null
+}
+
+# Refused means the kubelet got an error back and the container terminated
+# without ever running; settled covers that and the (disallowed) running case,
+# so the assertion after it is what decides, not the wait.
+eph_settled() {
+  local s
+  s=$(kubectl get pod "${POD}" -n "${NS}" \
+    -o jsonpath="{.status.ephemeralContainerStatuses[?(@.name=='$1')].state}" 2>/dev/null)
+  [[ "${s}" == *terminated* || "${s}" == *running* ]]
+}
+
 # wait_for runs its argument as a command, not as a shell string, so the
 # predicates have to be functions.
 pod_running()     { [[ "$(kubectl get pod "${POD}" -n "${NS}" -o jsonpath='{.status.phase}' 2>/dev/null)" = Running ]]; }
@@ -352,24 +369,25 @@ kubectl get pod "${POD}" -n "${NS}"
 pause
 
 # ---------------------------------------------------------------------------
-step "2 — a sidecar the policy has never seen"
-log "same policy, plus a container appended to the yaml *after* generation"
-log "the policy therefore has no entry for it, and no fragment is declared"
-wipe_pod
-render_pod "" > "${WORK}/step2.yaml"
-"${GENPOLICY}" -y "${WORK}/step2.yaml" -p "${WORK}/rules-none.rego" -j "${SETTINGS}" \
-  --initdata-path="${WORK}/initdata.toml" >/dev/null || die "genpolicy failed"
-append_sidecar "${WORK}/step2.yaml"
-_prompt "kubectl apply -f ${WORK}/step2.yaml"
-kubectl apply -f "${WORK}/step2.yaml"
-log "starting pod ${POD} again — another fresh CVM boot"
-wait_for 300 "busybox ready" container_ready busybox
-sleep 20
-sc=$(ready_of sidecar)
+step "2 — a sidecar the policy has never seen, added to the pod already running"
+log "no reboot, no new pod: the same sandbox from step 1 is still up"
+log "kubectl debug injects a container into it at runtime, and the measured"
+log "policy has no entry for it — no fragment is declared either"
+say <<'EOF'
+
+  This is the interesting shape of the attack. The pod was admitted, the CVM
+  booted, its measurement is already fixed — and only now does something try to
+  add a container. Nothing about the launch can help here; the decision has to
+  be made by the guest, at runtime, against the document it was launched with.
+EOF
+show "add a container to the running pod" \
+  "kubectl debug -n ${NS} ${POD} --image=quay.io/prometheus/busybox:latest -c sidecar -- sh -c 'echo ${MARK}; sleep 600' 2>&1 | tail -4 || true"
+wait_for 120 "the sidecar to reach a terminal state" eph_settled sidecar
+sc=$(eph_ready_of sidecar)
 [[ "${sc}" = "true" ]] && die "the sidecar started without a fragment — the policy is not being enforced"
-ok "busybox ready, sidecar refused (ready=${sc:-<none>})"
-show "kubernetes sees a partly-running pod: one container up, one never created" \
-  "kubectl get pod ${POD} -n ${NS}; kubectl get pod ${POD} -n ${NS} -o jsonpath='{range .status.containerStatuses[*]}{.name}{\"  ready=\"}{.ready}{\"  \"}{.state.waiting.reason}{.state.terminated.reason}{\"\\n\"}{end}'"
+ok "busybox still running, sidecar refused (ready=${sc:-<none>})"
+show "kubernetes sees the pod it always saw, plus one container that never started" \
+  "kubectl get pod ${POD} -n ${NS}; kubectl get pod ${POD} -n ${NS} -o jsonpath='{range .status.containerStatuses[*]}{.name}{\"  ready=\"}{.ready}{\"\\n\"}{end}{range .status.ephemeralContainerStatuses[*]}{.name}{\"  ready=\"}{.ready}{\"  \"}{.state.waiting.reason}{.state.terminated.reason}{\"\\n\"}{end}'"
 show "the refusal is a pod event written by kubelet, relaying the shim's error" \
   "kubectl get events -n ${NS} --field-selector involvedObject.name=${POD} -o jsonpath='{range .items[*]}{.source.component}{\" -> \"}{.message}{\"\\n\"}{end}' 2>/dev/null | grep -m1 'blocked by policy' | cut -c1-240"
 show "and this is the sentence the guest itself produced" \
@@ -391,7 +409,8 @@ say <<'EOF'
   starts. The worst a hostile host can do here is garble the explanation.
 
   Note also the pod is not dead: the sandbox and the authorized container keep
-  running. The policy denies the request; it does not kill the pod.
+  running, and they were running throughout. The policy denies the request; it
+  does not kill the pod, and it does not need the pod restarted to say no.
 EOF
 pause
 
@@ -521,6 +540,7 @@ AGENT=$(agent_addr "${SB}") || die "could not work out the agent address for san
 HV=$(agent_hvsock_flag "${AGENT}")
 show "the agent's endpoint on this node — a socket the host owns" \
   "echo ${AGENT}; sudo ls -l ${AGENT#unix://} 2>/dev/null || true"
+pause
 
 # A second fragment, on the receipt-required feed. --emit-statement writes the
 # exact bytes the issuer signed (the COSE Sig_structure), which is what a ledger
@@ -536,6 +556,7 @@ SIGN sign --issuer "${ISSUER}" --feed "${RECEIPT_FEED}" --svn "${SVN}" \
   || { tail -20 "${WORK}/receipt.sign.txt"; die "signing the receipt-feed fragment failed"; }
 grep '^cose_sign1_hex=' "${WORK}/receipt.sign.txt" | cut -d= -f2 > "${WORK}/receipt.cose.hex"
 ok "signed a fragment on ${RECEIPT_FEED} at svn ${SVN}"
+pause
 
 _CTL_CMD="sudo ${CTL} -l error connect --server-address ${AGENT} ${HV} -n true -c"
 # A refusal is carried by the ttRPC status, which -l error already prints. A
@@ -610,6 +631,8 @@ say <<'EOF'
 EOF
 show "deliver the fragment with its receipt" \
   "${_CTL_CMD_V} \"LoadPolicyFragment cose=\$(cat ${WORK}/receipt.cose.hex) receipt_ledger=${LEDGER_ID} proof=${WORK}/receipt.proof\" 2>&1 | grep -E 'response received|RpcStatus' | tail -2"
+pause
+
 say <<'EOF'
 
   And the same envelope again, receipt and all. It is now a replay, and the
@@ -632,7 +655,7 @@ pause
 
 heading "what just happened"
 say <<EOF
-  step 2 and step 4 run the same image, the same command, the same pod.
+  step 2 and step 4 run the same image and the same command.
   The difference is a signed, versioned artifact fetched from a registry by the
   host and verified inside the guest before it can authorize anything:
 

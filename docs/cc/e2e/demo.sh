@@ -983,6 +983,7 @@ for a in 0 1 2 3 4; do
   want_act "${a}" && "act${a}"
 done
 
+pause
 heading "demo complete"
 if [[ "${ACTS}" == "0,1,2,3,4" ]]; then
   say <<'EOF'
