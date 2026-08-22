@@ -45,7 +45,20 @@ _demo_clear() {
   printf '\033[H\033[2J'
 }
 
-step() { _CUR_STEP="$*"; _demo_clear; _lib_step "$@"; }
+# `|| true` matters: this script runs under `set -e`, and _demo_clear returns
+# non-zero whenever clearing is off (piped runs, DEMO_PAUSE=0). Without it the
+# whole script exits silently at the first heading.
+step() { _CUR_STEP="$*"; _demo_clear || true; _lib_step "$@"; }
+
+# Same contract as demo.sh's: state the claim, then show the command that
+# substantiates it. Duplicated rather than shared because each demo script has
+# to stand on its own when run directly.
+show() {
+  local desc="$1"; shift
+  printf '\n  %s->%s %s\n' "${_c_blu}" "${_c_off}" "${desc}"
+  printf '     %s$ %s%s\n' "${_c_yel}" "$*" "${_c_off}"
+  bash -c "$*" 2>&1 | sed 's/^/     /'
+}
 
 NS="${E2E_NS:-coco-e2e}"
 POD=demo-frag-sidecar
@@ -65,7 +78,14 @@ pause() {
   [[ "${DEMO_PAUSE:-0}" = "1" ]] || return 0
   printf '\n    press Enter to continue '
   read -r _
-  _demo_clear && [[ -n "${_CUR_STEP}" ]] && _lib_step "${_CUR_STEP}"
+}
+
+# Same split as demo.sh: `pause` holds while the audience reads something that
+# belongs with what is already on screen; `scene` ends one line of argument and
+# clears so the next step starts on a screen of its own.
+scene() {
+  pause
+  { _demo_clear && [[ -n "${_CUR_STEP}" ]] && _lib_step "${_CUR_STEP}"; } || true
 }
 
 need kubectl; need jq; need python3
@@ -191,12 +211,31 @@ sleep 20
 sc=$(ready_of sidecar)
 [[ "${sc}" = "true" ]] && die "the sidecar started without a fragment — the policy is not being enforced"
 ok "busybox ready, sidecar refused (ready=${sc:-<none>})"
-log "the guest's reason, from the pod events:"
-kubectl get events -n "${NS}" --field-selector involvedObject.name="${POD}" \
-  -o jsonpath='{range .items[*]}{.message}{"\n"}{end}' 2>/dev/null \
-  | grep -o 'blocked by policy[^\\]*' | head -1 | cut -c1-200 || true
-log "note the pod is not dead: the sandbox and the authorized container keep running."
-log "the policy denies the request; it does not kill the pod."
+show "kubernetes sees a partly-running pod: one container up, one never created" \
+  "kubectl get pod ${POD} -n ${NS}; kubectl get pod ${POD} -n ${NS} -o jsonpath='{range .status.containerStatuses[*]}{.name}{\"  ready=\"}{.ready}{\"  \"}{.state.waiting.reason}{.state.terminated.reason}{\"\\n\"}{end}'"
+show "the refusal is a pod event written by kubelet, relaying the shim's error" \
+  "kubectl get events -n ${NS} --field-selector involvedObject.name=${POD} -o jsonpath='{range .items[*]}{.source.component}{\" -> \"}{.message}{\"\\n\"}{end}' 2>/dev/null | grep -m1 'blocked by policy' | cut -c1-240"
+show "and this is the sentence the guest itself produced" \
+  "kubectl get events -n ${NS} --field-selector involvedObject.name=${POD} -o jsonpath='{range .items[*]}{.message}{\"\\n\"}{end}' 2>/dev/null | grep -o 'blocked by policy[^\\\\]*' | head -1 | cut -c1-200"
+cat <<'EOF'
+
+  Worth being clear about where that sentence comes from, because it reaches the
+  screen through the host and the host is not trusted. The framing -- "<endpoint>
+  is blocked by policy: no policy container satisfied: ..." -- is assembled by
+  the agent's policy engine inside the guest (agent/policy/src/decision.rs). The
+  reasons after the colon are strings from the measured policy document itself:
+  "command: no policy container declares this container's argument list" is a
+  rule in the generated rules.rego, not prose written by the runtime.
+
+  The chain above is the whole trip: the agent returns PERMISSION_DENIED for
+  CreateContainer over ttRPC, the shim wraps it, containerd hands it to kubelet,
+  kubelet records the event. Every hop after the guest is untrusted, and none of
+  them can turn the denial into an admission -- the container simply never
+  starts. The worst a hostile host can do here is garble the explanation.
+
+  Note also the pod is not dead: the sandbox and the authorized container keep
+  running. The policy denies the request; it does not kill the pod.
+EOF
 pause
 
 # ---------------------------------------------------------------------------

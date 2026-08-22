@@ -95,10 +95,15 @@ pause() {
   [[ "${DEMO_PAUSE:-0}" = "1" ]] || return 0
   printf '\n    press Enter to continue '
   read -r _
-  # Start each beat on a clean screen. The previous evidence has been read and
-  # discussed by this point, and leaving it up makes it hard to see what is new.
-  # Only interactive runs clear: a piped or unpaused run keeps the full
-  # transcript, which is what gets checked afterwards.
+}
+
+# Two kinds of break. `pause` holds while the audience reads something that
+# belongs with what is already on screen; `scene` ends one line of argument and
+# clears, so the next claim starts on a screen of its own. Beats that are
+# evidence for the same claim have to stay together — clearing between the two
+# halves of a comparison is how the comparison stops being one.
+scene() {
+  pause
   _demo_clear && [[ -n "${_CUR_STEP}" ]] && _lib_step "${_CUR_STEP}"
 }
 
@@ -219,7 +224,7 @@ show_sandbox_backing() {
   # a partition handle and a vCPU handle can only have come from /dev/mshv.
   show "that VM is driven by MSHV — a partition and a vCPU, and no KVM descriptor anywhere" \
     "sudo ls -l /proc/${clh}/fd | awk '/mshv|kvm/{print \$NF}' | sort -u"
-  pause
+  scene
 }
 
 # The measured document itself, straight out of the pod spec.
@@ -265,7 +270,7 @@ EOF
     "uname -r"
   show "the hypervisor device is /dev/mshv; there is no /dev/sev (that is the guest's side)" \
     "ls -l /dev/mshv 2>&1; ls -l /dev/sev 2>&1 || true"
-  pause
+  scene
   # The stages record the config path they actually installed; guessing the
   # filename is how this breaks when runtime-rs and runtime-go configs diverge.
   local cfg
@@ -318,7 +323,7 @@ EOF
   pause
   show "and the fragment machinery rides inside it — declared empty for this pod, and fail-closed" \
     "grep -c . ${WORK}/a.toml | xargs -I{} echo 'policy lines: {}'; grep -nE '^default policy_fragments := \[\]|\"fragments\": \[\]|\"image_layer_verification\": \"[a-z-]*\"' ${WORK}/a.toml"
-  pause
+  scene
 
   local d1; d1=$(initdata_digest_expected "${WORK}/a.toml")
   printf '\n  %s->%s anyone can compute the expected measurement from that document alone\n' "${_c_blu}" "${_c_off}"
@@ -366,13 +371,50 @@ EOF
   nothing but sha256 and the document itself. That is what makes pinning a
   digest meaningful: a relying party computes the expected value rather than
   being told what to trust.
+EOF
+  scene
+  cat <<'EOF'
 
-  And the guest checks this itself: the agent reads its own SNP report and
-  aborts unless the delivered document hashes to HOST_DATA.
+  A relying party rejecting the second digest is one half. The other half is
+  what the guest does when the host serves a document that does not match the
+  measurement it was launched with — because that is the case an attacker
+  actually needs: keep the attested measurement, swap the policy.
 
-  The fair question is whether we can watch it do that — print the value the
-  guest saw. We cannot, and the reason is worth more than the number would be.
-  This build closes every channel that could carry it out.
+  We cannot stage that against live hardware — it would mean lying to the
+  hardware about a launch that already happened. What we can do is drive the
+  same verification path the agent runs at boot, against a fake TEE tree, and
+  watch it refuse.
+EOF
+  pause
+  show "the agent's own binding check, exercised in both directions" \
+    "cd ${E2E_REPO_DIR}/src/agent && cargo test --features strict-policy,tsm-test-override hostdata::tests::binding 2>&1 | grep -E '^test |^test result'"
+  cat <<'EOF'
+
+  Four cases, and the two middle ones are the point: a matching measurement is
+  accepted, a tampered one is refused. The other two are the fail-closed edges —
+  a guest that should be able to measure but cannot is refused, while a plain
+  non-confidential VM is skipped rather than failed.
+
+  Note the feature those tests need. KATA_AGENT_TSM_ROOT can only redirect the
+  lookup when the agent is built with tsm-test-override, which no shipped image
+  enables — the agent's environment is host-influenced, so a host that could set
+  that variable could point the check at a tree it controls.
+EOF
+  pause
+  show "and a mismatch is fatal, not a warning — the agent aborts the VM" \
+    "grep -n -B2 -A2 'initdata does not match the launch measurement, aborting VM' ${E2E_REPO_DIR}/src/agent/src/main.rs; grep -n -A4 'async fn fatal_abort' ${E2E_REPO_DIR}/src/agent/src/main.rs"
+  cat <<'EOF'
+
+  fatal_abort records the reason and calls process::abort(). The agent is pid 1
+  in that guest, so aborting it takes the VM with it: there is no degraded mode
+  in which the workload runs under a policy that was never measured.
+EOF
+  scene
+  cat <<'EOF'
+
+  Which raises the obvious question: can we watch the guest do that check —
+  print the value it saw? We cannot, and the reason is worth more than the
+  number would be. This build closes every channel that could carry it out.
 EOF
   pause
   show "the agent's log stream is wired to a sink — a strict build forwards nothing" \
@@ -418,9 +460,8 @@ EOF
     "sudo find ${SNAP} -maxdepth 2 -name 'layer.erofs.dmverity' | sort | while read -r f; do echo \"\$f\"; sudo cat \"\$f\"; echo; done | head -20"
   pause
 
-  show "and the policy names them in the mount options the guest must be handed" \
-    "grep -oE 'X-kata\.dmverity\.roothash=[a-f0-9]{64}' ${WORK}/a.toml | sort -u | head -3"
-  pause
+  show "and the measured policy names those same layers, in the mount options the guest must be handed" \
+    "grep -oE 'X-kata\.dmverity\.roothash=[a-f0-9]{64}' ${WORK}/a.toml | sort -u"
 
   sudo find "${SNAP}" -maxdepth 2 -name 'layer.erofs.dmverity' -exec cat {} \; 2>/dev/null \
     | jq -r '.roothash' 2>/dev/null | sort -u > "${WORK}/host-hashes.txt"
@@ -429,13 +470,11 @@ EOF
   grep -oE 'X-kata\.dmverity\.roothash=[a-f0-9]{64}' "${WORK}/a.toml" \
     | cut -d= -f2 | sort -u > "${WORK}/policy-hashes.txt"
 
-  printf '\n  %s->%s the measured policy names each of those layers, by root hash\n' "${_c_blu}" "${_c_off}"
-  printf '     EROFS layers on this host : %s\n' "$(wc -l < "${WORK}/host-hashes.txt")"
+  printf '\n     EROFS layers on this host : %s\n' "$(wc -l < "${WORK}/host-hashes.txt")"
   printf '     root hashes in the policy : %s\n' "$(wc -l < "${WORK}/policy-hashes.txt")"
   local matched missing
   matched=$(comm -12 "${WORK}/host-hashes.txt" "${WORK}/policy-hashes.txt" | wc -l)
   missing=$(comm -13 "${WORK}/host-hashes.txt" "${WORK}/policy-hashes.txt" | wc -l)
-  comm -12 "${WORK}/host-hashes.txt" "${WORK}/policy-hashes.txt" | sed 's/^/     match  /'
   if [[ "${matched}" -gt 0 && "${missing}" -eq 0 ]]; then
     ok "every root hash the policy names is a layer containerd actually built (${matched})"
   elif [[ "${matched}" -gt 0 ]]; then
@@ -454,7 +493,7 @@ EOF
   erofs-utils — which is why the policy can be generated anywhere, and why the
   match above is a result rather than a copy.
 EOF
-  pause
+  scene
 
   show "note where the verity device is NOT: the host has no dm devices at all" \
     "sudo dmsetup ls 2>&1"
@@ -509,7 +548,7 @@ EOF
   else
     warn "no decision object in the error text — expected the policyDecision sentinel"
   fi
-  pause
+  scene
 
   cat <<'EOF'
 
@@ -572,6 +611,12 @@ preflight
 if [[ "${DEMO_PREP:-0}" = "1" ]]; then
   step "prep — doing the slow work now so the demo does not"
   ensure_policy_toolchain
+  # Act 1 runs the agent's binding tests live. Cached that is ~4s; cold it is a
+  # full agent test build, which is not something to discover mid-demo.
+  log "warming the agent test build (act 1 runs the binding tests live)"
+  (cd "${E2E_REPO_DIR}/src/agent" \
+    && cargo test --features strict-policy,tsm-test-override --no-run >/dev/null 2>&1) \
+    || warn "could not pre-build the agent tests — act 1's binding beat will compile them itself"
   demo_pod_yaml demo-prep '"sleep", "5"'
   start_demo_pod demo-prep
   kubectl delete pod demo-prep -n "${NS}" --ignore-not-found >/dev/null 2>&1 || true
