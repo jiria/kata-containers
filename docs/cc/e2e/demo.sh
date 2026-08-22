@@ -514,13 +514,15 @@ act0() {
   hardening in the acts that follow is demonstrated on real confidential
   hardware rather than under nested virt on an ordinary host.
 EOF
-  show "the hypervisor device is /dev/mshv; there is no /dev/sev (that is the guest's side)" \
-    "ls -l /dev/mshv 2>&1; ls -l /dev/sev 2>&1 || true"
+  show "the hypervisor device on this node is /dev/mshv" \
+    "ls -l /dev/mshv"
   # Not a module on this kernel, so lsmod/modinfo say nothing. The binding is
   # visible instead in the misc class node carrying the same major:minor as the
   # device, and in the driver's own boot lines.
-  show "and that device belongs to the in-kernel mshv driver — same major:minor, and this is what it reported at boot" \
-    "cat /sys/class/misc/mshv/dev; sudo journalctl -k --no-pager | grep -m3 'misc mshv:'"
+  show "it belongs to the in-kernel mshv driver — the misc class node carries the same major:minor" \
+    "cat /sys/class/misc/mshv/dev"
+  show "and this is what that driver reported at boot, including what the hardware offers it" \
+    "sudo journalctl -k --no-pager | grep -m3 'misc mshv:'"
   scene
   local cfg; cfg=$(runtime_config_path)
   show "the kata runtime's own configuration for this runtime class asks for an IGVM-launched SEV-SNP guest" \
@@ -571,13 +573,9 @@ EOF
   Nor is the annotation trusted for being an annotation. It arrives in the pod
   spec, which the host controls, and the runtime only looks at it because this
   confidential configuration opts in to that annotation by name.
-EOF
-  pause
 
-  say <<'EOF'
-
-  Before opening the document, it is worth establishing what just booted — a
-  pod is only as confidential as the sandbox underneath it.
+  Before opening the document, though, it is worth establishing what just
+  booted — a pod is only as confidential as the sandbox underneath it.
 EOF
   show_sandbox_backing demo-a
 

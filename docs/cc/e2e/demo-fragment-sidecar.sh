@@ -369,6 +369,45 @@ grep '^cose_sign1_hex=' "${WORK}/sign.txt" | cut -d= -f2 > "${WORK}/cose.hex"
 FRAGGEN --cose "${WORK}/cose.hex" --push "${SIDECAR_REF}" "${PLAIN_HTTP[@]}" > "${WORK}/push.txt" \
   || { tail -20 "${WORK}/push.txt"; die "publishing failed"; }
 ok "published ${SIDECAR_REF}, COSE_Sign1-signed by ${ISSUER} at svn ${SVN}"
+
+# The fragment is the one artifact the host fetches and hands in, so decode it
+# rather than describe it. The inspector carries its own CBOR reader; the node
+# has no cbor2, and a demo should not need a pip install to explain itself.
+_INSPECT="$(dirname "${BASH_SOURCE[0]}")/cose-inspect.py"
+show "what was actually published — decoded from the envelope, not from what we typed" \
+  "python3 ${_INSPECT} ${WORK}/cose.hex"
+say <<'EOF'
+
+  Everything the guest decides about this fragment comes from that protected
+  header: the issuer it must find on the measured allow-list, the feed it may
+  write under, and the SVN it must meet. All three are inside the signature, so
+  a host that edits any of them invalidates the envelope it is trying to pass.
+EOF
+show "and this is the Rego it would add — the same module we signed, read back out of the envelope" \
+  "python3 ${_INSPECT} ${WORK}/cose.hex --payload | head -4"
+pause
+
+say <<'EOF'
+
+  Signature and SVN say who wrote it and how new it is. They do not say that
+  anyone else ever saw it — a compromised issuer can sign a fragment for one
+  victim and never publish it. That is what a transparency receipt is for, and
+  the reference monitor verifies one cryptographically rather than trusting its
+  presence.
+EOF
+show "a receipt is a ledger's countersignature over the same bytes the issuer signed" \
+  "grep -n 'pub receipt:' -A3 ${E2E_REPO_DIR}/src/agent/security-reference-monitor/src/fragments.rs | head -8"
+show "and it is checked by recomputing the ledger's Merkle root, not by reading a claim" \
+  "grep -n -A9 'pub fn verify_ccf_inclusion' ${E2E_REPO_DIR}/src/agent/security-reference-monitor/src/ccf.rs"
+show "a required receipt that is absent is a refusal, with its own error" \
+  "grep -n 'MissingReceipt' ${E2E_REPO_DIR}/src/agent/security-reference-monitor/src/fragments.rs | head -4"
+say <<'EOF'
+
+  This demo's issuer list does not require a receipt, so what you just saw is
+  the machinery rather than a live rejection — the fragment above carries none.
+  The requirement is per issuer and feed, and the tests cover both directions,
+  including a receipt that verifies against the wrong ledger.
+EOF
 pause
 
 # ---------------------------------------------------------------------------
