@@ -480,9 +480,19 @@ ensure_genpolicy_defaults() {
     clh-snp)
       local src="${E2E_REPO_DIR}/src/tools/genpolicy" dst="${E2E_STATE_DIR}/genpolicy"
       mkdir -p "${dst}"
+      # Stage once per set of branch inputs, not once per run. The patches below
+      # are what make these settings usable on this platform, and each is guarded
+      # by a grep that stops matching once applied — so re-copying the pristine
+      # file every time is the only reason they get re-applied, and re-announced,
+      # on every single run. Keeping a pristine .orig beside the staged copy makes
+      # "did the branch change?" answerable without unpatching anything: if it
+      # did, both are refreshed and the patches legitimately run again.
       for f in rules.rego genpolicy-settings.json; do
         [[ -f "${src}/${f}" ]] || die "missing ${src}/${f} — genpolicy inputs are not where the suite expects them"
-        install -m 0644 "${src}/${f}" "${dst}/${f}" || die "could not stage ${f} into ${dst}"
+        if [[ ! -s "${dst}/${f}" ]] || ! cmp -s "${src}/${f}" "${dst}/${f}.orig"; then
+          install -m 0644 "${src}/${f}" "${dst}/${f}" || die "could not stage ${f} into ${dst}"
+          install -m 0644 "${src}/${f}" "${dst}/${f}.orig" || die "could not record pristine ${f} in ${dst}"
+        fi
       done
       GP_RULES="${dst}/rules.rego"
       GP_SETTINGS="${dst}/genpolicy-settings.json"

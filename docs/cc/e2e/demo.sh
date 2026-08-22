@@ -575,7 +575,7 @@ if [[ "${DEMO_PREP:-0}" = "1" ]]; then
   demo_pod_yaml demo-prep '"sleep", "5"'
   start_demo_pod demo-prep
   kubectl delete pod demo-prep -n "${NS}" --ignore-not-found >/dev/null 2>&1 || true
-  ok "genpolicy built, image pulled, EROFS layers and verity sidecars materialized"
+  ok "genpolicy built, image pulled, EROFS layers and their verity metadata materialized"
   log "now run: DEMO_PAUSE=1 ./demo.sh"
   exit 0
 fi
