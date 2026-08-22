@@ -249,8 +249,11 @@ EOF
 start_demo_pod() {
   local name="$1"
   kubectl delete pod "${name}" -n "${NS}" --ignore-not-found >/dev/null 2>&1 || true
-  kubectl apply -f "${WORK}/${name}.yaml" >/dev/null || die "kubectl apply failed for ${name}"
-  log "starting pod ${name} — this boots a fresh SEV-SNP CVM, so it is not instant"
+  # Shown rather than hidden: the audience should see the pod being created, and
+  # by what command, not just a status line claiming it happened.
+  _prompt "kubectl apply -f ${WORK}/${name}.yaml"
+  kubectl apply -f "${WORK}/${name}.yaml" || die "kubectl apply failed for ${name}"
+  log "this boots a fresh SEV-SNP CVM, so it is not instant"
   wait_for 300 "pod ${name} Running" \
     bash -c "kubectl get pod ${name} -n ${NS} -o jsonpath='{.status.phase}' | grep -qx Running"
 }
@@ -279,10 +282,18 @@ initdata_journal_line() {
 _TOOLCHAIN_READY=0
 ensure_policy_toolchain() {
   [[ "${_TOOLCHAIN_READY}" = "1" ]] && return 0
-  ensure_branch_genpolicy
-  ensure_genpolicy_defaults
+  # Prepare quietly: the build and staging chatter is scaffolding, and interleaving
+  # it with the narrative leaves output on screen with no command above it. The
+  # one fact worth showing is where the generator came from, and that is a beat.
+  local logf="${WORK}/toolchain.log"
+  { ensure_branch_genpolicy; ensure_genpolicy_defaults; } > "${logf}" 2>&1 \
+    || { cat "${logf}"; die "could not prepare the policy toolchain (see ${logf})"; }
   kubectl get ns "${NS}" >/dev/null 2>&1 || kubectl create ns "${NS}"
   _TOOLCHAIN_READY=1
+  # cargo is a no-op here — the build already happened above — so this shows the
+  # real command and its real answer without paying for it twice.
+  show "the policy is produced by this branch's own genpolicy, built from this tree" \
+    "cd ${E2E_REPO_DIR} && git rev-parse --short HEAD && cargo build --release -p genpolicy 2>&1 | tail -1 && ls -l target/release/genpolicy"
 }
 
 # Tie the pod that just booted to the CVM underneath it. The link is the sandbox

@@ -129,7 +129,11 @@ show() {
 
 NS="${E2E_NS:-coco-e2e}"
 POD=demo-frag-sidecar
-ensure_genpolicy_defaults
+# Quiet, for the same reason as demo.sh: staging chatter would land on screen
+# with no command above it. Failures still print the whole log.
+_SETUP_LOG=$(mktemp)
+ensure_genpolicy_defaults >> "${_SETUP_LOG}" 2>&1 \
+  || { cat "${_SETUP_LOG}"; die "could not stage genpolicy inputs"; }
 SETTINGS="${GP_SETTINGS}"
 RULES_SRC="${GP_RULES}"
 FRAG="${HOME}/.coco-e2e/fragments"
@@ -171,7 +175,9 @@ PLAIN_HTTP=()
 case "${FEED%%/*}" in localhost*|127.0.0.1*) PLAIN_HTTP=(--plain-http) ;; esac
 
 load_toolchain 2>/dev/null || true
-ensure_branch_genpolicy
+ensure_branch_genpolicy >> "${_SETUP_LOG}" 2>&1 \
+  || { cat "${_SETUP_LOG}"; die "could not build genpolicy from the branch"; }
+rm -f "${_SETUP_LOG}"
 
 SIGN()    { ( cd "${E2E_REPO_DIR}" && cargo run -q --example sign-fragment \
               -p kata-security-reference-monitor -- "$@" ); }
@@ -255,7 +261,8 @@ wipe_pod
 render_pod "" > "${WORK}/step1.yaml"
 "${GENPOLICY}" -y "${WORK}/step1.yaml" -p "${WORK}/rules-none.rego" -j "${SETTINGS}" \
   --initdata-path="${WORK}/initdata.toml" >/dev/null || die "genpolicy failed"
-kubectl apply -f "${WORK}/step1.yaml" >/dev/null
+_prompt "kubectl apply -f ${WORK}/step1.yaml"
+kubectl apply -f "${WORK}/step1.yaml"
 log "starting pod ${POD} — this boots a fresh SEV-SNP CVM, so it is not instant"
 wait_for 300 "pod ${POD} Running" pod_running
 ok "busybox is running, authorized by an entry in the measured policy"
@@ -271,7 +278,8 @@ render_pod "" > "${WORK}/step2.yaml"
 "${GENPOLICY}" -y "${WORK}/step2.yaml" -p "${WORK}/rules-none.rego" -j "${SETTINGS}" \
   --initdata-path="${WORK}/initdata.toml" >/dev/null || die "genpolicy failed"
 append_sidecar "${WORK}/step2.yaml"
-kubectl apply -f "${WORK}/step2.yaml" >/dev/null
+_prompt "kubectl apply -f ${WORK}/step2.yaml"
+kubectl apply -f "${WORK}/step2.yaml"
 log "starting pod ${POD} again — another fresh CVM boot"
 wait_for 300 "busybox ready" container_ready busybox
 sleep 20
@@ -370,7 +378,8 @@ render_pod "${SIDECAR_REF}" > "${WORK}/step4.yaml"
 "${GENPOLICY}" -y "${WORK}/step4.yaml" -p "${WORK}/rules-sidecar.rego" -j "${SETTINGS}" \
   --initdata-path="${WORK}/initdata.toml" >/dev/null || die "genpolicy failed"
 append_sidecar "${WORK}/step4.yaml"
-kubectl apply -f "${WORK}/step4.yaml" >/dev/null
+_prompt "kubectl apply -f ${WORK}/step4.yaml"
+kubectl apply -f "${WORK}/step4.yaml"
 log "starting pod ${POD} once more — final fresh CVM boot"
 wait_for 300 "sidecar ready" container_ready sidecar
 [[ "$(ready_of busybox)" = "true" ]] || die "busybox is not ready"
