@@ -426,7 +426,7 @@ live_binding_experiment() {
   demo_pod_yaml demo-control  '"sleep", "3600"'
 
   _tamper_run flip demo-tampered refused || return 0
-  show "the host stamped one policy and served another — same sandbox, one token apart" \
+  show "the host stamped one policy and served another — same sandbox, one character apart" \
     "cat ${WORK}/tamper-flip.log"
   show "and the pod never ran — this is kubelet's account, from outside the guest" \
     "kubectl get pod demo-tampered -n ${NS} -o custom-columns=NAME:.metadata.name,STATUS:.status.phase --no-headers; kubectl get events -n ${NS} --field-selector involvedObject.name=demo-tampered -o custom-columns=REASON:.reason,MESSAGE:.message --no-headers | grep -i sandbox | cut -c1-150 | head -2"
@@ -678,10 +678,14 @@ EOF
   So we can stage the attack for real, on this hardware, with no lie told to the
   hardware at all: let the runtime stamp the honest digest, then rewrite the
   image before the guest reads it. What we serve is the same policy with one
-  token changed — AllowRequestsFailingPolicy from false to true, which rules.rego
-  itself labels an unsecure configuration. It disables every rule at once and
-  leaves every dm-verity root hash intact, so nothing else in the guest has
-  cause to object.
+  character changed, inside a comment — no rule touched, no check disabled,
+  every dm-verity root hash intact, so nothing in the guest has any cause to
+  object to it except the binding itself.
+
+  A nastier edit would prove nothing extra. The guest aborts before the document
+  it was served is ever evaluated, so what a swapped policy *says* never gets a
+  chance to matter. What is on trial here is whether the served bytes have to be
+  the measured bytes.
 EOF
   pause
   live_binding_experiment

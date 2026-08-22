@@ -20,13 +20,17 @@ what closes it.
 
 Two modes, and the second is what makes the first mean anything:
 
-  flip     Serve a policy that differs from the measured one, minimally:
-           `default AllowRequestsFailingPolicy := false` -> `:= true`. That one
-           token disables every rule at once (rules.rego calls it "an unsecure
-           configuration") while leaving all the dm-verity root hashes intact,
-           so nothing else in the guest has cause to object. If the pod still
-           refuses to start, the binding check is the only thing that could
-           have refused it.
+  flip     Serve a document that differs from the measured one, minimally and
+           harmlessly: one character inside a comment in the policy's copyright
+           header. Deliberately inert -- it changes no rule, disables no check,
+           and leaves every dm-verity root hash intact, so nothing in the guest
+           has any cause to object to it except the binding itself. If the pod
+           still refuses to start, the binding check is the only thing that
+           could have refused it.
+
+           A meaner edit would be no more convincing: the guest aborts before
+           the served document is ever evaluated, so what the swapped policy
+           *says* never gets a chance to matter.
 
   control  Re-compress the *same* document. The bytes on disk change, the
            digest does not. If this boots normally, then rewriting the image is
@@ -59,8 +63,12 @@ BASE = "/run/kata-containers/shared/initdata"
 MAGIC = b"initdata"
 HEADER = 16
 
-FLIP_FROM = b"default AllowRequestsFailingPolicy := false"
-FLIP_TO = b"default AllowRequestsFailingPolicy := true"
+# A single character, inside a comment, same length in and out: the smallest
+# edit that is unambiguously not an attempt to weaken anything. Same length
+# matters -- the image is sector-padded, and keeping the size fixed keeps the
+# rewrite to exactly the bytes under test.
+FLIP_FROM = b"# Copyright (c) 2023 Microsoft Corporation"
+FLIP_TO = b"# copyright (c) 2023 Microsoft Corporation"
 
 
 def digest(toml: bytes) -> str:
@@ -121,7 +129,7 @@ def main() -> int:
     start = time.time()
     print("[tamper] mode=%s watching %s" % (args.mode, BASE), flush=True)
     if args.mode == "flip":
-        print("[tamper] will serve a policy that permits what the measured one denies", flush=True)
+        print("[tamper] will serve a policy edited by one character, inside a comment", flush=True)
     else:
         print("[tamper] will re-compress the same policy: new bytes, same digest", flush=True)
 
@@ -148,7 +156,7 @@ def main() -> int:
             before = digest(toml)
             if args.mode == "flip":
                 if FLIP_FROM not in toml:
-                    print("[tamper] %s: no AllowRequestsFailingPolicy default to flip" % sandbox[:12],
+                    print("[tamper] %s: no copyright comment to edit" % sandbox[:12],
                           flush=True)
                     continue
                 staged = toml.replace(FLIP_FROM, FLIP_TO)
