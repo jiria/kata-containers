@@ -852,6 +852,31 @@ if [[ "${ACTS}" == "0,1,2,3,4" ]]; then
   layers pinned by dm-verity root hashes that the measured policy names; a
   structured, redacted denial; and a signed fragment that extends the policy
   only within what the measurement already allowed.
+
+  Read the other way round — as the routes a hostile host would actually take
+  to get a container running under rules nobody approved — each one is closed
+  by something in the acts above, and by different machinery each time:
+
+    * Launch the guest under a policy of its own choosing. Not prevented, and
+      not meant to be: the host picks HOST_DATA. It is caught by attestation,
+      which works precisely because the digest in the report is honest.
+    * Stamp one policy and serve another. Refused at boot by the guest itself,
+      staged live in act 1 — with a control run, so the refusal is the digest
+      and not a broken image.
+    * Replace the policy once the guest is up. There is no channel: SetPolicy
+      is compiled out of a strict build, so initdata is the only way a policy
+      ever enters (act 3).
+    * Run a container the policy never described. Denied at
+      CreateContainerRequest, and the denial says which check failed without
+      echoing the request back (acts 3 and 4).
+    * Serve different image content behind an approved name. The measured
+      policy names every layer by dm-verity root hash, and the guest mounts
+      only those (act 2).
+    * Turn on a debug channel to work from inside. The guest overrides what the
+      host asks for: no log, no vsock port, no debug console (act 1).
+    * Smuggle permissions in through a fragment. It must be signed by an issuer
+      on the measured allow-list, declared by the measured policy, at or above
+      the SVN floor, and confined to its own feed's namespace (act 4).
 EOF
 else
   printf '\n  ran acts: %s (of 0,1,2,3,4)\n' "${ACTS}"
