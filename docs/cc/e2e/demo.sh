@@ -282,18 +282,22 @@ initdata_journal_line() {
 _TOOLCHAIN_READY=0
 ensure_policy_toolchain() {
   [[ "${_TOOLCHAIN_READY}" = "1" ]] && return 0
-  # Prepare quietly: the build and staging chatter is scaffolding, and interleaving
-  # it with the narrative leaves output on screen with no command above it. The
-  # one fact worth showing is where the generator came from, and that is a beat.
+  # No building here. genpolicy is built once by DEMO_PREP=1 (and preflight
+  # refuses to start without it), so the demo itself only ever displays evidence.
+  GENPOLICY="${E2E_REPO_DIR}/target/release/genpolicy"
+  export GENPOLICY
+  # Staging the rules/settings is file copying, not compilation, but it is still
+  # scaffolding: run it quietly and dump the whole log if it fails.
   local logf="${WORK}/toolchain.log"
-  { ensure_branch_genpolicy; ensure_genpolicy_defaults; } > "${logf}" 2>&1 \
-    || { cat "${logf}"; die "could not prepare the policy toolchain (see ${logf})"; }
+  ensure_genpolicy_defaults > "${logf}" 2>&1 \
+    || { cat "${logf}"; die "could not stage genpolicy inputs (see ${logf})"; }
   kubectl get ns "${NS}" >/dev/null 2>&1 || kubectl create ns "${NS}"
   _TOOLCHAIN_READY=1
-  # cargo is a no-op here — the build already happened above — so this shows the
-  # real command and its real answer without paying for it twice.
-  show "the policy is produced by this branch's own genpolicy, built from this tree" \
-    "cd ${E2E_REPO_DIR} && git rev-parse --short HEAD && cargo build --release -p genpolicy 2>&1 | tail -1 && ls -l target/release/genpolicy"
+  # version.rs.in stamps the commit into the binary at build time, so the binary
+  # itself can be asked what it was built from — no rebuild, and no taking the
+  # path's word for it.
+  show "the policy is produced by this branch's own genpolicy, and the binary says so" \
+    "H=\$(git -C ${E2E_REPO_DIR} rev-parse HEAD); echo \"tree HEAD           : \${H}\"; echo \"stamped in genpolicy: \$(strings ${E2E_REPO_DIR}/target/release/genpolicy | grep -m1 -o \"\${H}[a-z-]*\")\""
 }
 
 # Tie the pod that just booted to the CVM underneath it. The link is the sandbox
@@ -478,6 +482,10 @@ preflight() {
     || die "passwordless sudo is required — acts 1 and 2 read the journal and containerd's root-only snapshot dirs"
   [[ -r "${E2E_REPO_DIR}/src/agent/src/mediation.rs" ]] \
     || die "no source tree at E2E_REPO_DIR=${E2E_REPO_DIR} — acts 2 and 3 quote the source directly"
+  # Checked here rather than built on demand: a compile in the middle of an act is
+  # exactly the kind of scaffolding the demo should never show.
+  [[ "${DEMO_PREP:-0}" = "1" || -x "${E2E_REPO_DIR}/target/release/genpolicy" ]] \
+    || die "genpolicy has not been built — run DEMO_PREP=1 ./demo.sh first"
   [[ -r "${E2E_GUEST_IGVM}" ]] \
     || die "no guest IGVM at ${E2E_GUEST_IGVM} — run 04-build-guest-stack.sh first"
   kubectl get nodes >/dev/null 2>&1 \
@@ -899,6 +907,7 @@ export DEMO_NARRATE="${DEMO_NARRATE:-1}"
 # the pod-start wait in act 1, where it looks like the platform being slow.
 if [[ "${DEMO_PREP:-0}" = "1" ]]; then
   step "prep — doing the slow work now so the demo does not"
+  ensure_branch_genpolicy
   ensure_policy_toolchain
   # Act 1 runs the agent's binding tests live. Cached that is ~4s; cold it is a
   # full agent test build, which is not something to discover mid-demo.
@@ -906,6 +915,13 @@ if [[ "${DEMO_PREP:-0}" = "1" ]]; then
   (cd "${E2E_REPO_DIR}/src/agent" \
     && cargo test --features strict-policy,tsm-test-override --no-run >/dev/null 2>&1) \
     || warn "could not pre-build the agent tests — act 1's binding beat will compile them itself"
+  # Act 4 signs and publishes a fragment with `cargo run`, which compiles on first
+  # use. Build both now so nothing in the act is waiting on rustc.
+  log "warming the fragment signing and publishing tools (act 4 uses both)"
+  (cd "${E2E_REPO_DIR}" \
+    && cargo build -q --example sign-fragment -p kata-security-reference-monitor \
+    && cargo build -q -p genpolicy-fragmentgen) \
+    || warn "could not pre-build the fragment tools — act 4 will compile them itself"
   demo_pod_yaml demo-prep '"sleep", "5"'
   start_demo_pod demo-prep
   kubectl delete pod demo-prep -n "${NS}" --ignore-not-found >/dev/null 2>&1 || true

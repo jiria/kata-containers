@@ -175,8 +175,9 @@ PLAIN_HTTP=()
 case "${FEED%%/*}" in localhost*|127.0.0.1*) PLAIN_HTTP=(--plain-http) ;; esac
 
 load_toolchain 2>/dev/null || true
-ensure_branch_genpolicy >> "${_SETUP_LOG}" 2>&1 \
-  || { cat "${_SETUP_LOG}"; die "could not build genpolicy from the branch"; }
+# Built by DEMO_PREP=1 (demo.sh), never here: this runs mid-demo.
+GENPOLICY="${E2E_REPO_DIR}/target/release/genpolicy"
+[[ -x "${GENPOLICY}" ]] || die "genpolicy has not been built — run DEMO_PREP=1 ./demo.sh first"
 rm -f "${_SETUP_LOG}"
 
 SIGN()    { ( cd "${E2E_REPO_DIR}" && cargo run -q --example sign-fragment \
