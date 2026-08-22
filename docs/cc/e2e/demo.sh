@@ -257,15 +257,21 @@ gen_policy_for() {
     || die "no cc_init_data annotation — genpolicy did not inject a measured policy"
 }
 
-# Same, but on screen: the command that produces the policy, and the annotation
-# it left behind. The claim in the narration is that the policy is generated for
-# this exact spec, so the generation is worth watching rather than asserting.
+# Same, but on screen: the spec that goes in, the command that produces the
+# policy, and the annotation it leaves behind. The claim in the narration is that
+# the policy is generated for this exact spec, so both ends of that are worth
+# watching rather than asserting — the input especially, since it is otherwise
+# written off screen and the audience has only our word for what was in it.
 gen_policy_shown() {
   local name="$1"
-  show "generate the policy for this exact pod spec — genpolicy writes it back into the yaml" \
+  show "the input is an ordinary pod spec — no policy, no annotations, nothing measured yet" \
+    "cat ${WORK}/${name}.yaml"
+  show "generate the policy for this exact pod spec — genpolicy rewrites that file in place" \
     "${GENPOLICY} -y ${WORK}/${name}.yaml -p ${GP_RULES} -j ${GP_SETTINGS} && grep -c . ${WORK}/${name}.yaml | xargs -I{} echo \"${name}.yaml is now {} lines\""
   grep -q 'cc_init_data' "${WORK}/${name}.yaml" \
     || die "no cc_init_data annotation — genpolicy did not inject a measured policy"
+  show "and this is what it added: one annotation, carrying the policy it just derived" \
+    "grep -m1 'cc_init_data:' ${WORK}/${name}.yaml | cut -c1-88; A=\$(grep -m1 'cc_init_data:' ${WORK}/${name}.yaml | sed 's/^.*cc_init_data: //'); echo \"  ...\"; echo \"  \${#A} base64 characters in total — opened up later in this act\""
 }
 
 start_demo_pod() {
@@ -536,13 +542,13 @@ act0() {
   hardening in the acts that follow is demonstrated on real confidential
   hardware rather than under nested virt on an ordinary host.
 EOF
-  show "the hypervisor device on this node is /dev/mshv" \
-    "ls -l /dev/mshv"
-  # Not a module on this kernel, so lsmod/modinfo say nothing. The binding is
-  # visible instead in the misc class node carrying the same major:minor as the
-  # device, and in the driver's own boot lines.
-  show "it belongs to the in-kernel mshv driver — the misc class node carries the same major:minor" \
-    "cat /sys/class/misc/mshv/dev"
+  show "there is no KVM on this node — no device node, and no kvm module loaded" \
+    "ls -l /dev/kvm 2>&1; lsmod | grep -E '^kvm' || echo '(no kvm module loaded)'"
+  # mshv is not a module on this kernel, so lsmod/modinfo say nothing about it
+  # either. The binding shows instead in the misc class node carrying the same
+  # major:minor as the device, and in the driver's own boot lines.
+  show "the hypervisor here is /dev/mshv, and it belongs to the in-kernel mshv driver — same major:minor" \
+    "ls -l /dev/mshv; cat /sys/class/misc/mshv/dev"
   show "and this is what that driver reported at boot, including what the hardware offers it" \
     "sudo journalctl -k --no-pager | grep -m3 'misc mshv:'"
   scene
