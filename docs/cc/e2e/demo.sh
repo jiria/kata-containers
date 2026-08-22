@@ -318,8 +318,14 @@ show_sandbox_backing() {
     warn "could not resolve the sandbox id for ${name} — skipping the hypervisor linkage"
     return 0
   fi
-  show "each Cloud Hypervisor process on this node is exactly one pod sandbox" \
-    "ps -eo pid,args | grep '[c]loud-hypervisor' | cut -c1-150"
+  # Deliberately paired with crictl: a node often has more than one confidential
+  # sandbox alive, and a bare process list then raises "why are there two?".
+  # Listing the kata pods beside the process count answers it on screen.
+  #
+  # Counted through /proc/*/exe rather than a ps|grep, which counts the shell
+  # running the pattern as well and reports one process too many.
+  show "one Cloud Hypervisor process per confidential sandbox — and each one is a pod" \
+    "sudo crictl pods --state Ready 2>/dev/null | awk 'NR==1 || \$NF==\"${E2E_RUNTIMECLASS}\"'; echo; echo \"cloud-hypervisor processes: \$(sudo ls -l /proc/*/exe 2>/dev/null | grep -c cloud-hypervisor)\""
   show "and the sandbox id is what ties this pod's shim to this pod's VM" \
     "ps -eo pid,args | grep '[${sid:0:1}]${sid:1:11}' | cut -c1-130"
   pause
