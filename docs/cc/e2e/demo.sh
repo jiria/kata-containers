@@ -44,13 +44,15 @@
 #
 # Also needed: kubectl, jq, passwordless sudo (acts 1 and 2 read the journal and
 # the containerd snapshot dirs, both root-only), a cargo toolchain, and the
-# source tree at E2E_REPO_DIR — acts 2 and 3 quote versions.yaml, rpc.rs and
-# mediation.rs directly, because showing the source is the point.
+# source tree at E2E_REPO_DIR — acts 1, 2 and 3 quote the agent and runtime
+# source directly, because showing the source is the point.
 #
 # In practice: ./run-all.sh 01 02 03 04 06, then DEMO_PREP=1 ./demo.sh.
 #
 # Env:
 #   DEMO_PAUSE=1     wait for Enter between beats (default: run straight through)
+#   DEMO_CLEAR=0     keep the screen when paused (default: clear between beats,
+#                    redrawing the act heading; scrollback is preserved)
 #   DEMO_ACTS=0,2    run only these acts (default: 0,1,2,3,4)
 #   DEMO_PREP=1      do the slow work and exit — build genpolicy, warm the image
 #                    pull, then stop. Run this *before* the demo: otherwise act 1
@@ -67,6 +69,23 @@ export E2E_PLATFORM
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
+# Clearing the screen between beats costs the audience its place, so the act
+# heading is redrawn afterwards — which means remembering it. Wrapping lib.sh's
+# step keeps the heading format defined in exactly one place.
+eval "_lib_step() $(declare -f step | tail -n +2)"
+_CUR_STEP=""
+
+# Home the cursor and erase the visible screen. Deliberately not `clear`: on this
+# distro that also emits ESC[3J, which drops the scrollback buffer — so anything
+# scrolled past would be genuinely gone rather than just off-screen.
+_demo_clear() {
+  [[ "${DEMO_PAUSE:-0}" = "1" && "${DEMO_CLEAR:-1}" = "1" ]] || return 1
+  [[ -n "${TERM:-}" && "${TERM}" != "dumb" ]] || return 1
+  printf '\033[H\033[2J'
+}
+
+step() { _CUR_STEP="$*"; _demo_clear; _lib_step "$@"; }
+
 NS="${E2E_NS:-coco-e2e}"
 ACTS="${DEMO_ACTS:-0,1,2,3,4}"
 WORK=$(mktemp -d)
@@ -76,6 +95,11 @@ pause() {
   [[ "${DEMO_PAUSE:-0}" = "1" ]] || return 0
   printf '\n    press Enter to continue '
   read -r _
+  # Start each beat on a clean screen. The previous evidence has been read and
+  # discussed by this point, and leaving it up makes it hard to see what is new.
+  # Only interactive runs clear: a piped or unpaused run keeps the full
+  # transcript, which is what gets checked afterwards.
+  _demo_clear && [[ -n "${_CUR_STEP}" ]] && _lib_step "${_CUR_STEP}"
 }
 
 want_act() { [[ ",${ACTS}," == *",$1,"* ]]; }
@@ -161,6 +185,43 @@ ensure_policy_toolchain() {
   _TOOLCHAIN_READY=1
 }
 
+# Tie the pod that just booted to the CVM underneath it. The link is the sandbox
+# id: it appears in the shim's -id and again in the path of the API socket that
+# Cloud Hypervisor was launched with, so the chain from pod to partition is
+# something the audience can follow rather than something we assert.
+show_sandbox_backing() {
+  local name="$1"
+  show "the pod asked for the confidential runtime class, and the node honored it" \
+    "kubectl get pod ${name} -n ${NS} -o custom-columns=NAME:.metadata.name,RUNTIMECLASS:.spec.runtimeClassName,STATUS:.status.phase,NODE:.spec.nodeName"
+  show "that class is not a label: containerd routes it to its own shim and snapshotter" \
+    "grep -A2 'runtimes.${E2E_RUNTIMECLASS}\]' /etc/containerd/config.toml"
+  pause
+
+  local sid
+  sid=$(sudo crictl pods --name "${name}" --state Ready -o json 2>/dev/null | jq -r '.items[0].id // empty')
+  if [[ -z "${sid}" ]]; then
+    warn "could not resolve the sandbox id for ${name} — skipping the hypervisor linkage"
+    return 0
+  fi
+  show "each Cloud Hypervisor process on this node is exactly one pod sandbox" \
+    "ps -eo pid,args | grep '[c]loud-hypervisor' | cut -c1-150"
+  show "and the sandbox id is what ties this pod's shim to this pod's VM" \
+    "ps -eo pid,args | grep '[${sid:0:1}]${sid:1:11}' | cut -c1-130"
+  pause
+
+  local clh
+  clh=$(pgrep -f "/run/kata/${sid}/ch-api.sock" | head -n 1)
+  if [[ -z "${clh}" ]]; then
+    warn "no Cloud Hypervisor process found for sandbox ${sid} — skipping the MSHV check"
+    return 0
+  fi
+  # The fd table is the honest answer to "which hypervisor is this really?" —
+  # a partition handle and a vCPU handle can only have come from /dev/mshv.
+  show "that VM is driven by MSHV — a partition and a vCPU, and no KVM descriptor anywhere" \
+    "sudo ls -l /proc/${clh}/fd | awk '/mshv|kvm/{print \$NF}' | sort -u"
+  pause
+}
+
 # The measured document itself, straight out of the pod spec.
 INITDATA_JSONPATH='{.metadata.annotations.io\.katacontainers\.config\.hypervisor\.cc_init_data}'
 decode_initdata() {
@@ -235,6 +296,13 @@ EOF
   pause
 
   start_demo_pod demo-a
+  cat <<'EOF'
+
+  Before opening the document, it is worth establishing what just booted — a
+  pod is only as confidential as the sandbox underneath it.
+EOF
+  show_sandbox_backing demo-a
+
   decode_initdata demo-a "${WORK}/a.toml"
   show "that annotation is an initdata document — decode it straight out of the running pod" \
     "kubectl get pod demo-a -n ${NS} -o jsonpath='${INITDATA_JSONPATH}' | base64 -d | gunzip | head -5"
@@ -300,8 +368,31 @@ EOF
   being told what to trust.
 
   And the guest checks this itself: the agent reads its own SNP report and
-  aborts unless the delivered document hashes to HOST_DATA. So a pod that
-  reached Running is itself the evidence that the binding held.
+  aborts unless the delivered document hashes to HOST_DATA.
+
+  The fair question is whether we can watch it do that — print the value the
+  guest saw. We cannot, and the reason is worth more than the number would be.
+  This build closes every channel that could carry it out.
+EOF
+  pause
+  show "the agent's log stream is wired to a sink — a strict build forwards nothing" \
+    "grep -n -B4 'Box::new(tokio::io::sink())' ${E2E_REPO_DIR}/src/agent/src/main.rs"
+  show "and it cannot even construct a vsock listener: the socket import is compiled out" \
+    "grep -n -B1 'use nix::sys::socket' ${E2E_REPO_DIR}/src/agent/src/main.rs"
+  pause
+  show "nor can the host ask for it back — the guest overrides what it is told" \
+    "grep -n -A6 '\*debug_console = false;' ${E2E_REPO_DIR}/src/agent/src/config.rs"
+  cat <<'EOF'
+
+  No log, no port, no debug console, no tracing — and the host cannot re-enable
+  any of them, because those settings arrive on the kernel command line and this
+  build refuses to honor them. Note what that costs us right here: the demo
+  would be more satisfying if the guest could just tell us. It does not, and it
+  should not.
+
+  So the evidence is not a line of output. It is that the pod reached Running at
+  all. Had the delivered document not hashed to HOST_DATA, the agent would have
+  aborted and there would be nothing to look at.
 EOF
   pause
 }
@@ -323,21 +414,32 @@ EOF
   show "containerd built each layer as an EROFS image, with verity metadata beside it" \
     "sudo find ${SNAP} -maxdepth 2 -name 'layer.erofs*' | sort | head"
   pause
-  show "each sidecar carries the dm-verity root hash of its layer" \
+  show "one such file per layer — and a pod has several, across its images and the pause container" \
     "sudo find ${SNAP} -maxdepth 2 -name 'layer.erofs.dmverity' | sort | while read -r f; do echo \"\$f\"; sudo cat \"\$f\"; echo; done | head -20"
+  pause
+
+  show "and the policy names them in the mount options the guest must be handed" \
+    "grep -oE 'X-kata\.dmverity\.roothash=[a-f0-9]{64}' ${WORK}/a.toml | sort -u | head -3"
   pause
 
   sudo find "${SNAP}" -maxdepth 2 -name 'layer.erofs.dmverity' -exec cat {} \; 2>/dev/null \
     | jq -r '.roothash' 2>/dev/null | sort -u > "${WORK}/host-hashes.txt"
-  grep -oE '[a-f0-9]{64}' "${WORK}/a.toml" | sort -u > "${WORK}/policy-hashes.txt"
+  # Extract by the option that actually carries a root hash. Grepping for any
+  # 64-hex string would also pick up image digests and quietly inflate the count.
+  grep -oE 'X-kata\.dmverity\.roothash=[a-f0-9]{64}' "${WORK}/a.toml" \
+    | cut -d= -f2 | sort -u > "${WORK}/policy-hashes.txt"
 
-  printf '\n  %s->%s the measured policy names those layers, by root hash\n' "${_c_blu}" "${_c_off}"
-  printf '     host sidecars : %s\n' "$(wc -l < "${WORK}/host-hashes.txt")"
-  printf '     in the policy : %s\n' "$(wc -l < "${WORK}/policy-hashes.txt")"
-  local matched; matched=$(comm -12 "${WORK}/host-hashes.txt" "${WORK}/policy-hashes.txt" | wc -l)
+  printf '\n  %s->%s the measured policy names each of those layers, by root hash\n' "${_c_blu}" "${_c_off}"
+  printf '     EROFS layers on this host : %s\n' "$(wc -l < "${WORK}/host-hashes.txt")"
+  printf '     root hashes in the policy : %s\n' "$(wc -l < "${WORK}/policy-hashes.txt")"
+  local matched missing
+  matched=$(comm -12 "${WORK}/host-hashes.txt" "${WORK}/policy-hashes.txt" | wc -l)
+  missing=$(comm -13 "${WORK}/host-hashes.txt" "${WORK}/policy-hashes.txt" | wc -l)
   comm -12 "${WORK}/host-hashes.txt" "${WORK}/policy-hashes.txt" | sed 's/^/     match  /'
-  if [[ "${matched}" -gt 0 ]]; then
-    ok "${matched} layer root hash(es) present in both — the policy pins these exact layers"
+  if [[ "${matched}" -gt 0 && "${missing}" -eq 0 ]]; then
+    ok "every root hash the policy names is a layer containerd actually built (${matched})"
+  elif [[ "${matched}" -gt 0 ]]; then
+    warn "${matched} matched, but ${missing} policy hash(es) have no layer on this host"
   else
     warn "no overlap — the running pod's layers may not be among the snapshots listed"
   fi
@@ -348,11 +450,10 @@ EOF
   cat <<'EOF'
 
   genpolicy did not read those hashes off this host. It predicted them offline,
-  reproducing containerd's mkfs.erofs invocation byte-for-byte against a
-  matching erofs-utils, so the policy can be generated anywhere.
+  reproducing containerd's mkfs.erofs invocation byte-for-byte against a pinned
+  erofs-utils — which is why the policy can be generated anywhere, and why the
+  match above is a result rather than a copy.
 EOF
-  show "which is why the erofs-utils version is pinned — installed matches the pin" \
-    "mkfs.erofs --version 2>&1 | head -1; grep -A9 -i '^  erofs-utils:' ${E2E_REPO_DIR}/versions.yaml | grep -iE '^[[:space:]]+version:' | head -1 | sed 's/^/versions.yaml pin: /'"
   pause
 
   show "note where the verity device is NOT: the host has no dm devices at all" \

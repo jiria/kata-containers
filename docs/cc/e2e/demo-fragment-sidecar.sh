@@ -33,6 +33,20 @@ set -euo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
+# Same as demo.sh: remember the current heading so pause() can redraw it after
+# clearing the screen, without duplicating lib.sh's heading format.
+eval "_lib_step() $(declare -f step | tail -n +2)"
+_CUR_STEP=""
+
+# Not `clear`: that also emits ESC[3J here, which discards the scrollback.
+_demo_clear() {
+  [[ "${DEMO_PAUSE:-0}" = "1" && "${DEMO_CLEAR:-1}" = "1" ]] || return 1
+  [[ -n "${TERM:-}" && "${TERM}" != "dumb" ]] || return 1
+  printf '\033[H\033[2J'
+}
+
+step() { _CUR_STEP="$*"; _demo_clear; _lib_step "$@"; }
+
 NS="${E2E_NS:-coco-e2e}"
 POD=demo-frag-sidecar
 ensure_genpolicy_defaults
@@ -51,6 +65,7 @@ pause() {
   [[ "${DEMO_PAUSE:-0}" = "1" ]] || return 0
   printf '\n    press Enter to continue '
   read -r _
+  _demo_clear && [[ -n "${_CUR_STEP}" ]] && _lib_step "${_CUR_STEP}"
 }
 
 need kubectl; need jq; need python3
