@@ -172,7 +172,7 @@ need kubectl; need jq; need python3
 [[ -s "${FRAG}/key.txt" ]] || die "no issuer key at ${FRAG}/key.txt — run 06-policy-fragment-e2e.sh first"
 [[ -r "${RULES_SRC}" ]] || die "no staged rules.rego at ${RULES_SRC} — run 03-deploy-cluster.sh first"
 
-ISSUER=$(jq -r .issuer "${ENTRY}")
+ISSUER_CN="e2e-fragment-signer"
 FEED=$(jq -r .feed "${ENTRY}")
 SVN=$(jq -r .minimum_svn "${ENTRY}")
 PRIV=$(grep '^private_key_hex=' "${FRAG}/key.txt" | cut -d= -f2)
@@ -214,12 +214,54 @@ LEDGER_PRIV=$(grep '^private_key_hex=' "${WORK}/ledger.txt" | cut -d= -f2)
 LEDGER_PUB=$(grep  '^public_key_hex='  "${WORK}/ledger.txt" | cut -d= -f2)
 [[ -n "${LEDGER_PRIV}" && -n "${LEDGER_PUB}" ]] || die "could not parse the ledger keypair"
 
+# ------------------------------------------------------------------ did:x509
+# FR-1d: the issuer is a certificate identity, not a bare key — the same shape
+# C-ACI uses. A throwaway CA and one code-signing leaf, minted per run: nothing
+# here is reusable as a trust anchor anywhere else.
+need openssl
+( umask 077
+  openssl ecparam -name prime256v1 -genkey -noout -out "${WORK}/ca.key" 2>/dev/null
+  openssl req -x509 -new -key "${WORK}/ca.key" -sha256 -days 2 \
+      -subj "/CN=e2e-fragment-ca" -out "${WORK}/ca.pem" 2>/dev/null
+  openssl ecparam -name prime256v1 -genkey -noout -out "${WORK}/leaf.ec.key" 2>/dev/null
+  # sign-fragment parses PKCS#8; `ecparam` emits SEC1.
+  openssl pkcs8 -topk8 -nocrypt -in "${WORK}/leaf.ec.key" -out "${WORK}/leaf.key" 2>/dev/null
+  openssl req -new -key "${WORK}/leaf.key" -subj "/CN=${ISSUER_CN}" -out "${WORK}/leaf.csr" 2>/dev/null
+  printf 'extendedKeyUsage = codeSigning\n' > "${WORK}/leaf.ext"
+  openssl x509 -req -in "${WORK}/leaf.csr" -CA "${WORK}/ca.pem" -CAkey "${WORK}/ca.key" \
+      -CAcreateserial -days 2 -sha256 -extfile "${WORK}/leaf.ext" -out "${WORK}/leaf.pem" 2>/dev/null
+) || die "could not mint the demo certificate chain"
+CA_FP_HEX=$(openssl x509 -in "${WORK}/ca.pem" -outform DER 2>/dev/null | sha256sum | cut -d' ' -f1)
+[[ ${#CA_FP_HEX} -eq 64 ]] || die "could not fingerprint the demo CA"
+# The canonical did:x509 form: version, fingerprint algorithm, base64url of the
+# CA fingerprint, then the policy the leaf must satisfy.
+CA_FP_B64=$(openssl x509 -in "${WORK}/ca.pem" -outform DER 2>/dev/null \
+  | openssl dgst -sha256 -binary | base64 | tr '+/' '-_' | tr -d '=\n')
+ISSUER="did:x509:0:sha256:${CA_FP_B64}::subject:CN:${ISSUER_CN}"
+EKU_CODE_SIGNING="1.3.6.1.5.5.7.3.3"
+X509_ARGS=(--x509-key "${WORK}/leaf.key" --x509-chain "${WORK}/leaf.pem,${WORK}/ca.pem")
+
+# `[[issuer]]` is where feeds, SVN floors and receipt scoping are declared, and
+# its schema still requires an Ed25519 key. Mint a throwaway one so the field is
+# a real key rather than a fabricated value — its private half signs only the
+# Ed25519 envelope that sign-fragment emits alongside the x509 one and that
+# nothing in this demo delivers. `require_x509 = true` makes the raw-key path
+# unreachable regardless (see the note in step 3).
+( umask 077; SIGN gen-key > "${WORK}/placeholder.txt" ) \
+  || die "could not generate the placeholder keypair"
+PRIV=$(grep '^private_key_hex=' "${WORK}/placeholder.txt" | cut -d= -f2)
+PLACEHOLDER_PUB=$(grep '^public_key_hex=' "${WORK}/placeholder.txt" | cut -d= -f2)
+
 # The receipt requirement is scoped to one feed rather than switched on globally:
 # the sidecar feed above is delivered by boot-pull, which carries no receipt, and
 # the point of step 5 is that the requirement is per issuer and per feed.
 RECEIPT_FEED="${FEED}-receipt-demo"
 {
-  cat "${FRAG}/fragment-issuers.toml"
+  printf 'require_receipt = false\nrequire_x509 = true\n'
+  printf '\n[[ca_anchor]]\ndid = "%s"\nca_fingerprint_hex = "%s"\n' "${ISSUER}" "${CA_FP_HEX}"
+  printf 'require_subject_cn = "%s"\nrequire_eku = ["%s"]\n' "${ISSUER_CN}" "${EKU_CODE_SIGNING}"
+  printf '\n[[issuer]]\nid = "%s"\ned25519_pubkey_hex = "%s"\nmin_svn = %s\n' \
+    "${ISSUER}" "${PLACEHOLDER_PUB}" "${SVN}"
   printf '\n[[issuer.feed]]\nname = "%s"\nmin_svn = %s\nrequired_receipt_from = ["%s"]\n' \
     "${RECEIPT_FEED}" "${SVN}" "${LEDGER_ID}"
   printf '\n[[ledger]]\nid = "%s"\npubkey_hex = ["%s"]\n' "${LEDGER_ID}" "${LEDGER_PUB}"
@@ -461,11 +503,33 @@ fi
   printf 'containers := [%s]\n' "$(cat "${WORK}/entry.json")"
 } > "${WORK}/sidecar.rego"
 show "the fragment declares" "head -4 ${WORK}/sidecar.rego"
+say <<EOF
+
+  Note what the issuer is. Not a key fingerprint and not a name we made up — a
+  did:x509, which is a trust policy written as an identifier: version, hash
+  algorithm, the CA certificate's SHA-256 fingerprint, and the constraints the
+  signing leaf must satisfy.
+
+    ${ISSUER}
+
+  Nothing resolves that over a network; a confidential guest has no egress and
+  needs none. The chain travels inside the envelope, and the identifier is
+  checked against it. The measured initdata pins the CA fingerprint, the leaf's
+  common name and its code-signing EKU, and this build sets require_x509, so the
+  raw-key path is not reachable at all — a chain cannot be stripped to land on a
+  weaker check.
+EOF
+show "the anchor, as measured into this pod's initdata" \
+  "sed -n '/\\[\\[ca_anchor\\]\\]/,/^\$/p' ${WORK}/fragment-issuers.toml"
+show "and the chain that has to satisfy it" \
+  "openssl x509 -in ${WORK}/leaf.pem -noout -subject -issuer -ext extendedKeyUsage 2>/dev/null; echo; echo -n 'CA SHA-256: '; openssl x509 -in ${WORK}/ca.pem -outform DER 2>/dev/null | sha256sum | cut -d' ' -f1"
+pause
 
 SIGN sign --issuer "${ISSUER}" --feed "${SIDECAR_FEED}" --svn "${SVN}" \
-     --module "${WORK}/sidecar.rego" --key "${PRIV}" > "${WORK}/sign.txt" \
+     --module "${WORK}/sidecar.rego" --key "${PRIV}" "${X509_ARGS[@]}" > "${WORK}/sign.txt" \
   || { tail -20 "${WORK}/sign.txt"; die "signing failed"; }
-grep '^cose_sign1_hex=' "${WORK}/sign.txt" | cut -d= -f2 > "${WORK}/cose.hex"
+grep '^cose_sign1_x509_hex=' "${WORK}/sign.txt" | cut -d= -f2 > "${WORK}/cose.hex"
+[[ -s "${WORK}/cose.hex" ]] || die "sign-fragment produced no did:x509 envelope"
 FRAGGEN --cose "${WORK}/cose.hex" --push "${SIDECAR_REF}" "${PLAIN_HTTP[@]}" > "${WORK}/push.txt" \
   || { tail -20 "${WORK}/push.txt"; die "publishing failed"; }
 ok "published ${SIDECAR_REF}, COSE_Sign1-signed by ${ISSUER} at svn ${SVN}"
@@ -482,6 +546,14 @@ say <<'EOF'
   header: the issuer it must find on the measured allow-list, the feed it may
   write under, and the SVN it must meet. All three are inside the signature, so
   a host that edits any of them invalidates the envelope it is trying to pass.
+
+  The chain sits in the unprotected header, and the inspector is right to say
+  that is not signed — so ask the obvious question: can the host swap it? It
+  can, and it gains nothing. The chain is not the identity. The identity is the
+  issuer string in the *signed* header, and the guest only accepts it if the
+  chain it was handed leads to the measured CA, satisfies the leaf policy, and
+  ends in the key that actually produced this signature. Substituting a chain
+  the host controls fails the anchor; keeping the real chain changes nothing.
 EOF
 show "and this is the Rego it would add — the same module we signed, read back out of the envelope" \
   "python3 ${_INSPECT} ${WORK}/cose.hex --payload | head -4"
@@ -551,10 +623,12 @@ pause
   printf 'receipt_demo_loaded := true\n'
 } > "${WORK}/receipt.rego"
 SIGN sign --issuer "${ISSUER}" --feed "${RECEIPT_FEED}" --svn "${SVN}" \
-     --module "${WORK}/receipt.rego" --key "${PRIV}" \
-     --emit-statement "${WORK}/receipt.stmt" > "${WORK}/receipt.sign.txt" \
+     --module "${WORK}/receipt.rego" --key "${PRIV}" "${X509_ARGS[@]}" \
+     --emit-x509-statement "${WORK}/receipt.stmt" > "${WORK}/receipt.sign.txt" \
   || { tail -20 "${WORK}/receipt.sign.txt"; die "signing the receipt-feed fragment failed"; }
-grep '^cose_sign1_hex=' "${WORK}/receipt.sign.txt" | cut -d= -f2 > "${WORK}/receipt.cose.hex"
+grep '^cose_sign1_x509_hex=' "${WORK}/receipt.sign.txt" | cut -d= -f2 > "${WORK}/receipt.cose.hex"
+[[ -s "${WORK}/receipt.cose.hex" && -s "${WORK}/receipt.stmt" ]] \
+  || die "sign-fragment produced no did:x509 envelope or statement"
 ok "signed a fragment on ${RECEIPT_FEED} at svn ${SVN}"
 pause
 
@@ -659,7 +733,8 @@ say <<EOF
   The difference is a signed, versioned artifact fetched from a registry by the
   host and verified inside the guest before it can authorize anything:
 
-    * the issuer is on an allow-list measured into initdata, not into the policy
+    * the issuer is a did:x509 whose CA fingerprint and leaf policy are measured
+      into initdata, not into the policy — and the chain is inside the envelope
     * the fragment is COSE_Sign1-signed and its feed must match the declaration
     * its SVN must be at or above the floor the policy declares
     * it may only write under its own signed feed's namespace

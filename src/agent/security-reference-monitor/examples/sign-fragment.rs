@@ -30,6 +30,11 @@
 //! writes the same rendering to a file. `--emit-statement` writes the COSE `Sig_structure`,
 //! which is what a transparency ledger records as a Merkle leaf and what receipts
 //! countersign; those bytes must stay byte-exact.
+//!
+//! `--x509-key`/`--x509-chain` additionally emit a `did:x509` envelope (`cose_sign1_x509_hex=`),
+//! signed by an EC P-256 leaf with the chain in the `x5chain` header. Its protected header
+//! carries ES256, so its `Sig_structure` differs from the Ed25519 one: use
+//! `--emit-x509-statement` for that envelope's ledger leaf, never `--emit-statement`.
 
 use ed25519_dalek::{Signer, SigningKey};
 use kata_security_reference_monitor::PolicyFragment;
@@ -377,10 +382,21 @@ fn main() {
                 let tbs = sign1.tbs_data(b"");
                 let sig: Signature = leaf_sk.sign(&tbs);
                 sign1.signature = sig.to_bytes().to_vec();
-                println!(
-                    "cose_sign1_x509_hex={}",
-                    hex_encode(&sign1.to_vec().unwrap())
-                );
+                let x509_bytes = sign1.to_vec().unwrap();
+                println!("cose_sign1_x509_hex={}", hex_encode(&x509_bytes));
+
+                // The x509 envelope's protected header carries ES256, so its `Sig_structure`
+                // is *not* the one `--emit-statement` wrote for the Ed25519 envelope above.
+                // A ledger leaf minted from the wrong one validates as a signature and still
+                // binds the wrong bytes, so these are separate flags rather than an
+                // overwrite: whichever envelope is delivered, its own statement is named.
+                if let Some(path) = f.get("emit-x509-statement") {
+                    std::fs::write(path, &tbs).expect("write x509 statement file");
+                }
+                if let Some(path) = f.get("emit-x509-statement-diag") {
+                    std::fs::write(path, statement_diag(&x509_bytes))
+                        .expect("write x509 statement diag file");
+                }
             }
         }
         // FR-1d dev/verification tool: verify a did:x509 COSE fragment offline against a CA
