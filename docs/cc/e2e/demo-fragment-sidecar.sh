@@ -400,17 +400,29 @@ agent_hvsock_flag() {
 
 # ---------------------------------------------------------------------------
 step "1 — a container the measured policy contains"
-log "generating a policy from a one-container pod, then running that pod"
-wipe_pod
-render_pod "" > "${WORK}/step1.yaml"
-"${GENPOLICY}" -y "${WORK}/step1.yaml" -p "${WORK}/rules-none.rego" -j "${SETTINGS}" \
-  --initdata-path="${WORK}/initdata.toml" >/dev/null || die "genpolicy failed"
-_prompt "kubectl apply -f ${WORK}/step1.yaml"
-kubectl apply -f "${WORK}/step1.yaml"
-log "starting pod ${POD} — this boots a fresh SEV-SNP CVM, so it is not instant"
-wait_for 300 "pod ${POD} Running" pod_running
-ok "busybox is running, authorized by an entry in the measured policy"
-pause
+# Steps 1-2 need nothing more than a running pod whose measured policy declares
+# no fragments — which is exactly what act 1 left behind. Reuse it rather than
+# spending another CVM boot on an identical one. Steps 3-5 do need their own
+# pod, because those carry a measured issuer list act 1's pod does not have.
+FRAG_POD=demo-frag-sidecar
+if [[ -n "${E2E_BASE_POD:-}" ]] \
+   && [[ "$(kubectl get pod "${E2E_BASE_POD}" -n "${NS}" -o jsonpath='{.status.phase}' 2>/dev/null)" = Running ]]; then
+  POD="${E2E_BASE_POD}"
+  log "reusing the pod from act 1 — it is still running, and its measured policy declares no fragments"
+  ok "busybox is running, authorized by an entry in that measured policy"
+else
+  log "generating a policy from a one-container pod, then running that pod"
+  wipe_pod
+  render_pod "" > "${WORK}/step1.yaml"
+  "${GENPOLICY}" -y "${WORK}/step1.yaml" -p "${WORK}/rules-none.rego" -j "${SETTINGS}" \
+    --initdata-path="${WORK}/initdata.toml" >/dev/null || die "genpolicy failed"
+  _prompt "kubectl apply -f ${WORK}/step1.yaml"
+  kubectl apply -f "${WORK}/step1.yaml"
+  log "starting pod ${POD} — this boots a fresh SEV-SNP CVM, so it is not instant"
+  wait_for 300 "pod ${POD} Running" pod_running
+  ok "busybox is running, authorized by an entry in the measured policy"
+  pause
+fi
 kubectl get pod "${POD}" -n "${NS}"
 pause
 
@@ -462,6 +474,12 @@ pause
 
 # ---------------------------------------------------------------------------
 step "3 — sign and publish a fragment that authorizes exactly that sidecar"
+# Back to a pod of our own from here on: steps 4-5 need a pod carrying the
+# measured issuer list, which act 1's pod does not have. The switch has to
+# happen *before* the reference policy below is generated — the runtime stamps
+# the sandbox name onto every container's OCI spec, so an entry lifted under one
+# pod name will not match a request made under another.
+POD="${FRAG_POD}"
 # The entry is lifted from a policy generated for the pod the sidecar will really
 # run in — annotation included, because the runtime stamps pod annotations onto
 # every container's OCI spec and the entry has to match the request byte for byte.
@@ -580,7 +598,7 @@ render_pod "${SIDECAR_REF}" > "${WORK}/step4.yaml"
 append_sidecar "${WORK}/step4.yaml"
 _prompt "kubectl apply -f ${WORK}/step4.yaml"
 kubectl apply -f "${WORK}/step4.yaml"
-log "starting pod ${POD} once more — final fresh CVM boot"
+log "starting pod ${POD} — a fresh CVM, this time declaring the fragment"
 wait_for 300 "sidecar ready" container_ready sidecar
 [[ "$(ready_of busybox)" = "true" ]] || die "busybox is not ready"
 ok "both containers running — the fragment authorized a container the measured policy never contained"

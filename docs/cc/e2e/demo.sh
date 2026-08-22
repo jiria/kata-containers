@@ -412,6 +412,7 @@ _tamper_run() {
 
   kubectl apply -f "${WORK}/${pod}.yaml" >/dev/null || die "kubectl apply failed for ${pod}"
   log "starting pod ${pod} with the watcher armed (${mode})"
+  log "this boots a fresh SEV-SNP CVM under the rewritten image, so it is not instant"
 
   local i
   for i in $(seq 1 30); do
@@ -470,39 +471,37 @@ live_binding_experiment() {
   say <<'EOF'
 
   Kubelet keeps retrying and the watcher keeps rewriting, so the pod never gets
-  a sandbox at all. But on its own that is not yet proof: a pod that fails to
-  start is just as well explained by us having corrupted the image. So run it
-  again with the manipulation neutered — re-compress the document instead of
-  editing it. Different bytes on disk, identical digest.
-EOF
-  pause
+  a sandbox at all — and the refusal is fatal rather than a warning. On a
+  mismatch the agent records the reason and calls process::abort(); it is pid 1
+  in that guest, so aborting it takes the VM with it. There is no degraded mode
+  in which the workload runs under a policy that was never measured, which is
+  why the evidence here is which pods ran rather than any message from inside.
 
-  _tamper_run control demo-control running || return 0
-  if [[ "${_TAMPER_PHASE}" = "Running" ]]; then
-    ok "phase=Running — rewriting the image is not what refused the pod; the digest is"
-  else
-    warn "the control did not reach Running (phase=${_TAMPER_PHASE:-unknown}) — the flip result above is inconclusive"
-  fi
-  kubectl delete pod demo-control -n "${NS}" --ignore-not-found >/dev/null 2>&1 || true
-  say <<'EOF'
+  Be precise about what this one run shows. The document served differed from
+  the document measured, and the pod was refused — but a pod that fails to start
+  is on its own equally well explained by us having corrupted the image. The
+  control for that is to run the same rewrite with the manipulation neutered:
+  re-compress the document instead of editing it, so the bytes on disk change
+  and the digest does not. That run boots and reaches Running, which is what
+  isolates the digest as the only variable. It is another CVM boot, so it is off
+  by default here — DEMO_TAMPER_CONTROL=1 runs it.
 
-  Two runs, one variable. Same watcher, same rewrite, same code path — only the
-  content differed, and only the edited one was refused. So the guest will not
-  enforce a policy other than the one named in its own launch measurement, and
-  an SNP report cannot lie about which policy is in force.
-
-  And the refusal is fatal, not a warning. On a mismatch the agent records the
-  reason and calls process::abort(); it is pid 1 in that guest, so aborting it
-  takes the VM with it. There is no degraded mode in which the workload runs
-  under a policy that was never measured — which is why the evidence here is
-  which pods ran, rather than any message from inside the guest.
-
-  Note what this does *not* claim: a host is free to launch a CVM under any
+  Note also what none of this claims: a host is free to launch a CVM under any
   policy it likes, stamping that policy's digest honestly. Catching that is
   attestation's job, and it can do it precisely because the digest in the
   report is trustworthy.
 EOF
   pause
+  if [[ "${DEMO_TAMPER_CONTROL:-0}" = "1" ]]; then
+    _tamper_run control demo-control running || return 0
+    if [[ "${_TAMPER_PHASE}" = "Running" ]]; then
+      ok "phase=Running — rewriting the image is not what refused the pod; the digest is"
+    else
+      warn "the control did not reach Running (phase=${_TAMPER_PHASE:-unknown}) — the flip result above is inconclusive"
+    fi
+    kubectl delete pod demo-control -n "${NS}" --ignore-not-found >/dev/null 2>&1 || true
+    pause
+  fi
   scene
 }
 
@@ -513,6 +512,17 @@ decode_initdata() {
   kubectl get pod "${name}" -n "${NS}" -o jsonpath="${INITDATA_JSONPATH}" \
     | base64 -d | gunzip > "${out}" 2>/dev/null \
     || die "could not decode initdata for ${name}"
+}
+
+# Best-effort variant for acts that can run standalone: act 4 shows act 1's
+# document when it is there, and simply skips those beats when it is not. The
+# strict version dies, and a `|| true` around it would not help — `die` exits.
+decode_initdata_if_running() {
+  local name="$1" out="$2"
+  [[ "$(kubectl get pod "${name}" -n "${NS}" -o jsonpath='{.status.phase}' 2>/dev/null)" = Running ]] || return 0
+  kubectl get pod "${name}" -n "${NS}" -o jsonpath="${INITDATA_JSONPATH}" \
+    | base64 -d | gunzip > "${out}" 2>/dev/null || rm -f "${out}"
+  return 0
 }
 
 # Same, but from a generated yaml rather than a running pod: act 1 opens the
@@ -671,15 +681,6 @@ EOF
   show_sandbox_backing demo-a
 
   decode_initdata demo-a "${WORK}/a.toml"
-  say <<'EOF'
-
-  Back to the document, now the pod's own copy of it. Those key names are not a
-  convention the demo invented — the guest looks for exactly these.
-EOF
-  show "the keys the guest will look for, from the agent's own source" \
-    "grep -n 'const [A-Z_]*KEY: &str' ${E2E_REPO_DIR}/src/agent/src/initdata.rs"
-  show "and the fragment machinery rides inside it — declared empty for this pod, and fail-closed" \
-    "grep -c . ${WORK}/a.toml | xargs -I{} echo 'policy lines: {}'; grep -nE '^default policy_fragments := \[\]|\"fragments\": \[\]|\"image_layer_verification\": \"[a-z-]*\"' ${WORK}/a.toml"
   scene
 
   local d1; d1=$(initdata_digest_expected "${WORK}/a.toml")
@@ -729,6 +730,7 @@ EOF
   digest meaningful: a relying party computes the expected value rather than
   being told what to trust.
 EOF
+  pause
   scene
   say <<'EOF'
 
@@ -806,8 +808,6 @@ EOF
   fi
   pause
 
-  show "and the policy demands verity for every layer it admits" \
-    "grep -o '\"image_layer_verification\": \"[a-z-]*\"' ${WORK}/a.toml | head -1"
   say <<'EOF'
 
   genpolicy did not read those hashes off this host. It predicted them offline,
@@ -926,9 +926,30 @@ act4() {
   afterwards without invalidating that measurement: the launch digest never
   moves, and the extension is signed by an issuer the measured document already
   named and bounded by what that document already permits.
+
+  Which means the machinery has to live in the measured document itself. It
+  already does — act 1's pod carries it, declared empty.
 EOF
+  [[ -s "${WORK}/a.toml" ]] || decode_initdata_if_running demo-a "${WORK}/a.toml"
+  if [[ -s "${WORK}/a.toml" ]]; then
+    show "the keys the guest will look for in that document, from the agent's own source" \
+      "grep -n 'const [A-Z_]*KEY: &str' ${E2E_REPO_DIR}/src/agent/src/initdata.rs"
+    show "and act 1's pod declared no fragments at all — which is a decision, not a gap" \
+      "grep -nE '^default policy_fragments := \[\]|\"fragments\": \[\]' ${WORK}/a.toml"
+    say <<'EOF'
+
+  Four keys the agent recognizes: the policy, the issuer allow-list, and the
+  two that carry an attestation configuration. Act 1's pod set the first and
+  left the fragment list empty — so nothing could have been added to it at
+  runtime, whoever signed it. What follows is a pod that declares an issuer.
+EOF
+  fi
   pause
-  DEMO_PAUSE="${DEMO_PAUSE:-0}" bash "$(dirname "${BASH_SOURCE[0]}")/demo-fragment-sidecar.sh"
+  # Steps 1-2 only need a running pod whose measured policy declares no
+  # fragments; act 1 already left one. Handing it over saves a CVM boot and
+  # makes the continuity explicit.
+  DEMO_PAUSE="${DEMO_PAUSE:-0}" E2E_BASE_POD=demo-a \
+    bash "$(dirname "${BASH_SOURCE[0]}")/demo-fragment-sidecar.sh"
 }
 
 # ============================================================ run
