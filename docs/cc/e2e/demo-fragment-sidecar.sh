@@ -284,6 +284,24 @@ cp "${RULES_SRC}" "${WORK}/rules-sidecar.rego"
 printf '\npolicy_fragments := [{"issuer": "%s", "feed": "%s", "minimum_svn": %s}]\n' \
   "${ISSUER}" "${SIDECAR_FEED}" "${SVN}" >> "${WORK}/rules-sidecar.rego"
 
+# Read the container entries back out of a pod's *measured* policy. The point of
+# steps 1-2 is that this document never changes, so take it from the running pod
+# rather than from any file we wrote — a file we wrote proves nothing about what
+# the guest was launched with.
+cat > "${WORK}/policy-containers.py" <<'PY'
+import json, sys
+policy = sys.stdin.read()
+i = policy.find("policy_data := {")
+data, _ = json.JSONDecoder().raw_decode(policy, policy.index("{", i))
+containers = data["containers"]
+for c in containers:
+    ann = c.get("OCI", {}).get("Annotations", {})
+    name = ann.get("io.kubernetes.cri.container-name")
+    print("  permitted: %s" % (name if name else "<the sandbox's own pause container>"))
+print()
+print("%d container entries in the measured policy — nothing else can be created" % len(containers))
+PY
+
 # $1 = delivery annotation, empty for none.
 render_pod() {
   local anno=""
@@ -405,6 +423,7 @@ step "1 — a container the measured policy contains"
 # spending another CVM boot on an identical one. Steps 3-5 do need their own
 # pod, because those carry a measured issuer list act 1's pod does not have.
 FRAG_POD=demo-frag-sidecar
+FRAG_INITDATA_JSONPATH='{.metadata.annotations.io\.katacontainers\.config\.hypervisor\.cc_init_data}'
 if [[ -n "${E2E_BASE_POD:-}" ]] \
    && [[ "$(kubectl get pod "${E2E_BASE_POD}" -n "${NS}" -o jsonpath='{.status.phase}' 2>/dev/null)" = Running ]]; then
   POD="${E2E_BASE_POD}"
@@ -423,7 +442,18 @@ else
   ok "busybox is running, authorized by an entry in the measured policy"
   pause
 fi
-kubectl get pod "${POD}" -n "${NS}"
+show "the spec this pod is running under — one container, and the policy measured into it" \
+  "kubectl get pod ${POD} -n ${NS} -o yaml | awk '/^  annotations:/,/^status:/' | grep -vE 'last-applied-configuration|^      \\{' | awk '{ l = \$0; if (length(l) > 78) l = substr(l,1,78) \"...\"; if (l ~ /cc_init_data:/) l = l \"   <-- the measured policy\"; print l }' | grep -vE '^status:' | head -24"
+show "and this is every container that spec's measured policy admits" \
+  "kubectl get pod ${POD} -n ${NS} -o jsonpath='${FRAG_INITDATA_JSONPATH}' | base64 -d | gunzip | python3 ${WORK}/policy-containers.py"
+say <<'EOF'
+
+  That policy is fixed. Nothing in the steps that follow regenerates it, and
+  nothing re-launches this pod — so whatever happens next is judged against
+  exactly this list. One workload container is permitted, and the sandbox's own
+  pause container. A second workload container has no entry, and cannot acquire
+  one by being asked for politely.
+EOF
 pause
 
 # ---------------------------------------------------------------------------
@@ -596,6 +626,17 @@ render_pod "${SIDECAR_REF}" > "${WORK}/step4.yaml"
 "${GENPOLICY}" -y "${WORK}/step4.yaml" -p "${WORK}/rules-sidecar.rego" -j "${SETTINGS}" \
   --initdata-path="${WORK}/initdata.toml" >/dev/null || die "genpolicy failed"
 append_sidecar "${WORK}/step4.yaml"
+show "the spec for this step — the same two containers, plus one annotation naming the fragment" \
+  "awk '{ l = \$0; if (length(l) > 78) l = substr(l,1,78) \"...\"; if (l ~ /policy_fragments:/) l = l \"   <-- the fragment the host must fetch\"; else if (l ~ /cc_init_data:/) l = l \"   <-- the measured policy, which now declares that issuer\"; print l }' ${WORK}/step4.yaml"
+say <<'EOF'
+
+  This is a freshly launched pod with a different measured policy, and it has to
+  be. The fragment declaration is part of what gets measured, so a pod that never
+  named the issuer cannot be talked into trusting one later — which is exactly
+  why step 2 failed and this will not. What the fragment adds is the sidecar
+  entry; what it cannot add is permission to be trusted in the first place.
+EOF
+pause
 _prompt "kubectl apply -f ${WORK}/step4.yaml"
 kubectl apply -f "${WORK}/step4.yaml"
 log "starting pod ${POD} — a fresh CVM, this time declaring the fragment"
