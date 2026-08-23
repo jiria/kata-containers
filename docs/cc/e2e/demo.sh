@@ -691,11 +691,10 @@ act0() {
   step "act 0 — this is a confidential host, and the guest is a real CVM"
   say <<'EOF'
 
-  MSHV plus Cloud Hypervisor with real SEV-SNP is not new work in itself — that
-  path existed before, and then it was suspended. What is new is that it has
-  been rebased onto current Kata and brought back into working order, so the
-  hardening in the acts that follow is demonstrated on real confidential
-  hardware rather than under nested virt on an ordinary host.
+  The stack underneath is Cloud Hypervisor on MSHV. That path is not new work in
+  itself — it existed, and had been suspended; rebasing it onto current Kata and
+  getting it running again is what this branch did. It is the reason everything
+  that follows happens on a confidential machine rather than under nested virt.
 EOF
   show "there is no KVM on this node — no device node, and no kvm module loaded" \
     "ls -l /dev/kvm 2>&1; lsmod | grep -E '^kvm' || echo '(no kvm module loaded)'"
