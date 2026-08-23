@@ -101,7 +101,18 @@ heading() { _CUR_STEP="$*"; _lib_step "$@"; _vo "$*"; }
 NS="${E2E_NS:-coco-e2e}"
 ACTS="${DEMO_ACTS:-0,1,2,3,4}"
 WORK=$(mktemp -d)
-trap 'rm -rf "${WORK}"; sudo pkill -f initdata-tamper.py >/dev/null 2>&1 || true; kubectl delete pod -n "${NS}" -l demo=parma --ignore-not-found >/dev/null 2>&1 || true; kubectl delete pod -n "${NS}" demo-frag-sidecar --ignore-not-found >/dev/null 2>&1 || true' EXIT
+trap '_verity_restore; rm -rf "${WORK}"; sudo pkill -f initdata-tamper.py >/dev/null 2>&1 || true; kubectl delete pod -n "${NS}" -l demo=parma --ignore-not-found >/dev/null 2>&1 || true; kubectl delete pod -n "${NS}" demo-frag-sidecar --ignore-not-found >/dev/null 2>&1 || true' EXIT
+
+# Act 2 substitutes the root hash the host presents. That edits a file belonging
+# to containerd's snapshotter, so it has to be put back even if the demo dies
+# between the edit and the restore — hence a global, and a call from the trap.
+_VERITY_TARGET=""
+_verity_restore() {
+  [[ -n "${_VERITY_TARGET}" ]] || return 0
+  sudo cp "${_VERITY_TARGET}.demobak" "${_VERITY_TARGET}" >/dev/null 2>&1 || true
+  sudo rm -f "${_VERITY_TARGET}.demobak" >/dev/null 2>&1 || true
+  _VERITY_TARGET=""
+}
 
 pause() {
   [[ "${DEMO_PAUSE:-0}" = "1" ]] || return 0
@@ -503,6 +514,125 @@ EOF
   scene
 }
 
+# ---------------------------------------------------------------- act 2
+# Substitute the dm-verity root hash the *host* presents, leaving the measured
+# policy alone, and let the guest answer. The runtime reads that hash out of a
+# per-layer file in containerd's snapshotter, which the host owns outright — so
+# staging this needs no exploit, only an edit.
+#
+# Writes ${WORK}/verity-denial.py, which lifts the guest's sentence back out of
+# the kubelet event. That message embeds an escaped Rust string inside JSON, so
+# it is unpicked in Python rather than in a pipeline of seds.
+verity_substitution_experiment() {
+  local pod=demo-verity
+  local target_hash="" target_file="" best=0 f h sz
+
+  # The layer to swap is the workload's: a hash the policy names, on the largest
+  # image this host built. The pause container's layer would prove the same
+  # thing about a less interesting image.
+  while read -r f; do
+    [[ -n "${f}" ]] || continue
+    h=$(sudo jq -r '.roothash' "${f}" 2>/dev/null) || continue
+    grep -qx "${h}" "${WORK}/policy-hashes.txt" 2>/dev/null || continue
+    sz=$(sudo stat -c %s "$(dirname "${f}")/layer.erofs" 2>/dev/null || echo 0)
+    if [[ "${sz}" -gt "${best}" ]]; then best="${sz}"; target_hash="${h}"; target_file="${f}"; fi
+  done < <(sudo find "${SNAP}" -maxdepth 2 -name 'layer.erofs.dmverity' 2>/dev/null)
+
+  if [[ -z "${target_file}" ]]; then
+    warn "no layer on this host carries a root hash the policy names — skipping the substitution"
+    return 0
+  fi
+
+  cat > "${WORK}/verity-denial.py" <<'PY'
+import json, re, subprocess, sys
+
+ns, pod = sys.argv[1], sys.argv[2]
+out = subprocess.run(
+    ["kubectl", "get", "events", "-n", ns,
+     "--field-selector", "involvedObject.name=" + pod, "-o", "json"],
+    capture_output=True, text=True).stdout
+msgs = [i["message"] for i in json.loads(out).get("items", [])
+        if "blocked by policy" in i.get("message", "")]
+if not msgs:
+    print("no policy denial recorded for this pod")
+    raise SystemExit(1)
+
+s = msgs[-1]
+s = s[s.index("blocked by policy:"):].split("policyDecision<")[0]
+s = s.replace('\\\\\\"', '"').replace('\\"', '"').replace('\\\\', '\\')
+
+def short(t):
+    return re.sub(r"([0-9a-f]{16})[0-9a-f]{48}", r"\1...", t)
+
+groups = re.findall(r"(request presents|policy declares) \{(.*?)\}", s)
+print("the guest refused CreateContainerRequest, and this is why:\n")
+if groups:
+    for label, body in groups:
+        print("  %s" % label)
+        for entry in re.findall(r'"([^"]+)"', body):
+            print("    %s" % short(entry.rstrip("\\ ")))
+        print()
+else:
+    print("  " + short(s.strip()))
+PY
+
+  say <<EOF
+
+  So try that. The policy stays exactly as it is — untouched, still measured,
+  still the document whose digest is in the report. The only thing that changes
+  is the number the host hands over at mount time.
+EOF
+  pause
+  show "the hash the runtime presents is read out of this file, which belongs to the host" \
+    "sudo cat ${target_file}"
+
+  sudo cp "${target_file}" "${target_file}.demobak" >/dev/null 2>&1 \
+    || { warn "could not back the file up — skipping the substitution"; return 0; }
+  _VERITY_TARGET="${target_file}"
+
+  local first="${target_hash:0:1}" new tampered
+  if [[ "${first}" = "0" ]]; then new=1; else new=0; fi
+  tampered="${new}${target_hash:1}"
+
+  show "flip one hex digit of it — the layer on disk is untouched, only the claim about it changes" \
+    "sudo python3 -c \"import json,sys; p=sys.argv[1]; d=json.load(open(p)); d['roothash']=sys.argv[2]; open(p,'w').write(json.dumps(d)); print('presented root hash is now', sys.argv[2])\" ${target_file} ${tampered}"
+
+  say <<EOF
+
+  The policy still declares ${target_hash:0:16}...
+  The host will now present  ${tampered:0:16}...
+
+  Nothing else differs. The image is the one the policy was generated for, the
+  command is the same, and every other layer still matches.
+EOF
+  pause
+
+  demo_pod_yaml "${pod}" '"sleep", "300"'
+  kubectl delete pod "${pod}" -n "${NS}" --ignore-not-found >/dev/null 2>&1 || true
+  _prompt "kubectl apply -f ${WORK}/${pod}.yaml"
+  kubectl apply -f "${WORK}/${pod}.yaml" >/dev/null || die "kubectl apply failed for ${pod}"
+  log "the sandbox still boots — it is the container that has to be judged"
+  wait_for_soft 180 "${pod} to reach a terminal state" \
+    bash -c "kubectl get pod ${pod} -n ${NS} -o jsonpath='{.status.containerStatuses[0].state.terminated.reason}{.status.phase}' 2>/dev/null | grep -qE 'StartError|Failed'" \
+    || true
+  pause
+
+  show "the guest's answer" "python3 ${WORK}/verity-denial.py ${NS} ${pod}"
+
+  local phase
+  phase=$(kubectl get pod "${pod}" -n "${NS}" -o jsonpath='{.status.containerStatuses[0].state.terminated.reason}' 2>/dev/null)
+  if [[ "${phase}" = "StartError" ]]; then
+    ok "the container never started — one hex digit is the whole difference"
+  else
+    warn "expected StartError, got '${phase:-unknown}' — read the event above before believing this beat"
+  fi
+
+  _verity_restore
+  kubectl delete pod "${pod}" -n "${NS}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  pause
+  scene
+}
+
 # The measured document itself, straight out of the pod spec.
 INITDATA_JSONPATH='{.metadata.annotations.io\.katacontainers\.config\.hypervisor\.cc_init_data}'
 decode_initdata() {
@@ -601,12 +731,43 @@ EOF
     "grep -nE '^(igvm|confidential_guest|sev_snp_guest)' ${cfg}"
   # The SNP support lines come from the driver beat above — the same three lines
   # say who the driver is and what the hardware offers it.
+  say <<'EOF'
+
+  One thing left to place before any of the rest can be read: where enforcement
+  actually happens.
+
+  Inside that guest, pid 1 is the kata agent. It is what the shim talks to —
+  over a vsock, in ttRPC — and every request to create a container, mount a
+  layer, exec a process or configure the network arrives there as a call. The
+  agent carries a policy engine, and each of those calls is answered against a
+  policy document before it is served.
+
+  So there are two sides to keep apart for the rest of this demo. Outside the
+  guest: kubelet, containerd, the shim, the VMM. Inside it: the agent and its
+  policy. Everything outside is untrusted — it is what the hardware is
+  protecting the guest from — and every gate that follows is enforced by the
+  guest, on requests the host is making.
+EOF
+  pause
 }
 
 # ============================================================ act 1
 act1() {
   step "act 1 — the policy is measured, not asserted"
   ensure_policy_toolchain
+
+  say <<'EOF'
+
+  How a policy is built and measured is Kata's own mechanism, and the first half
+  of this act simply follows it: genpolicy turns a pod spec into a policy,
+  initdata carries that policy into the guest, and the runtime stamps its digest
+  into the hardware report at launch.
+
+  The second half goes where that mechanism stops — to the question of whether
+  the document the guest is handed has to be the document that digest was taken
+  over.
+EOF
+  pause
 
   local t0; t0=$(date '+%Y-%m-%d %H:%M:%S')
   demo_pod_yaml demo-a '"sleep", "3600"' --defer
@@ -743,8 +904,15 @@ EOF
   That opening is real, and it needs no trickery beyond being the host. The
   runtime does two independent things with the document: it hashes it for the
   launch, and it separately writes it into a block image the guest reads. Both
-  happen in one file — runtime-rs virt_container sandbox.rs — and nothing
-  re-checks that the second still matches the first.
+  happen on the host, and nothing on that side re-checks that the second still
+  matches the first.
+
+  So the guest has to. This branch makes the agent recompute the digest of the
+  initdata it was actually served and compare it against the launch measurement
+  the host stamped it into — on this hardware, HOST_DATA, read back out of an
+  SNP report the PSP produced rather than anything the host can write. That
+  comparison runs before any consumer of the document, and it is what the rest
+  of this act puts on trial.
 EOF
   pause
   say <<'EOF'
@@ -774,16 +942,29 @@ act2() {
   say <<'EOF'
 
   A measured policy is only as good as its grip on what actually gets mounted.
-  Here the container image layers are EROFS images produced by containerd's own
-  snapshotter, each with a dm-verity root hash, and the policy names those exact
-  hashes — so the guest will mount a layer only if its contents hash to what the
-  measurement already committed to.
+
+  Kata already mounts read-only image layers through dm-verity: containerd's
+  snapshotter builds each layer as an EROFS image with a root hash, and the
+  guest kernel checks every block read against it. What that proves is that a
+  layer's contents match the hash it was mounted with — content against digest,
+  and nothing more.
+
+  What it does not say is where that hash came from. The host supplies it, and
+  a host serving its own layer can supply the matching hash to go with it: verity
+  passes, and an attacker's filesystem is mounted read-only and perfectly intact.
+  The kernel was never asked the question that matters, which is whether the
+  digest is one the tenant approved.
+
+  That question is what this branch adds. The measured policy names the root
+  hashes the pod is allowed to mount, and a layer arriving under any other hash
+  is refused before it is mounted. The rest of this act shows the naming, and
+  then breaks it.
 EOF
   [[ -s "${WORK}/a.toml" ]] || { ensure_policy_toolchain; demo_pod_yaml demo-a '"sleep", "3600"'; start_demo_pod demo-a; decode_initdata demo-a "${WORK}/a.toml"; }
 
-  local SNAP=/var/lib/containerd/io.containerd.snapshotter.v1.erofs/snapshots
+  SNAP=/var/lib/containerd/io.containerd.snapshotter.v1.erofs/snapshots
   show "containerd built each layer as an EROFS image, with verity metadata beside it" \
-    "sudo find ${SNAP} -maxdepth 2 -name 'layer.erofs*' | sort | head"
+    "sudo find ${SNAP} -maxdepth 2 \\( -name 'layer.erofs' -o -name 'layer.erofs.dmverity' \\) | sort | head"
   show "one such file per layer — and a pod has several, across its images and the pause container" \
     "sudo find ${SNAP} -maxdepth 2 -name 'layer.erofs.dmverity' | sort | while read -r f; do echo \"\$f\"; sudo cat \"\$f\"; echo; done | head -20"
 
@@ -817,9 +998,14 @@ EOF
   reproducing containerd's mkfs.erofs invocation byte-for-byte against a pinned
   erofs-utils — which is why the policy can be generated anywhere, and why the
   match above is a result rather than a copy.
+
+  It also means the policy and the host arrive at those hashes independently.
+  So the interesting question is what happens when they disagree.
 EOF
   pause
   scene
+
+  verity_substitution_experiment
 
   show "note where the verity device is NOT: the host has no dm devices at all" \
     "sudo dmsetup ls 2>&1"
@@ -827,9 +1013,13 @@ EOF
 
   The host builds the layers and can no longer look inside them. The guest
   kernel mounts them with dm-verity and enforces the root hash on every block
-  read — a root hash that came from the measured policy, which is covered by
-  the attestation. That is an unbroken chain from the SNP report to a
-  filesystem block.
+  read — and the hash it enforces has to be one the measured policy named, or
+  the container is refused before any mount happens.
+
+  Those are two different checks doing two different jobs. The kernel proves
+  contents against digest. The policy proves that digest was approved. Kata
+  brought the first; the second is what closes the gap, and it is covered by
+  the attestation because it lives in the measured document.
 EOF
   pause
 }
@@ -846,8 +1036,16 @@ act3() {
   say <<'EOF'
 
   Back to act 1's default rules: every request the agent can serve starts at
-  false, and genpolicy only turns on the ones this pod's spec justifies. Nobody
-  asked to exec into this pod, so ExecProcessRequest was never turned on.
+  false, and genpolicy only turns on the ones this pod's spec justifies.
+
+  That posture is worth saying plainly, because it is not what the stock guest
+  does. The default policy shipped in the upstream rootfs is allow-all — a guest
+  that boots without a policy of its own serves whatever it is asked. This build
+  compiles the closed door into the agent binary instead, so it does not depend
+  on which policy file a host chose to point it at, and the escape hatch that
+  let requests through when the policy failed to answer is compiled out too.
+
+  Nobody asked to exec into this pod, so ExecProcessRequest was never turned on.
 EOF
   show "the rule that decides it, in this pod's own measured policy" \
     "grep -nE '^default ExecProcessRequest' ${WORK}/a.toml; grep -cE '^ExecProcessRequest' ${WORK}/a.toml | xargs -I{} echo '{} conditional rules could turn it on — this exec matched none of them'"
@@ -925,10 +1123,16 @@ act4() {
   fi
   say <<'EOF'
 
-  A measured policy is fixed at launch. Fragments are how it is extended
-  afterwards without invalidating that measurement: the launch digest never
+  A measured policy is fixed at launch. That is the point of it, and it is also
+  its limit: anything the pod turns out to need later has no way in. Upstream
+  the answer was SetPolicy, a host-facing call that replaced the policy wholesale
+  — which act 3 just showed compiled out of this build.
+
+  Fragments are what replaces it, and they are new here. A fragment extends a
+  measured policy without invalidating the measurement: the launch digest never
   moves, and the extension is signed by an issuer the measured document already
-  named and bounded by what that document already permits.
+  named and bounded by what that document already permits. Add-only, and only
+  within limits fixed before the guest booted.
 
   Which means the machinery has to live in the measured document itself. It
   already does — act 1's pod carries it, declared empty.
@@ -1014,9 +1218,17 @@ if [[ "${ACTS}" == "0,1,2,3,4" ]]; then
 
   What was shown, end to end: a real CVM on a confidential host; a policy whose
   digest is in the hardware report and moves with a one-byte change; image
-  layers pinned by dm-verity root hashes that the measured policy names; a
-  structured, redacted denial; and a signed fragment that extends the policy
-  only within what the measurement already allowed.
+  layers pinned by dm-verity root hashes that the measured policy names, and a
+  substituted hash refused; a structured, redacted denial; and a signed fragment
+  that extends the policy only within what the measurement already allowed.
+
+  Kata brought the shape of most of this: the runtime class, genpolicy, initdata
+  and its digest, dm-verity layers, a policy engine in the agent. What this
+  branch adds is the part that makes each one hold against a host that is
+  actively hostile rather than merely uninvolved — the guest checking what it
+  was served against what was measured, the approved-digest test on every layer,
+  a closed door compiled into the binary with the mutation channel removed, and
+  a signed, versioned, bounded way to extend a policy that is already fixed.
 
   Read the other way round — as the routes a hostile host would actually take
   to get a container running under rules nobody approved — each one is closed
@@ -1035,8 +1247,9 @@ if [[ "${ACTS}" == "0,1,2,3,4" ]]; then
       CreateContainerRequest, and the denial says which check failed without
       echoing the request back (acts 3 and 4).
     * Serve different image content behind an approved name. The measured
-      policy names every layer by dm-verity root hash, and the guest mounts
-      only those (act 2).
+      policy names every layer by dm-verity root hash, and a layer presented
+      under any other hash is refused — staged live in act 2, by changing one
+      hex digit of what the host hands over.
     * Turn on a debug channel to work from inside. The guest overrides what the
       host asks for: no log, no vsock port, no debug console (act 1).
     * Smuggle permissions in through a fragment. It must be signed by an issuer

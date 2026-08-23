@@ -503,8 +503,8 @@ show "and this is the sentence the guest itself produced" \
 say <<'EOF'
 
   Worth being clear about where that sentence comes from, because it reaches the
-  screen through the host and the host is not trusted. The framing -- "<endpoint>
-  is blocked by policy: no policy container satisfied: ..." -- is assembled by
+  screen through the host and the host is not trusted. The framing — "<endpoint>
+  is blocked by policy: no policy container satisfied: ..." — is assembled by
   the agent's policy engine inside the guest (agent/policy/src/decision.rs). The
   reasons after the colon are strings from the measured policy document itself:
   "command: no policy container declares this container's argument list" is a
@@ -513,7 +513,7 @@ say <<'EOF'
   The chain above is the whole trip: the agent returns PERMISSION_DENIED for
   CreateContainer over ttRPC, the shim wraps it, containerd hands it to kubelet,
   kubelet records the event. Every hop after the guest is untrusted, and none of
-  them can turn the denial into an admission -- the container simply never
+  them can turn the denial into an admission — the container simply never
   starts. The worst a hostile host can do here is garble the explanation.
 
   Note also the pod is not dead: the sandbox and the authorized container keep
