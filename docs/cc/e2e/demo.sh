@@ -757,10 +757,12 @@ act1() {
 
   say <<'EOF'
 
-  How a policy is built and measured is Kata's own mechanism, and the first half
+  How a policy is built and measured is existing mechanism, and the first half
   of this act simply follows it: genpolicy turns a pod spec into a policy,
   initdata carries that policy into the guest, and the runtime stamps its digest
-  into the hardware report at launch.
+  into the hardware report at launch. genpolicy is Kata's; initdata comes from
+  the wider Confidential Containers project — a small TOML document of named
+  entries plus the hash algorithm to digest them with, which Kata fills in.
 
   The second half goes where that mechanism stops — to the question of whether
   the document the guest is handed has to be the document that digest was taken
@@ -1260,8 +1262,9 @@ if [[ "${ACTS}" == "0,1,2,3,4" ]]; then
   substituted hash refused; a structured, redacted denial; and a signed fragment
   that extends the policy only within what the measurement already allowed.
 
-  Kata brought the shape of most of this: the runtime class, genpolicy, initdata
-  and its digest, dm-verity layers, a policy engine in the agent. What this
+  The shape of most of this was already there: the runtime class, genpolicy,
+  dm-verity layers and a policy engine in the agent from Kata, and initdata and
+  its digest from the wider Confidential Containers project. What this
   branch adds is the part that makes each one hold against a host that is
   actively hostile rather than merely uninvolved — the guest checking what it
   was served against what was measured, the approved-digest test on every layer,
