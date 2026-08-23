@@ -1207,6 +1207,45 @@ if [[ "${DEMO_PREP:-0}" = "1" ]]; then
   exit 0
 fi
 
+if [[ "${ACTS}" == "0,1,2,3,4" ]]; then
+  step "what this demo is testing"
+  say <<'EOF'
+
+  Confidential containers exist for one reason: to run a workload on a machine
+  whose operator you do not trust. The hardware encrypts the guest's memory and
+  attests what it booted, so the host cannot read the workload as it runs.
+
+  But the host is still the thing that starts that workload, supplies its
+  images, and answers it at runtime. Encrypted memory says nothing about *what*
+  was started. A host that can decide what runs inside the guest does not need
+  to read anything — it can simply run something of its own choosing and be
+  handed the secrets by the workload itself.
+
+  So the question here is narrower than "is the VM confidential". It is whether
+  what runs inside has been fixed in advance, and tied to something the hardware
+  will vouch for.
+
+  The answer takes the form of a policy: a document generated from the pod spec,
+  measured into the launch, and enforced inside the guest on every request the
+  host makes. Kata already has that shape. Whether it holds against a host that
+  is actively hostile, rather than merely uninvolved, is what the five acts test
+  — one route at a time, on real SEV-SNP hardware.
+
+    act 0  the platform: a real confidential host, and where the guest boundary
+           sits
+    act 1  the policy is measured rather than asserted — and the guest refuses a
+           document it was not launched with
+    act 2  image layers are pinned by hash, and a substituted hash is refused
+    act 3  the gates that are shut by construction: no policy replacement, no
+           generic file copy, no un-mediated network change
+    act 4  the one way in that remains: a signed, versioned, bounded fragment
+
+  Nothing here is a slide. Every claim is a command run on this node, and what
+  you see is whatever it printed.
+EOF
+  pause
+fi
+
 for a in 0 1 2 3 4; do
   want_act "${a}" && "act${a}"
 done
