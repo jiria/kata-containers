@@ -741,11 +741,22 @@ EOF
   agent carries a policy engine, and each of those calls is answered against a
   policy document before it is served.
 
-  So there are two sides to keep apart for the rest of this demo. Outside the
-  guest: kubelet, containerd, the shim, the VMM. Inside it: the agent and its
-  policy. Everything outside is untrusted — it is what the hardware is
-  protecting the guest from — and every gate that follows is enforced by the
-  guest, on requests the host is making.
+  So there are two sides to keep apart for the rest of this demo. Everything
+  left of the boundary below is host-controlled and untrusted — it is what the
+  hardware is protecting the guest from. Every gate that follows is enforced on
+  the right, by the guest, on requests the host is making.
+
+    outside the guest — untrusted     ║      inside the guest — trusted
+                                      ║
+      kubelet                         ║        kata-agent (pid 1)
+         │                            ║             │
+      containerd                      ║        policy engine
+         │                            ║             │
+      kata shim ── ttRPC over vsock ──╫──▶   allow / deny
+         │                            ║             ▲
+      Cloud Hypervisor on MSHV        ║             │
+         └─ launches the CVM;         ║        the measured policy
+            cannot see inside it      ║
 EOF
   pause
 }
