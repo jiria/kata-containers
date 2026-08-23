@@ -1229,20 +1229,9 @@ if [[ "${ACTS}" == "0,1,2,3,4" ]]; then
   The answer takes the form of a policy: a document generated from the pod spec,
   measured into the launch, and enforced inside the guest on every request the
   host makes. Kata already has that shape. Whether it holds against a host that
-  is actively hostile, rather than merely uninvolved, is what the five acts test
-  — one route at a time, on real SEV-SNP hardware.
-
-    act 0  the platform: a real confidential host, and where the guest boundary
-           sits
-    act 1  the policy is measured rather than asserted — and the guest refuses a
-           document it was not launched with
-    act 2  image layers are pinned by hash, and a substituted hash is refused
-    act 3  the gates that are shut by construction: no policy replacement, no
-           generic file copy, no un-mediated network change
-    act 4  the one way in that remains: a signed, versioned, bounded fragment
-
-  Nothing here is a slide. Every claim is a command run on this node, and what
-  you see is whatever it printed.
+  is actively hostile, rather than merely uninvolved, is what follows — one
+  route at a time, on real SEV-SNP hardware, in five acts. Each act is
+  introduced as it begins.
 EOF
   pause
 fi
