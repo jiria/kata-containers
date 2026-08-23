@@ -471,24 +471,23 @@ live_binding_experiment() {
 
   Kubelet keeps retrying and the watcher keeps rewriting, so the pod never gets
   a sandbox at all — and the refusal is fatal rather than a warning. On a
-  mismatch the agent records the reason and calls process::abort(); it is pid 1
-  in that guest, so aborting it takes the VM with it. There is no degraded mode
-  in which the workload runs under a policy that was never measured, which is
-  why the evidence here is which pods ran rather than any message from inside.
+  mismatch the agent records the reason and aborts; it is pid 1 in that guest,
+  so aborting takes the VM with it. There is no degraded mode in which the
+  workload runs under a policy that was never measured.
 
   Be precise about what this one run shows. The document served differed from
   the document measured, and the pod was refused — but a pod that fails to start
-  is on its own equally well explained by us having corrupted the image. The
-  control for that is to run the same rewrite with the manipulation neutered:
-  re-compress the document instead of editing it, so the bytes on disk change
-  and the digest does not. That run boots and reaches Running, which is what
-  isolates the digest as the only variable. It is another CVM boot, so it is off
-  by default here — DEMO_TAMPER_CONTROL=1 runs it.
+  is equally well explained by us having corrupted the image. The control for
+  that is the same rewrite with the manipulation neutered: re-compress the
+  document instead of editing it, so the bytes on disk change and the digest
+  does not. That run boots and reaches Running, which isolates the digest as the
+  only variable. It is another CVM boot, so it is off by default —
+  DEMO_TAMPER_CONTROL=1 runs it.
 
-  Note also what none of this claims: a host is free to launch a CVM under any
-  policy it likes, stamping that policy's digest honestly. Catching that is
-  attestation's job, and it can do it precisely because the digest in the
-  report is trustworthy.
+  Note what none of this claims: a host is free to launch a CVM under any policy
+  it likes, stamping that policy's digest honestly. Catching that is
+  attestation's job, and it can do it precisely because the digest in the report
+  is trustworthy.
 EOF
   pause
   if [[ "${DEMO_TAMPER_CONTROL:-0}" = "1" ]]; then
@@ -621,15 +620,14 @@ act1() {
     "B=\$(sed -n 's/^[[:space:]]*io\.katacontainers\.config\.hypervisor\.cc_init_data: //p' ${WORK}/demo-a.yaml); echo \"annotation      : \${#B} base64 characters\"; echo \"gzip payload    : \$(echo \"\${B}\" | base64 -d | wc -c) bytes\"; echo \"decoded document: \$(echo \"\${B}\" | base64 -d | gunzip | wc -c) bytes\""
   say <<'EOF'
 
-  The encoding is transport, and that is all. The host decodes it on the way in
-  (kata-types annotations/mod.rs, add_hypervisor_initdata_overrides), and
-  everything downstream — the digest it stamps into the hardware report, the
+  The encoding is transport, and that is all. The host decodes it on the way in,
+  and everything downstream — the digest it stamps into the hardware report, the
   document it serves the guest — is computed from that decoded text, not from
   these bytes. Re-compress it differently and nothing moves; the experiment at
   the end of this act does exactly that, deliberately.
 
   Nor is it trusted for being an annotation. It arrives in the pod spec, which
-  the host controls, and the runtime only looks at it because this confidential
+  the host controls, and the runtime looks at it only because this confidential
   configuration opts in to that annotation by name.
 EOF
   pause
@@ -745,9 +743,8 @@ EOF
   That opening is real, and it needs no trickery beyond being the host. The
   runtime does two independent things with the document: it hashes it for the
   launch, and it separately writes it into a block image the guest reads. Both
-  happen in one file — runtime-rs virt_container sandbox.rs, where the digest
-  goes into host_data and the document goes through initdata_block::push_data.
-  Nothing re-checks that the second still matches the first.
+  happen in one file — runtime-rs virt_container sandbox.rs — and nothing
+  re-checks that the second still matches the first.
 EOF
   pause
   say <<'EOF'
@@ -800,8 +797,8 @@ EOF
   grep -oE 'X-kata\.dmverity\.roothash=[a-f0-9]{64}' "${WORK}/a.toml" \
     | cut -d= -f2 | sort -u > "${WORK}/policy-hashes.txt"
 
-  show "so put the two sets side by side — the layers this host built, and the hashes the policy names" \
-    "paste -d' ' ${WORK}/host-hashes.txt ${WORK}/policy-hashes.txt | awk '{ printf \"%s  %s  %s\\n\", substr(\$1,1,32), (\$1==\$2 ? \"==\" : \"!=\"), substr(\$2,1,32) }'; echo; diff -q ${WORK}/host-hashes.txt ${WORK}/policy-hashes.txt >/dev/null && echo 'the two sets are identical — every layer, every hash' || echo 'THE TWO SETS DIFFER'"
+  show "so check each hash the policy names against the layers this host actually built" \
+    "while read -r h; do if grep -qx \"\$h\" ${WORK}/host-hashes.txt; then printf '  %s...  found on this host\\n' \"\$(echo \$h | cut -c1-32)\"; else printf '  %s...  MISSING\\n' \"\$(echo \$h | cut -c1-32)\"; fi; done < ${WORK}/policy-hashes.txt; echo; echo \"policy names \$(wc -l < ${WORK}/policy-hashes.txt | tr -d ' ') hashes; this host has \$(wc -l < ${WORK}/host-hashes.txt | tr -d ' ') layers in the snapshotter, from every image it has ever pulled\""
   local matched missing
   matched=$(comm -12 "${WORK}/host-hashes.txt" "${WORK}/policy-hashes.txt" | wc -l)
   missing=$(comm -13 "${WORK}/host-hashes.txt" "${WORK}/policy-hashes.txt" | wc -l)
@@ -848,7 +845,7 @@ act3() {
 
   say <<'EOF'
 
-  Back to act 1's 50 default rules: every request the agent can serve starts at
+  Back to act 1's default rules: every request the agent can serve starts at
   false, and genpolicy only turns on the ones this pod's spec justifies. Nobody
   asked to exec into this pod, so ExecProcessRequest was never turned on.
 EOF
@@ -870,15 +867,15 @@ EOF
   local b64; b64=$(echo "${out}" | grep -o 'policyDecision<[^>]*>policyDecision' | head -1 \
     | sed 's/^policyDecision<//; s/>policyDecision$//')
   if [[ -n "${b64}" ]]; then
-    show "decoded — this is FR-8" \
+    show "decoded — the denial the guest produced, as a structured record" \
       "echo '${b64}' | base64 -d | jq ."
     say <<'EOF'
 
-  Three things to notice. The sentinel framing is fixed and machine-parseable,
-  so a log consumer can lift this record straight out of containerd's logs.
+  Three things to notice. The framing is fixed and machine-parseable, so a log
+  consumer can lift this record straight out of containerd's logs.
   bound_state_keys lists field *names* and never their values, so a denial
   record cannot become an exfil channel. And failed_rule names only the
-  endpoint — "reasons" is what actually attributes the denial.
+  endpoint — "reasons" is what attributes the denial.
 EOF
     pause
   else
@@ -890,17 +887,17 @@ EOF
 
   Two more gates, in categories that are easy to leave open.
 EOF
-  show "FR-10: the host-to-guest file copy channel is refused outright in strict builds" \
+  show "the host-to-guest file copy channel is refused outright in strict builds" \
     "sed -n '2535,2543p' ${E2E_REPO_DIR}/src/agent/src/rpc.rs"
-  show "FR-14: network config is policy-checked and then frozen once the workload starts" \
+  show "network config is policy-checked, then frozen once the workload starts" \
     "grep -n 'net_phase_authorize' ${E2E_REPO_DIR}/src/agent/src/rpc.rs | head -6"
   say <<'EOF'
 
-  Network configuration is an easy channel to overlook: if a host can reach the
-  network-modify path without a policy call, it can add or remove adapters,
+  Network configuration is easy to overlook: a host that can reach the
+  network-modify path without a policy call can add or remove adapters,
   addresses and routes unchecked, and the measured policy says nothing about the
-  pod's connectivity. Which raises the obvious question: how do we know there is
-  no such hole anywhere else in the agent?
+  pod's connectivity. Which raises the obvious question — how do we know there
+  is no such hole anywhere else in the agent?
 EOF
   pause
 

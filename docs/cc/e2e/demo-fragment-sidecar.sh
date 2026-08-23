@@ -758,10 +758,10 @@ scene
 step "5 — a transparency receipt, checked by the guest over the host's own channel"
 say <<EOF
 
-  Steps 1-4 went through the runtime. This one does not: it opens the sandbox's
-  vsock and speaks ttRPC to the agent directly, with kata-agent-ctl, which is the
-  same channel a compromised host already owns. Nothing here is privileged
-  access - it is the ordinary delivery path, driven by hand.
+  Steps 1–4 went through the runtime. This one does not: it opens the sandbox's
+  vsock and speaks ttRPC to the agent directly, with kata-agent-ctl — the same
+  channel a compromised host already owns. Nothing here is privileged access;
+  it is the ordinary delivery path, driven by hand.
 
   The pod that is running carries a measured issuer list with one extra rule:
   fragments on the feed
@@ -769,8 +769,8 @@ say <<EOF
     ${RECEIPT_FEED}
 
   must additionally carry a receipt from the ledger "${LEDGER_ID}", whose public
-  key is measured into initdata. The sidecar feed from steps 3-4 has no such
-  requirement - the scope is per issuer and per feed.
+  key is measured into initdata. The sidecar feed from steps 3–4 has no such
+  requirement — the scope is per issuer and per feed.
 EOF
 show "the requirement and the ledger key, as measured into this pod's initdata" \
   "sed -n '/\\[\\[issuer.feed\\]\\]/,\$p' ${WORK}/fragment-issuers.toml"
@@ -895,9 +895,10 @@ pause
 
 heading "what just happened"
 say <<EOF
-  step 2 and step 4 run the same image and the same command.
-  The difference is a signed, versioned artifact fetched from a registry by the
-  host and verified inside the guest before it can authorize anything:
+
+  Step 2 and step 4 run the same image and the same command. The difference is a
+  signed, versioned artifact fetched from a registry by the host and verified
+  inside the guest before it can authorize anything:
 
     * the issuer is a did:x509 whose CA fingerprint and leaf policy are measured
       into initdata, not into the policy — and the chain is inside the envelope
