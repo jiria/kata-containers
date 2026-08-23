@@ -783,8 +783,8 @@ EOF
   The encoding is transport, and that is all. The host decodes it on the way in,
   and everything downstream — the digest it stamps into the hardware report, the
   document it serves the guest — is computed from that decoded text, not from
-  these bytes. Re-compress it differently and nothing moves; the experiment at
-  the end of this act does exactly that, deliberately.
+  these bytes. Re-compress the same document differently and the digest does not
+  move.
 
   Nor is it trusted for being an annotation. It arrives in the pod spec, which
   the host controls, and the runtime looks at it only because this confidential
@@ -1276,8 +1276,9 @@ if [[ "${ACTS}" == "0,1,2,3,4" ]]; then
       not meant to be: the host picks HOST_DATA. It is caught by attestation,
       which works precisely because the digest in the report is honest.
     * Stamp one policy and serve another. Refused at boot by the guest itself,
-      staged live in act 1 — with a control run, so the refusal is the digest
-      and not a broken image.
+      staged live in act 1. The control that rules out "the image was simply
+      corrupted" — the same rewrite with the digest left intact, which boots and
+      runs — is a second CVM launch, so it is off by default.
     * Replace the policy once the guest is up. There is no channel: SetPolicy
       is compiled out of a strict build, so initdata is the only way a policy
       ever enters (act 3).
