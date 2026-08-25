@@ -101,6 +101,11 @@ heading() { _CUR_STEP="$*"; _lib_step "$@"; _vo "$*"; }
 NS="${E2E_NS:-coco-e2e}"
 ACTS="${DEMO_ACTS:-0,1,2,3,4}"
 WORK=$(mktemp -d)
+# Kubernetes events outlive the pod they describe (an hour, by default), and
+# they are looked up by object name. A fixed pod name therefore lets a previous
+# run's refusal answer for this one -- both as evidence on screen and, worse, as
+# the stop condition act 1's experiment waits on. Tag the names per run.
+RUN_TAG=$(date -u +%H%M%S)
 trap '_verity_restore; rm -rf "${WORK}"; sudo pkill -f initdata-tamper.py >/dev/null 2>&1 || true; kubectl delete pod -n "${NS}" -l demo=parma --ignore-not-found >/dev/null 2>&1 || true; kubectl delete pod -n "${NS}" demo-frag-sidecar --ignore-not-found >/dev/null 2>&1 || true' EXIT
 
 # Act 2 substitutes the root hash the host presents. That edits a file belonging
@@ -476,23 +481,24 @@ _tamper_events() {
 }
 
 live_binding_experiment() {
-  # Distinct pod names per run, deliberately. Events outlive the pod they
-  # describe, so reusing one name lets the flip run's failure events answer for
-  # the control run -- or, worse, a previous demo's events answer for this one.
-  demo_pod_yaml demo-tampered '"sleep", "3600"'
-  demo_pod_yaml demo-control  '"sleep", "3600"'
+  # Distinct pod names per run and per arm, deliberately: reusing one name lets
+  # the flip run's failure events answer for the control run, or a previous
+  # demo's events answer for this one. See RUN_TAG.
+  local tpod="demo-tampered-${RUN_TAG}" cpod="demo-control-${RUN_TAG}"
+  demo_pod_yaml "${tpod}" '"sleep", "3600"'
+  demo_pod_yaml "${cpod}" '"sleep", "3600"'
 
-  _tamper_run flip demo-tampered refused || return 0
+  _tamper_run flip "${tpod}" refused || return 0
   show "the host stamped one policy and served another — same sandbox, one character apart" \
     "cat ${WORK}/tamper-flip.log"
   show "and the pod never ran — this is kubelet's account, from outside the guest" \
-    "kubectl get pod demo-tampered -n ${NS} -o custom-columns=NAME:.metadata.name,STATUS:.status.phase --no-headers; kubectl get events -n ${NS} --field-selector involvedObject.name=demo-tampered -o custom-columns=REASON:.reason,MESSAGE:.message --no-headers | grep -i sandbox | cut -c1-150 | head -2"
+    "kubectl get pod ${tpod} -n ${NS} -o custom-columns=NAME:.metadata.name,STATUS:.status.phase --no-headers; kubectl get events -n ${NS} --field-selector involvedObject.name=${tpod} -o custom-columns=REASON:.reason,MESSAGE:.message --no-headers | grep -i sandbox | cut -c1-150"
   if [[ "${_TAMPER_PHASE}" = "Running" ]]; then
     warn "the pod reached Running under a swapped policy — that is the failure this act exists to catch"
   else
     ok "phase=${_TAMPER_PHASE:-Pending} — the guest refused a policy it had not been launched with"
   fi
-  kubectl delete pod demo-tampered -n "${NS}" --ignore-not-found >/dev/null 2>&1 || true
+  kubectl delete pod "${tpod}" -n "${NS}" --ignore-not-found >/dev/null 2>&1 || true
   say <<'EOF'
 
   Kubelet keeps retrying and the watcher keeps rewriting, so the pod never gets
@@ -508,13 +514,13 @@ live_binding_experiment() {
 EOF
   pause
   if [[ "${DEMO_TAMPER_CONTROL:-0}" = "1" ]]; then
-    _tamper_run control demo-control running || return 0
+    _tamper_run control "${cpod}" running || return 0
     if [[ "${_TAMPER_PHASE}" = "Running" ]]; then
       ok "phase=Running — rewriting the image is not what refused the pod; the digest is"
     else
       warn "the control did not reach Running (phase=${_TAMPER_PHASE:-unknown}) — the flip result above is inconclusive"
     fi
-    kubectl delete pod demo-control -n "${NS}" --ignore-not-found >/dev/null 2>&1 || true
+    kubectl delete pod "${cpod}" -n "${NS}" --ignore-not-found >/dev/null 2>&1 || true
     pause
   fi
   scene
@@ -1132,12 +1138,27 @@ EOF
 
   say <<'EOF'
 
-  Two more gates, in categories that are easy to leave open.
+  Three more gates, in categories that are easy to leave open.
 EOF
   show "the host-to-guest file copy channel is refused outright in strict builds" \
     "sed -n '2535,2543p' ${E2E_REPO_DIR}/src/agent/src/rpc.rs"
   show "network config is policy-checked, then frozen once the workload starts" \
     "grep -n 'net_phase_authorize' ${E2E_REPO_DIR}/src/agent/src/rpc.rs | head -6"
+  show "and the settings a host would use to open a way in are overridden, whatever it asked for" \
+    "grep -nE '^\\s+\\*(debug_console|debug_console_vport|dev_mode|log_level|log_vport|tracing|secure_storage_integrity) = ' ${E2E_REPO_DIR}/src/agent/src/config.rs"
+  say <<'EOF'
+
+  Those seven arrive on the kernel command line, or in a config file it names,
+  or in the agent's environment — all three chosen by the host, so all three are
+  untrusted here. A debug console is an unmediated shell into the guest; tracing
+  ships decoded request payloads back out; and zeroing the log port means no
+  listener is bound at all, so the guest keeps no channel the host asked for.
+
+  The function that does this destructures the config exhaustively, which is the
+  part that lasts: adding a setting to the agent will not compile in a strict
+  build until someone states, there, whether a confidential guest honours it.
+EOF
+  pause
   say <<'EOF'
 
   Network configuration is easy to overlook: a host that can reach the
@@ -1328,7 +1349,8 @@ if [[ "${ACTS}" == "0,1,2,3,4" ]]; then
       under any other hash is refused — staged live in act 2, by changing one
       hex digit of what the host hands over.
     * Turn on a debug channel to work from inside. The guest overrides what the
-      host asks for: no log, no vsock port, no debug console (act 1).
+      host asks for: no debug console, no log listener, no tracing exporter
+      (act 3).
     * Smuggle permissions in through a fragment. It must be signed by an issuer
       on the measured allow-list, declared by the measured policy, at or above
       the SVN floor, and confined to its own feed's namespace (act 4).
