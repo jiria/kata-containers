@@ -53,7 +53,7 @@ spec:
     supplementalGroups: [10]
   containers:
     - name: busybox
-      image: quay.io/prometheus/busybox:latest
+      image: mcr.microsoft.com/azurelinux/busybox:1.36
       command: ["sleep", "600"]
 EOF
 

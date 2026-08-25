@@ -255,7 +255,7 @@ spec:
     supplementalGroups: [10]
   containers:
     - name: busybox
-      image: quay.io/prometheus/busybox:latest
+      image: mcr.microsoft.com/azurelinux/busybox:1.36
       command: ["sleep", "600"]
 EOF
 }
@@ -673,12 +673,12 @@ spec:
     supplementalGroups: [10]
   containers:
     - name: busybox
-      image: quay.io/prometheus/busybox:latest
+      image: mcr.microsoft.com/azurelinux/busybox:1.36
       command: ["sleep", "600"]
 EOF
   [[ "$2" = "two" ]] && cat <<EOF
     - name: sidecar
-      image: quay.io/prometheus/busybox:latest
+      image: mcr.microsoft.com/azurelinux/busybox:1.36
       command: ["sh", "-c", "echo ${SIDECAR_MARK}; sleep 600"]
 EOF
   return 0
@@ -793,7 +793,7 @@ apply_sidecar_case() {
   # asserting nothing.
   cat >> "${yaml}" <<EOF
     - name: sidecar
-      image: quay.io/prometheus/busybox:latest
+      image: mcr.microsoft.com/azurelinux/busybox:1.36
       command: ["sh", "-c", "echo ${SIDECAR_MARK}; sleep 600"]
 EOF
   kubectl delete pod "$1" -n "${NS}" --ignore-not-found >/dev/null 2>&1 || true
