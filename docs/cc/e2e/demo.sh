@@ -986,9 +986,11 @@ EOF
   [[ -s "${WORK}/a.toml" ]] || { ensure_policy_toolchain; demo_pod_yaml demo-a '"sleep", "3600"'; start_demo_pod demo-a; decode_initdata demo-a "${WORK}/a.toml"; }
 
   show "containerd built each layer as an EROFS image, with verity metadata beside it" \
-    "sudo find ${SNAP} -maxdepth 2 \\( -name 'layer.erofs' -o -name 'layer.erofs.dmverity' \\) | sort | head"
-  show "one such file per layer — and a pod has several, across its images and the pause container" \
-    "sudo find ${SNAP} -maxdepth 2 -name 'layer.erofs.dmverity' | sort | while read -r f; do echo \"\$f\"; sudo cat \"\$f\"; echo; done | head -20"
+    "sudo find ${SNAP} -maxdepth 2 \\( -name 'layer.erofs' -o -name 'layer.erofs.dmverity' \\) | sort | sed 's|${SNAP}/||'"
+  # Print every layer, not a head-truncated sample: the next beat lists the hashes
+  # the policy names, and a cut-off list makes one of them look absent from the host.
+  show "and this is the root hash of every layer on this host — not just this pod's" \
+    "sudo find ${SNAP} -maxdepth 2 -name 'layer.erofs.dmverity' | sort | while read -r f; do printf '  snapshot %-5s %s...\\n' \"\$(basename \$(dirname \$f))\" \"\$(sudo jq -r .roothash \$f | cut -c1-16)\"; done"
 
   # Partition numbers are per container, so two containers each have a partition 1.
   # Printing the hashes flat makes the agent's denial message (which unions them into
@@ -1017,7 +1019,7 @@ for n, c in enumerate(json.loads(t[j:end])["containers"], 1):
         print("      partition %s = %s..." % (o.get("X-kata.partition-number", "?"),
                                               o.get("X-kata.dmverity.roothash", "?")[:16]))
 PYEOF
-  show "and the measured policy — demo-a's initdata, decoded — names those same layers, per container" \
+  show "and the measured policy — demo-a's initdata, decoded — names only the ones this pod may mount" \
     "python3 ${WORK}/policy-layers.py ${WORK}/a.toml"
 
   sudo find "${SNAP}" -maxdepth 2 -name 'layer.erofs.dmverity' -exec cat {} \; 2>/dev/null \
