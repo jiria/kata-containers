@@ -982,8 +982,8 @@ EOF
   grep -oE 'X-kata\.dmverity\.roothash=[a-f0-9]{64}' "${WORK}/a.toml" \
     | cut -d= -f2 | sort -u > "${WORK}/policy-hashes.txt"
 
-  show "so check each hash the policy names against the layers this host actually built" \
-    "while read -r h; do if grep -qx \"\$h\" ${WORK}/host-hashes.txt; then printf '  %s...  built on this host\\n' \"\$(echo \$h | cut -c1-32)\"; else printf '  %s...  MISSING\\n' \"\$(echo \$h | cut -c1-32)\"; fi; done < ${WORK}/policy-hashes.txt"
+  show "does the policy name any hash containerd did not build here? (empty means no)" \
+    "comm -13 ${WORK}/host-hashes.txt ${WORK}/policy-hashes.txt | sed 's/^/  UNBACKED: /'; echo '  -- end of list --'"
   local matched missing
   matched=$(comm -12 "${WORK}/host-hashes.txt" "${WORK}/policy-hashes.txt" | wc -l)
   missing=$(comm -13 "${WORK}/host-hashes.txt" "${WORK}/policy-hashes.txt" | wc -l)
