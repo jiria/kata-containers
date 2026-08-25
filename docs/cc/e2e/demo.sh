@@ -983,7 +983,7 @@ EOF
     | cut -d= -f2 | sort -u > "${WORK}/policy-hashes.txt"
 
   show "so check each hash the policy names against the layers this host actually built" \
-    "while read -r h; do if grep -qx \"\$h\" ${WORK}/host-hashes.txt; then printf '  %s...  found on this host\\n' \"\$(echo \$h | cut -c1-32)\"; else printf '  %s...  MISSING\\n' \"\$(echo \$h | cut -c1-32)\"; fi; done < ${WORK}/policy-hashes.txt; echo; echo \"policy names \$(wc -l < ${WORK}/policy-hashes.txt | tr -d ' ') hashes; this host has \$(wc -l < ${WORK}/host-hashes.txt | tr -d ' ') layers in the snapshotter, from every image it has ever pulled\""
+    "while read -r h; do if grep -qx \"\$h\" ${WORK}/host-hashes.txt; then printf '  %s...  built on this host\\n' \"\$(echo \$h | cut -c1-32)\"; else printf '  %s...  MISSING\\n' \"\$(echo \$h | cut -c1-32)\"; fi; done < ${WORK}/policy-hashes.txt"
   local matched missing
   matched=$(comm -12 "${WORK}/host-hashes.txt" "${WORK}/policy-hashes.txt" | wc -l)
   missing=$(comm -13 "${WORK}/host-hashes.txt" "${WORK}/policy-hashes.txt" | wc -l)
