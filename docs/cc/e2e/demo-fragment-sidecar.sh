@@ -438,6 +438,16 @@ agent_hvsock_flag() {
 
 # ---------------------------------------------------------------------------
 step "1 — a container the measured policy contains"
+say <<'EOF'
+
+  What follows is one continuous experiment on a single pod. It starts from a
+  container that pod's measured policy already contains, then asks for one it
+  has never seen — first with nothing to authorize it, and then with a signed
+  fragment that does. The pod is never restarted and its policy is never
+  regenerated, so the launch measurement is the same at the end as at the
+  start; only what the guest has been given permission to accept changes.
+EOF
+pause
 # Steps 1-2 need nothing more than a running pod whose measured policy declares
 # no fragments — which is exactly what act 1 left behind. Reuse it rather than
 # spending another CVM boot on an identical one. Steps 3-5 do need their own
@@ -471,8 +481,8 @@ say <<'EOF'
   That policy is fixed. Nothing in the steps that follow regenerates it, and
   nothing re-launches this pod — so whatever happens next is judged against
   exactly this list. One workload container is permitted, and the sandbox's own
-  pause container. A second workload container has no entry, and cannot acquire
-  one by being asked for politely.
+  pause container. Anything else has no entry here, and the only thing that can
+  give it one is a signed fragment.
 EOF
 pause
 

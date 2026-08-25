@@ -632,6 +632,8 @@ EOF
     || true
   pause
 
+  show "the pod's own account of what happened to that container" \
+    "kubectl get pod ${pod} -n ${NS} -o custom-columns='NAME:.metadata.name,PHASE:.status.phase,CONTAINER:.status.containerStatuses[0].name,STATE:.status.containerStatuses[0].state.terminated.reason,EXIT:.status.containerStatuses[0].state.terminated.exitCode'"
   show "the guest's answer" "python3 ${WORK}/verity-denial.py ${NS} ${pod}"
 
   local phase
@@ -1066,10 +1068,12 @@ EOF
     "sudo dmsetup ls 2>&1"
   say <<'EOF'
 
-  The host builds the layers and can no longer look inside them. The guest
-  kernel mounts them with dm-verity and enforces the root hash on every block
-  read — and the hash it enforces has to be one the measured policy named, or
-  the container is refused before any mount happens.
+  The host built these layers, so it has the bytes and could read them at any
+  time — that is not what dm-verity is for. It hands them to the guest, and the
+  guest kernel mounts them with dm-verity and enforces the root hash on every
+  block read, so the host cannot change what it handed over without the guest
+  noticing. And the hash the guest enforces has to be one the measured policy
+  named, or the container is refused before any mount happens.
 
   Those are two different checks doing two different jobs. The kernel proves
   contents against digest. The policy proves that digest was approved. Kata
@@ -1215,10 +1219,11 @@ EOF
       "grep -nE '^default policy_fragments := \[\]|\"fragments\": \[\]' ${WORK}/a.toml"
     say <<'EOF'
 
-  Four keys the agent recognizes: the policy, the issuer allow-list, and the
-  two that carry an attestation configuration. Act 1's pod set the first and
-  left the fragment list empty — so nothing could have been added to it at
-  runtime, whoever signed it. What follows is a pod that declares an issuer.
+  aa.toml and cdh.toml carry attestation configuration, policy.rego is the
+  policy itself, and fragment-issuers.toml is the allow-list this act turns on.
+  Whoever signs a fragment, an empty list is an empty list — so act 1's pod
+  could not have had anything added to it at runtime. What follows is a pod
+  that names an issuer.
 EOF
   fi
   pause
