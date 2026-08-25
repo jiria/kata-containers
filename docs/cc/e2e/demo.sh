@@ -106,12 +106,27 @@ trap '_verity_restore; rm -rf "${WORK}"; sudo pkill -f initdata-tamper.py >/dev/
 # Act 2 substitutes the root hash the host presents. That edits a file belonging
 # to containerd's snapshotter, so it has to be put back even if the demo dies
 # between the edit and the restore — hence a global, and a call from the trap.
+SNAP=/var/lib/containerd/io.containerd.snapshotter.v1.erofs/snapshots
 _VERITY_TARGET=""
 _verity_restore() {
   [[ -n "${_VERITY_TARGET}" ]] || return 0
   sudo cp "${_VERITY_TARGET}.demobak" "${_VERITY_TARGET}" >/dev/null 2>&1 || true
   sudo rm -f "${_VERITY_TARGET}.demobak" >/dev/null 2>&1 || true
   _VERITY_TARGET=""
+}
+
+# The trap covers everything except SIGKILL and a hard reset — and if the restore
+# never runs, the substituted hash stays on disk, where it breaks every later pod
+# that mounts that layer, this demo's own included. The backup is enough to undo
+# it, so undo it before anything else runs rather than debugging a mystery.
+_verity_recover_stray() {
+  local bak
+  while read -r bak; do
+    [[ -n "${bak}" ]] || continue
+    sudo cp "${bak}" "${bak%.demobak}" >/dev/null 2>&1 || true
+    sudo rm -f "${bak}" >/dev/null 2>&1 || true
+    warn "put back a dm-verity root hash a previous run left substituted: ${bak%.demobak}"
+  done < <(sudo find "${SNAP}" -maxdepth 2 -name 'layer.erofs.dmverity.demobak' 2>/dev/null)
 }
 
 pause() {
@@ -563,6 +578,9 @@ if groups:
         for entry in re.findall(r'"([^"]+)"', body):
             print("    %s" % short(entry.rstrip("\\ ")))
         print()
+    print("  (partition numbers restart at 1 for each container, and 'policy declares'")
+    print("   covers every container in the policy — so a second partition 1 is the")
+    print("   pause container's layer, not a duplicate)")
 else:
     print("  " + short(s.strip()))
 PY
@@ -674,6 +692,7 @@ preflight() {
     || die "no reachable cluster — run 03-deploy-cluster.sh first"
   kubectl get runtimeclass "${E2E_RUNTIMECLASS}" >/dev/null 2>&1 \
     || die "runtimeclass ${E2E_RUNTIMECLASS} not found — run 03-deploy-cluster.sh first"
+  _verity_recover_stray
   ok "preflight: cluster, guest stack and source tree present"
 }
 
@@ -966,14 +985,40 @@ act2() {
 EOF
   [[ -s "${WORK}/a.toml" ]] || { ensure_policy_toolchain; demo_pod_yaml demo-a '"sleep", "3600"'; start_demo_pod demo-a; decode_initdata demo-a "${WORK}/a.toml"; }
 
-  SNAP=/var/lib/containerd/io.containerd.snapshotter.v1.erofs/snapshots
   show "containerd built each layer as an EROFS image, with verity metadata beside it" \
     "sudo find ${SNAP} -maxdepth 2 \\( -name 'layer.erofs' -o -name 'layer.erofs.dmverity' \\) | sort | head"
   show "one such file per layer — and a pod has several, across its images and the pause container" \
     "sudo find ${SNAP} -maxdepth 2 -name 'layer.erofs.dmverity' | sort | while read -r f; do echo \"\$f\"; sudo cat \"\$f\"; echo; done | head -20"
 
-  show "and the measured policy — demo-a's initdata, decoded — names those same layers in the mount options it requires" \
-    "grep -oE 'X-kata\.dmverity\.roothash=[a-f0-9]{64}' ${WORK}/a.toml | sort -u"
+  # Partition numbers are per container, so two containers each have a partition 1.
+  # Printing the hashes flat makes the agent's denial message (which unions them into
+  # one set) look like it is contradicting itself.
+  cat > "${WORK}/policy-layers.py" <<'PYEOF'
+import json, sys
+t = open(sys.argv[1]).read()
+j = t.index("{", t.index("policy_data := {"))
+d = 0
+for k in range(j, len(t)):
+    if t[k] == "{":
+        d += 1
+    elif t[k] == "}":
+        d -= 1
+        if d == 0:
+            end = k + 1
+            break
+for n, c in enumerate(json.loads(t[j:end])["containers"], 1):
+    img = c.get("OCI", {}).get("Annotations", {}).get("io.kubernetes.cri.image-name") \
+        or "the pause container (sandbox infrastructure)"
+    print("  container %d - %s" % (n, img))
+    for s in c.get("storages", []):
+        if s.get("driver") != "erofs-verity-layer":
+            continue
+        o = dict(x.split("=", 1) for x in s.get("options", []) if "=" in x)
+        print("      partition %s = %s..." % (o.get("X-kata.partition-number", "?"),
+                                              o.get("X-kata.dmverity.roothash", "?")[:16]))
+PYEOF
+  show "and the measured policy — demo-a's initdata, decoded — names those same layers, per container" \
+    "python3 ${WORK}/policy-layers.py ${WORK}/a.toml"
 
   sudo find "${SNAP}" -maxdepth 2 -name 'layer.erofs.dmverity' -exec cat {} \; 2>/dev/null \
     | jq -r '.roothash' 2>/dev/null | sort -u > "${WORK}/host-hashes.txt"
@@ -982,8 +1027,6 @@ EOF
   grep -oE 'X-kata\.dmverity\.roothash=[a-f0-9]{64}' "${WORK}/a.toml" \
     | cut -d= -f2 | sort -u > "${WORK}/policy-hashes.txt"
 
-  show "does the policy name any hash containerd did not build here? (empty means no)" \
-    "comm -13 ${WORK}/host-hashes.txt ${WORK}/policy-hashes.txt | sed 's/^/  UNBACKED: /'; echo '  -- end of list --'"
   local matched missing
   matched=$(comm -12 "${WORK}/host-hashes.txt" "${WORK}/policy-hashes.txt" | wc -l)
   missing=$(comm -13 "${WORK}/host-hashes.txt" "${WORK}/policy-hashes.txt" | wc -l)
