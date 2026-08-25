@@ -991,7 +991,7 @@ act2() {
 EOF
   [[ -s "${WORK}/a.toml" ]] || { ensure_policy_toolchain; demo_pod_yaml demo-a '"sleep", "3600"'; start_demo_pod demo-a; decode_initdata demo-a "${WORK}/a.toml"; }
 
-  show "containerd built each layer as an EROFS image, with verity metadata beside it" \
+  show "containerd built each layer as an EROFS image in its snapshotter store, with verity metadata beside it" \
     "sudo find ${SNAP} -maxdepth 2 \\( -name 'layer.erofs' -o -name 'layer.erofs.dmverity' \\) | sort | sed 's|${SNAP}/||'"
   # Print every layer, not a head-truncated sample: the next beat lists the hashes
   # the policy names, and a cut-off list makes one of them look absent from the host.
