@@ -1148,19 +1148,18 @@ EOF
     "sed -n '2535,2543p' ${E2E_REPO_DIR}/src/agent/src/rpc.rs"
   show "network config is policy-checked, then frozen once the workload starts" \
     "grep -n 'net_phase_authorize' ${E2E_REPO_DIR}/src/agent/src/rpc.rs | head -6"
-  show "and the settings a host would use to open a way in are overridden, whatever it asked for" \
+  show "and the settings a host could use to open a way in are fixed by the guest, whatever it asked for" \
     "grep -nE '^\\s+\\*(debug_console|debug_console_vport|dev_mode|log_level|log_vport|tracing|secure_storage_integrity) = ' ${E2E_REPO_DIR}/src/agent/src/config.rs"
   say <<'EOF'
 
-  Those seven arrive on the kernel command line, or in a config file it names,
-  or in the agent's environment — all three chosen by the host, so all three are
-  untrusted here. A debug console is an unmediated shell into the guest; tracing
-  ships decoded request payloads back out; and zeroing the log port means no
-  listener is bound at all, so the guest keeps no channel the host asked for.
+  The host chooses every one of those — on the kernel command line, in a config
+  file, or in the agent's environment. A debug console is a shell into the guest
+  that no policy sees, and tracing ships request payloads back out. So a strict
+  guest sets them itself rather than accepting what it was handed.
 
-  The function that does this destructures the config exhaustively, which is the
-  part that lasts: adding a setting to the agent will not compile in a strict
-  build until someone states, there, whether a confidential guest honours it.
+  And it has to say something about each one: the code names every setting
+  individually, so a new one will not compile until someone decides whether a
+  confidential guest may honour it.
 EOF
   pause
   say <<'EOF'
