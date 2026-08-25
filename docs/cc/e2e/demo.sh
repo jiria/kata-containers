@@ -486,15 +486,6 @@ live_binding_experiment() {
   so aborting takes the VM with it. There is no degraded mode in which the
   workload runs under a policy that was never measured.
 
-  Be precise about what this one run shows. The document served differed from
-  the document measured, and the pod was refused — but a pod that fails to start
-  is equally well explained by us having corrupted the image. The control for
-  that is the same rewrite with the manipulation neutered: re-compress the
-  document instead of editing it, so the bytes on disk change and the digest
-  does not. That run boots and reaches Running, which isolates the digest as the
-  only variable. It is another CVM boot, so it is off by default —
-  DEMO_TAMPER_CONTROL=1 runs it.
-
   Note what none of this claims: a host is free to launch a CVM under any policy
   it likes, stamping that policy's digest honestly. Catching that is
   attestation's job, and it can do it precisely because the digest in the report
@@ -930,9 +921,10 @@ EOF
   say <<'EOF'
 
   So we can stage the attack for real, on this hardware, with no lie told to the
-  hardware at all: let the runtime stamp the honest digest, then rewrite the
-  image before the guest reads it. What we serve is the same policy with one
-  character changed, inside a comment — no rule touched, no check disabled,
+  hardware at all: let the runtime stamp the honest digest, then rewrite that
+  block image — the one carrying the policy — before the guest reads it. What we
+  serve is the same policy with one character changed, inside a comment — no
+  rule touched, no check disabled,
   every dm-verity root hash intact, so nothing in the guest has any cause to
   object to it except the binding itself.
 
@@ -980,7 +972,7 @@ EOF
   show "one such file per layer — and a pod has several, across its images and the pause container" \
     "sudo find ${SNAP} -maxdepth 2 -name 'layer.erofs.dmverity' | sort | while read -r f; do echo \"\$f\"; sudo cat \"\$f\"; echo; done | head -20"
 
-  show "and the measured policy names those same layers, in the mount options the guest must be handed" \
+  show "and the measured policy — demo-a's initdata, decoded — names those same layers in the mount options it requires" \
     "grep -oE 'X-kata\.dmverity\.roothash=[a-f0-9]{64}' ${WORK}/a.toml | sort -u"
 
   sudo find "${SNAP}" -maxdepth 2 -name 'layer.erofs.dmverity' -exec cat {} \; 2>/dev/null \
@@ -1279,9 +1271,7 @@ if [[ "${ACTS}" == "0,1,2,3,4" ]]; then
       not meant to be: the host picks HOST_DATA. It is caught by attestation,
       which works precisely because the digest in the report is honest.
     * Stamp one policy and serve another. Refused at boot by the guest itself,
-      staged live in act 1. The control that rules out "the image was simply
-      corrupted" — the same rewrite with the digest left intact, which boots and
-      runs — is a second CVM launch, so it is off by default.
+      staged live in act 1.
     * Replace the policy once the guest is up. There is no channel: SetPolicy
       is compiled out of a strict build, so initdata is the only way a policy
       ever enters (act 3).
