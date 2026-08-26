@@ -573,6 +573,12 @@ s = msgs[-1]
 s = s[s.index("blocked by policy:"):].split("policyDecision<")[0]
 s = s.replace('\\\\\\"', '"').replace('\\"', '"').replace('\\\\', '\\')
 
+# The pod object carries no terminated.message for this failure, so the one-line
+# reason has to come out of the same event as the detail below it.
+if "--headline" in sys.argv:
+    print("  " + s.split(" request presents")[0].rstrip(": "))
+    raise SystemExit(0)
+
 def short(t):
     return re.sub(r"([0-9a-f]{16})[0-9a-f]{48}", r"\1...", t)
 
@@ -632,9 +638,9 @@ EOF
     || true
   pause
 
-  show "the pod's own account of what happened to that container" \
-    "kubectl get pod ${pod} -n ${NS} -o custom-columns='NAME:.metadata.name,PHASE:.status.phase,CONTAINER:.status.containerStatuses[0].name,STATE:.status.containerStatuses[0].state.terminated.reason,EXIT:.status.containerStatuses[0].state.terminated.exitCode'"
-  show "the guest's answer" "python3 ${WORK}/verity-denial.py ${NS} ${pod}"
+  show "the pod's own account of what happened to that container, and why" \
+    "kubectl get pod ${pod} -n ${NS} -o custom-columns='NAME:.metadata.name,PHASE:.status.phase,CONTAINER:.status.containerStatuses[0].name,STATE:.status.containerStatuses[0].state.terminated.reason,EXIT:.status.containerStatuses[0].state.terminated.exitCode'; echo; python3 ${WORK}/verity-denial.py ${NS} ${pod} --headline"
+  show "and the guest's answer in full" "python3 ${WORK}/verity-denial.py ${NS} ${pod}"
 
   local phase
   phase=$(kubectl get pod "${pod}" -n "${NS}" -o jsonpath='{.status.containerStatuses[0].state.terminated.reason}' 2>/dev/null)
