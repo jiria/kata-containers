@@ -524,9 +524,16 @@ emit_mlt() {
   # Clip length is the audio's own duration — that is what actually has to fit.
   # mp3_seconds is exact here even without ffmpeg installed, because the stream
   # is constant bitrate by request.
+  # Path portability: this script may run under Git Bash while Kdenlive runs as
+  # a native Windows app, and "/c/Users/..." means nothing to the latter. So
+  # resources are relative to the document and the root is converted to a native
+  # form where a converter exists. On Linux both are already correct.
+  local root="${out}"
+  command -v cygpath >/dev/null 2>&1 && root="$(cygpath -m "${out}" 2>/dev/null || printf '%s' "${out}")"
+
   {
     printf '<?xml version="1.0" encoding="utf-8"?>\n'
-    printf '<mlt LC_NUMERIC="C" version="7.0.0" producer="main_bin" profile="demo_exec">\n'
+    printf '<mlt LC_NUMERIC="C" version="7.0.0" producer="main_bin" profile="demo_exec" root="%s">\n' "${root}"
     printf '  <profile description="demo-exec" width="1920" height="1080" progressive="1"'
     printf ' sample_aspect_num="1" sample_aspect_den="1" display_aspect_num="16"'
     printf ' display_aspect_den="9" frame_rate_num="%s" frame_rate_den="1" colorspace="709"/>\n' \
@@ -536,7 +543,7 @@ emit_mlt() {
       [[ -s "${out}/tts/${SEG_ID[i]}.mp3" ]] || continue
       alen="$(mp3_seconds "${out}/tts/${SEG_ID[i]}.mp3")"
       printf '  <producer id="vo%02d" in="00:00:00.000" out="%s">\n' "${i}" "$(hms "${alen}")"
-      printf '    <property name="resource">%s/tts/%s.mp3</property>\n' "${out}" "${SEG_ID[i]}"
+      printf '    <property name="resource">tts/%s.mp3</property>\n' "${SEG_ID[i]}"
       printf '    <property name="mlt_service">avformat</property>\n'
       printf '    <property name="kdenlive:clipname">%s</property>\n' "${SEG_ID[i]}"
       printf '  </producer>\n'
