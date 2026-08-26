@@ -641,6 +641,17 @@ EOF
   show "the pod's own account of what happened to that container, and why" \
     "kubectl get pod ${pod} -n ${NS} -o custom-columns='NAME:.metadata.name,PHASE:.status.phase,CONTAINER:.status.containerStatuses[0].name,STATE:.status.containerStatuses[0].state.terminated.reason,EXIT:.status.containerStatuses[0].state.terminated.exitCode'; echo; python3 ${WORK}/verity-denial.py ${NS} ${pod} --headline"
   show "and the guest's answer in full" "python3 ${WORK}/verity-denial.py ${NS} ${pod}"
+  show "where that sentence came from: the frame from the agent, the reason from the measured document itself" \
+    "grep -n 'is blocked by policy: no policy container satisfied' ${E2E_REPO_DIR}/src/agent/policy/src/decision.rs; grep -n 'dm-verity layers: request presents' ${WORK}/a.toml | cut -c1-100"
+  say <<'EOF'
+
+  The host did not compose that refusal, it relayed it. The sentence frame is
+  written by the agent inside the guest, and the reason in it comes from the
+  policy that was measured at launch — the second grep is act 1's decoded
+  document, not a copy in the source tree. So the explanation for the refusal
+  is covered by the same digest as the rule that produced it.
+EOF
+  pause
 
   local phase
   phase=$(kubectl get pod "${pod}" -n "${NS}" -o jsonpath='{.status.containerStatuses[0].state.terminated.reason}' 2>/dev/null)
