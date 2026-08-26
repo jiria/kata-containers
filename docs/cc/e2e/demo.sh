@@ -274,7 +274,7 @@ spec:
     supplementalGroups: [10]
   containers:
     - name: busybox
-      image: mcr.microsoft.com/azurelinux/busybox:1.36
+      image: ${E2E_BUSYBOX_IMAGE}
       command: [${cmd}]
 EOF
   # Generating a policy takes a few seconds and prints nothing. Off screen that
@@ -1036,6 +1036,9 @@ for k in range(j, len(t)):
 for n, c in enumerate(json.loads(t[j:end])["containers"], 1):
     img = c.get("OCI", {}).get("Annotations", {}).get("io.kubernetes.cri.image-name") \
         or "the pause container (sandbox infrastructure)"
+    if "@sha256:" in img:
+        repo, dig = img.split("@sha256:", 1)
+        img = "%s@sha256:%s..." % (repo, dig[:12])
     print("  container %d - %s" % (n, img))
     for s in c.get("storages", []):
         if s.get("driver") != "erofs-verity-layer":

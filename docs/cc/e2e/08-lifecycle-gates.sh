@@ -152,13 +152,13 @@ spec:
     supplementalGroups: [10]
   containers:
     - name: busybox
-      image: mcr.microsoft.com/azurelinux/busybox:1.36
+      image: ${E2E_BUSYBOX_IMAGE}
       command: ["sleep", "900"]
 EOF
   if [[ "${POD_WITH_EXITER:-0}" = 1 ]]; then
     cat >> "${WORK}/${pod}.yaml" <<EOF
     - name: exiter
-      image: mcr.microsoft.com/azurelinux/busybox:1.36
+      image: ${E2E_BUSYBOX_IMAGE}
       command: ["true"]
 EOF
   fi

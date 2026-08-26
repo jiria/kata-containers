@@ -36,6 +36,14 @@ set -uo pipefail
 # are all different, and only the QEMU path ships a genpolicy binary. Anything
 # platform-dependent is derived here so the stages stay declarative.
 : "${E2E_PLATFORM:=qemu-coco-dev}"
+
+# Pinned by digest rather than by tag. mcr.microsoft.com/azurelinux/busybox:1.36 is
+# mutable and has moved mid-run: genpolicy resolves the reference itself and writes the
+# resulting dm-verity root hashes into the measured policy, while containerd mounts
+# whatever it already has cached for that tag. When the tag moves between those two
+# steps the hashes disagree and the guest refuses a pod nobody tampered with -- a real
+# denial with a misleading cause. A digest makes both parties name the same bytes.
+: "${E2E_BUSYBOX_IMAGE:=mcr.microsoft.com/azurelinux/busybox@sha256:e3ead6d406efe76dc1da586756c0e9142442f7320644a13d5cc0a55598a080fe}"
 case "${E2E_PLATFORM}" in
   qemu-coco-dev)
     # Standard_DC16as_cc_v5 is a SEV-SNP CC SKU. See README for the region/quota

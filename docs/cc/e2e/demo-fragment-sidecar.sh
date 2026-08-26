@@ -343,7 +343,7 @@ spec:
     supplementalGroups: [10]
   containers:
     - name: busybox
-      image: mcr.microsoft.com/azurelinux/busybox:1.36
+      image: ${E2E_BUSYBOX_IMAGE}
       command: ["sleep", "600"]
 EOF
 }
@@ -351,7 +351,7 @@ EOF
 append_sidecar() {
   cat >> "$1" <<EOF
     - name: sidecar
-      image: mcr.microsoft.com/azurelinux/busybox:1.36
+      image: ${E2E_BUSYBOX_IMAGE}
       command: ["sh", "-c", "echo ${MARK}; sleep 600"]
 EOF
 }
@@ -499,7 +499,7 @@ say <<'EOF'
   be made by the guest, at runtime, against the document it was launched with.
 EOF
 show "add a container to the running pod" \
-  "kubectl debug -n ${NS} ${POD} --image=mcr.microsoft.com/azurelinux/busybox:1.36 -c sidecar -- sh -c 'echo ${MARK}; sleep 600' 2>&1 | tail -4 || true"
+  "kubectl debug -n ${NS} ${POD} --image=${E2E_BUSYBOX_IMAGE} -c sidecar -- sh -c 'echo ${MARK}; sleep 600' 2>&1 | tail -4 || true"
 wait_for 120 "the sidecar to reach a terminal state" eph_settled sidecar
 sc=$(eph_ready_of sidecar)
 [[ "${sc}" = "true" ]] && die "the sidecar started without a fragment — the policy is not being enforced"
