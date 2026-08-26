@@ -205,11 +205,11 @@ segment() {
 
 # ---- open -------------------------------------------------------------------
 segment S01 "open" "title card — no terminal" none '' <<'VO'
-Confidential containers on Azure encrypt memory and measure a policy at launch.
-We've taken it further: each workload runs in its own hardware-isolated VM, the
-image is verified block by block, the rules stay enforced for the whole life of
-the workload, and the customer or the platform can still evolve them safely.
-Let me show you each one.
+Confidential containers on Azure already give each workload its own hardware-isolated
+VM, with every image layer verified block by block — in the layer format the OCI is
+standardizing on. What we've added is that the policy holds for the entire life of the
+workload, and that the customer or the platform can still evolve it safely. Let me walk
+the whole chain, ending on those two.
 VO
 
 # ---- moment 1: what the workload actually runs in ---------------------------
@@ -230,9 +230,10 @@ VO
 
 # ---- moment 2: down to the bytes of the image -------------------------------
 segment S04 "m2" "the layer's dm-verity root hash, as named in the measured policy" act:2 '' <<'VO'
-Every layer of the image carries a dm-verity root hash, and those hashes are in
+Every layer is an erofs image with a dm-verity root hash, and those hashes are in
 the attested policy — so the guest checks the disk block by block instead of
-trusting it.
+trusting it. That is also the layer format the OCI is standardizing on, so this is
+not a detour we have to unwind later.
 VO
 
 segment S05 "m2" "one hex digit of one hash changed" act:2 '' <<'VO'
@@ -294,7 +295,8 @@ VO
 segment S15 "m4" "hold on the annotation, then the measured issuer list beside it" act:frag '' <<'VO'
 It's called a fragment, and it can come from the customer or from the platform:
 Azure shipping a managed sidecar is the same mechanism. Notice it arrives
-through the host — so the host is not trusted with it.
+through the host — which only carries it. What gets it accepted is the
+signature, never the delivery.
 VO
 
 segment S16 "m4" "the guest verifying the signature and the ledger receipt" act:frag '' <<'VO'
@@ -636,8 +638,20 @@ synthesize() {
     if [[ -s "${out}/tts/${SEG_ID[i]}.mp3" && "${SPEECH_FORCE:-0}" != "1" ]]; then
       kept=$((kept + 1))
     else
-      # SSML is XML: an unescaped ampersand or angle bracket is a 400, not a warning.
-      txt="$(sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' <<<"${SEG_VO[i]}")"
+      # SSML is XML: an unescaped ampersand or angle bracket is a 400, not a
+      # warning. Escape first, then insert breaks — do it the other way round
+      # and the break tags get escaped into literal text.
+      #
+      # The dashes need the breaks. This narration uses em dashes the way speech
+      # uses a beat before a qualifier, but the voice runs straight through them,
+      # which turns "written inside the boundary — the host is only relaying it"
+      # into one breathless clause. The text files keep the dash, because a shot
+      # list and a subtitle should read normally; only the SSML gets the pause.
+      txt="$(printf '%s' "${SEG_VO[i]}" \
+        | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' \
+        | sed -e 's/ — / <break time="320ms"\/> /g' \
+              -e 's/ – / <break time="240ms"\/> /g' \
+              -e 's/: /: <break time="200ms"\/> /g')"
       code="$(curl -sS -o "${out}/tts/${SEG_ID[i]}.mp3" -w '%{http_code}' \
         -X POST "${SPEECH_ENDPOINT%/}/tts/cognitiveservices/v1" \
         -H "Authorization: Bearer ${tok}" \
