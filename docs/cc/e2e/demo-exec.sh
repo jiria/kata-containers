@@ -206,10 +206,10 @@ segment() {
 # ---- open -------------------------------------------------------------------
 segment S01 "open" "title card — no terminal" none '' <<'VO'
 Confidential containers on Azure already give each workload its own hardware-isolated
-VM, with every image layer verified block by block — in the layer format the OCI is
-standardizing on. What we've added is that the policy holds for the entire life of the
-workload, and that the customer or the platform can still evolve it safely. Let me walk
-the whole chain, ending on those two.
+VM, with image layers the kernel verifies block by block. What we've added is what all
+of that is anchored to: rules the host cannot reinterpret, that hold for the whole life
+of the workload, and that the customer or the platform can still evolve safely. Let me
+walk the chain.
 VO
 
 # ---- moment 1: what the workload actually runs in ---------------------------
@@ -217,32 +217,33 @@ VO
 # UVM, so this moment shows the platform and moment 3 shows the running VM.
 segment S02 "m1" "the hypervisor device and the in-kernel driver behind it" '' \
   "ls -l /dev/mshv; cat /sys/class/misc/mshv/dev" <<'VO'
-Each of these workloads gets its own virtual machine — not a container sharing a
-kernel with everything else on the box. Cloud Hypervisor launches it on the
-Microsoft hypervisor: that's slash dev slash m-s-h-v, in the kernel.
+Each workload gets its own virtual machine, not a container sharing a kernel.
+Cloud Hypervisor launches it on the Microsoft hypervisor — slash dev slash
+m-s-h-v, in the kernel.
 VO
 
 segment S03 "m1" "the runtime config: CLH as the VMM, IGVM-launched SEV-SNP guest" '' \
   "grep -nE '^\[hypervisor\.clh\]|^path = ' ${CFG} | head -2; grep -nE '^(igvm|confidential_guest|sev_snp_guest)' ${CFG}" <<'VO'
-And the runtime is configured to ask for an IGVM-launched SEV-SNP guest, so the
-memory boundary is enforced by the silicon rather than by a setting.
+And it asks for an IGVM-launched SEV-SNP guest, so the memory boundary is
+enforced by the silicon rather than by a setting.
 VO
 
 # ---- moment 2: down to the bytes of the image -------------------------------
 segment S04 "m2" "the layer's dm-verity root hash, as named in the measured policy" act:2 '' <<'VO'
-Every layer is an erofs image with a dm-verity root hash, and those hashes are in
-the attested policy — so the guest checks the disk block by block instead of
-trusting it. That is also the layer format the OCI is standardizing on, so this is
-not a detour we have to unwind later.
+Every layer is an erofs image, and the kernel proves its contents against that
+layer's dm-verity root hash — the format the OCI is standardizing on. What we
+added is who chooses the hash: it is named in the measured policy, so the host
+can only present layers the policy approved.
 VO
 
 segment S05 "m2" "one hex digit of one hash changed" act:2 '' <<'VO'
 Watch: we change one hex digit of one hash. Not the data. One digit.
 VO
 
-segment S06 "m2" "pod verdict — StartError, exit 128 — and the guest's own reason" act:2 '' <<'VO'
+segment S06 "m2" "pod verdict — StartError, exit 128 — then the full layer list beside the policy" act:2 '' <<'VO'
 The container never starts, and the refusal is written inside the boundary — the
-host is only relaying it.
+host is only relaying it. And it is not just this hash: presented layers must
+match declared layers one for one, each pinned to its position.
 VO
 
 # ---- moment 3: the rules are generated, measured, and enforced --------------
@@ -269,10 +270,11 @@ its VM.
 VO
 
 segment S11 "m3" "hold on the running pod — no new terminal output" none '' <<'VO'
-Measuring a policy at launch is not new. What we added is that it holds for the
-rest of the workload's life. There's no code path to accept a new policy after
-boot — compiled out, not switched off — and an agent that wasn't handed an
-attested policy denies everything rather than asking the host for one.
+Measuring a policy at launch is not new. What we changed is the question it asks.
+It used to be: is there a rule that permits this? Now it is: does what you
+presented match exactly what was declared? And it holds for the rest of the
+workload's life — there is no code path to accept a new policy after boot,
+compiled out rather than switched off.
 VO
 
 segment S12 "m3" "a substituted policy staged, and the guest's refusal" act:1 '' <<'VO'
