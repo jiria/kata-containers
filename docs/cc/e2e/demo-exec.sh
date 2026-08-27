@@ -70,7 +70,11 @@
 #                                   stateful experiments prompt you to run the
 #                                   corresponding act of demo.sh and record it.
 #                                   Timings are stamped either way.
-#   ./demo-exec.sh --run --auto     same without waiting for Enter.
+#   ./demo-exec.sh --run --auto     smoke-test the conductor: no prompts, so it
+#                                   runs straight through in seconds. Not a
+#                                   recording — it stamps no timings, because a
+#                                   run nobody was recording did not measure
+#                                   anything.
 #   ./demo-exec.sh --tts            synthesize the narration with Azure Speech.
 #   ./demo-exec.sh --inset          print the track B command and exit.
 #   ./demo-exec.sh --reset          clear the demo's pods and events, and exit.
@@ -385,8 +389,21 @@ slate() {
 }
 
 conduct() {
-  local t0 i
+  local t0 i prev_src=""
   reset_stage
+  # What this is, said once, because the shape of it surprises people: the cut
+  # interleaves segments that come from the same run of demo.sh — S04, S05 and
+  # S06 are all act 2 — so the acts cannot be driven from here. Running act 2
+  # three times would produce three different runs of the same experiment. The
+  # acts are separate takes, recorded once each; this walks the cut in order so
+  # the live segments get captured and the rest get called.
+  printf '%sthis conducts the cut; it does not run the three stateful acts.%s\n' \
+    "${c_bld}" "${c_off}"
+  printf '%sthose are separate takes — see recording-plan.md.%s\n\n' "${c_dim}" "${c_off}"
+  if [[ "${AUTO}" = "1" ]]; then
+    printf '%s--auto: smoke test, no prompts, no timings stamped. Not a recording.%s\n' \
+      "${c_ylw}" "${c_off}"
+  fi
   printf '%s\n' "${c_ylw}start your screen recording now, and keep the track B inset in shot.${c_off}"
   printf '%s\n' "${c_ylw}(./demo-exec.sh --inset prints the inset command)${c_off}"
   # The narration is deliberately not shown here. It is voice-over, added in
@@ -398,17 +415,29 @@ conduct() {
   t0="$(date +%s.%N)"
 
   for ((i = 0; i < N; i++)); do
-    STARTS+=("$(awk -v a="$(date +%s.%N)" -v b="${t0}" 'BEGIN{printf "%.3f", a-b}')")
+    # An --auto pass is not a conducted run: nothing was recorded and nobody
+    # waited, so the wall clock measures the speed of a for-loop. Leaving STARTS
+    # empty keeps emit() on a basis that means something.
+    [[ "${AUTO}" = "1" ]] || \
+      STARTS+=("$(awk -v a="$(date +%s.%N)" -v b="${t0}" 'BEGIN{printf "%.3f", a-b}')")
     slate "${i}"
     case "${SEG_SRC[i]}" in
       none) : ;;
       act:*)
-        printf '  %sfootage source: %s — run and record that act, then continue%s\n' \
-          "${c_ylw}" "${SEG_SRC[i]#act:}" "${c_off}"
-        case "${SEG_SRC[i]}" in
-          act:frag) printf '  %s%s%s\n' "${c_dim}" "DEMO_PAUSE=0 bash ${HERE}/demo-fragment-sidecar.sh" "${c_off}" ;;
-          *)        printf '  %s%s%s\n' "${c_dim}" "DEMO_PAUSE=0 DEMO_ACTS=${SEG_SRC[i]#act:} bash ${HERE}/demo.sh" "${c_off}" ;;
-        esac
+        # Only announce the act when it changes. Five consecutive segments out
+        # of act 1 are five shots in one recording, and repeating the command
+        # under each one reads as an instruction to run it again.
+        if [[ "${SEG_SRC[i]}" = "${prev_src}" ]]; then
+          printf '  %sstill in that recording — keep it rolling%s\n' "${c_dim}" "${c_off}"
+        else
+          printf '  %sfootage source: %s — run and record that act, then continue%s\n' \
+            "${c_ylw}" "${SEG_SRC[i]#act:}" "${c_off}"
+          case "${SEG_SRC[i]}" in
+            act:frag) printf '  %s%s%s\n' "${c_dim}" "DEMO_PAUSE=0 bash ${HERE}/demo-fragment-sidecar.sh" "${c_off}" ;;
+            *)        printf '  %s%s%s\n' "${c_dim}" "DEMO_PAUSE=0 DEMO_ACTS=${SEG_SRC[i]#act:} bash ${HERE}/demo.sh" "${c_off}" ;;
+          esac
+        fi
+        prev_src="${SEG_SRC[i]}"
         ;;
       *)
         # Clear first: everything above this point — the slate, the previous
@@ -420,10 +449,12 @@ conduct() {
         printf '%s%s@%s%s:%s%s%s$ %s\n' "${c_grn}" "$(whoami)" "$(hostname -s 2>/dev/null || echo host)" \
           "${c_off}" "${c_blu}" "${PWD/#${HOME}/\~}" "${c_off}" "${SEG_CMD[i]}"
         bash -c "${SEG_CMD[i]}" 2>&1 || true
+        prev_src="self"
         ;;
     esac
     [[ "${AUTO}" = "1" ]] || read -r -p "  press Enter for the next segment ..." _
-    ENDS+=("$(awk -v a="$(date +%s.%N)" -v b="${t0}" 'BEGIN{printf "%.3f", a-b}')")
+    [[ "${AUTO}" = "1" ]] || \
+      ENDS+=("$(awk -v a="$(date +%s.%N)" -v b="${t0}" 'BEGIN{printf "%.3f", a-b}')")
   done
 }
 
@@ -468,7 +499,11 @@ emit() {
   # it rather than trusting the nominal value.
   [[ -s "${out}/tts/_gap.mp3" ]] && SEG_GAP_S="$(mp3_seconds "${out}/tts/_gap.mp3")"
 
-  if [[ ${#STARTS[@]} -eq ${N} && "${have_audio}" != "1" ]]; then
+  # A conducted run that measured nothing — every segment stamped at t=0 — is a
+  # run that was not really conducted. Fall through rather than emit a 0:00
+  # timeline.
+  if [[ ${#STARTS[@]} -eq ${N} && "${have_audio}" != "1" \
+        && "$(awk -v x="${ENDS[$((N - 1))]:-0}" 'BEGIN{print (x > 1) ? 1 : 0}')" = "1" ]]; then
     TIMING_BASIS="measured from a conducted run"; st=("${STARTS[@]}"); en=("${ENDS[@]}")
   else
     for ((i = 0; i < N; i++)); do
