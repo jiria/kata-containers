@@ -301,16 +301,16 @@ through the host — which only carries it. What gets it accepted is the
 signature, never the delivery.
 VO
 
-segment S16 "m4" "the guest verifying the signature and the ledger receipt" act:frag '' <<'VO'
-Two things get checked inside the guest: that it's signed by an issuer named in
-the attested policy before launch, and that it carries a receipt from a
-transparency ledger proving the rule was published in the open.
+segment S16 "m4" "the guest verifying the fragment's signature and its version floor" act:frag '' <<'VO'
+What the guest checks is the signature: signed by an issuer the attested policy
+named before launch, at a version at or above the floor that policy set. An old
+rule replayed fails that same test.
 VO
 
-segment S17 "m4" "the sidecar Running, alongside the original container" act:frag '' <<'VO'
-Both pass. The sidecar starts. No redeploy, no re-attestation. And a fragment
-from someone who wasn't named — or an old one being replayed — is refused just
-the same.
+segment S17 "m4" "the sidecar Running beside the original container; then the receipt-required feed" act:frag '' <<'VO'
+It passes, and the sidecar starts — no redeploy, no re-attestation. And what's
+measured at launch can ask for more: that a feed's rules also carry a
+transparency-ledger receipt, proving they were published in the open.
 VO
 
 # ---- close ------------------------------------------------------------------
