@@ -217,8 +217,8 @@ VO
 segment S02 "m1" "the hypervisor device and the in-kernel driver behind it" '' \
   "ls -l /dev/mshv; cat /sys/class/misc/mshv/dev" <<'VO'
 Each workload gets its own virtual machine, not a container sharing a kernel.
-Cloud Hypervisor launches it on the Microsoft hypervisor — slash dev slash
-m-s-h-v, in the kernel.
+Cloud Hypervisor builds it through slash dev slash m-s-h-v — the kernel's
+interface to the Microsoft hypervisor running beneath this host.
 VO
 
 segment S03 "m1" "the runtime config: CLH as the VMM, IGVM-launched SEV-SNP guest" '' \
