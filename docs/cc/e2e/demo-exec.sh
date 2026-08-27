@@ -260,10 +260,10 @@ So who writes that document, and when?
 VO
 
 segment S08 "m3" "genpolicy rewriting the spec — the cc_init_data annotation appears" act:1 '' <<'VO'
-The customer does, before deploying. Genpolicy derives a Rego policy from this
-exact pod spec and writes it back as one annotation, so the rules are settled
-before the workload is ever submitted. That's the measured document the guest
-enforces: what may run, what may be mounted, who may get a shell.
+The customer does, before deploying. The Genpolicy tool derives a Rego policy
+from this exact pod spec and writes it back as one annotation. That's the
+measured document the guest enforces: what may run, what may be mounted, who may
+get a shell.
 VO
 
 segment S09 "m3" "the same digest in the hardware report at launch" act:1 '' <<'VO'
