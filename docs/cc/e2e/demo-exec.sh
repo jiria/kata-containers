@@ -229,10 +229,11 @@ VO
 
 # ---- moment 2: down to the bytes of the image -------------------------------
 segment S04 "m2" "the layer's dm-verity root hash, as named in the measured policy" act:2 '' <<'VO'
-Here's that policy — and one of the things it declares. Every layer is an erofs
-image: a mainline Linux filesystem, and a proposed OCI layer format. The kernel
-proves each layer against its dm-verity root hash, and that hash is written in
-the policy — so the host can only present what was declared.
+That boundary protects the memory, not what runs inside it. That's the policy's
+job — and here's one thing it declares. Every layer is an erofs image: a
+mainline Linux filesystem, and a proposed OCI layer format. The kernel proves
+each layer against its dm-verity root hash, and that hash is in the policy — so
+the host can only present what was declared.
 VO
 
 segment S05 "m2" "one hex digit of one hash changed" act:2 '' <<'VO'
@@ -287,10 +288,9 @@ it's a legitimate container, or who asks — it has no entry, so it doesn't star
 VO
 
 segment S14 "m4" "the policy_fragments annotation being attached to the pod spec" act:frag '' <<'VO'
-Security this strict normally means redeploying and re-attesting to change that.
-Instead, the policy names the issuers it will accept new rules from. Here's a
-signed rule being attached to the pod spec — one more annotation, next to the
-measured policy from a moment ago.
+Normally, changing that means redeploying and re-attesting. Instead, the policy
+names the issuers it will accept new rules from. Here's a signed rule being
+attached to the pod spec — one more annotation, next to the measured policy.
 VO
 
 segment S15 "m4" "hold on the annotation, then the measured issuer list beside it" act:frag '' <<'VO'
