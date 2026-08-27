@@ -209,7 +209,7 @@ We've enhanced the upstream Kata Confidential Containers stack to make it ready 
 scenarios. A workload runs in its own hardware-isolated VM, governed by one
 document: a policy measured into the hardware report at launch. Every layer, every
 mount, every container has to match what that document declared, for the whole life of
-the workload. Let me walk the chain.
+the workload.
 VO
 
 # ---- moment 1: what the workload actually runs in ---------------------------
@@ -248,12 +248,13 @@ VO
 
 # ---- moment 3: the rules are generated, measured, and enforced --------------
 segment S07 "m3" "the pod spec, before anything is done to it" act:1 '' <<'VO'
-So where does that document come from, and who decides what goes in it?
+So who writes that document, and when?
 VO
 
 segment S08 "m3" "genpolicy rewriting the spec — the cc_init_data annotation appears" act:1 '' <<'VO'
-From the deployment itself: generated out of this exact pod spec and injected
-back as a single annotation. That's the measured document the guest enforces —
+The customer does, before deploying. Genpolicy derives it from this exact pod
+spec and writes it back as one annotation, so the rules are settled before the
+workload is ever submitted. That's the measured document the guest enforces:
 what may run, what may be mounted, who may get a shell.
 VO
 
@@ -301,7 +302,7 @@ delivery.
 VO
 
 segment S16 "m4" "the guest verifying the fragment's signature and its version floor" act:frag '' <<'VO'
-What the guest checks is the signature: signed by an issuer the attested policy
+It's signed by an issuer the attested policy
 named before launch, at a version at or above the floor that policy set. An old
 rule replayed fails that same test.
 VO
