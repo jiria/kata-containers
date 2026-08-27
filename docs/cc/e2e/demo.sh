@@ -334,9 +334,12 @@ gen_policy_for() {
 # watching rather than asserting — the input especially, since it is otherwise
 # written off screen and the audience has only our word for what was in it.
 gen_policy_shown() {
-  local name="$1"
+  local name="$1" cue_gen="${2:-}"
   show "the input is an ordinary pod spec — no policy, no annotations, nothing measured yet" \
     "awk '{ l = \$0; if (l ~ /runtimeClassName:/) l = l \"        <-- act 0'\"'\"'s runtime class\"; print l }' ${WORK}/${name}.yaml"
+  # Under a paced take the spec and the generated annotation are two different
+  # sentences of narration, so they must not land on screen together.
+  cue "${cue_gen}"
   show "generate the policy for this exact pod spec — genpolicy rewrites that file in place" \
     "${GENPOLICY} -y ${WORK}/${name}.yaml -p ${GP_RULES} -j ${GP_SETTINGS} && grep -c . ${WORK}/${name}.yaml | xargs -I{} echo \"${name}.yaml is now {} lines\""
   grep -q 'cc_init_data' "${WORK}/${name}.yaml" \
@@ -523,6 +526,9 @@ live_binding_experiment() {
   demo_pod_yaml "${cpod}" '"sleep", "3600"'
 
   _tamper_run flip "${tpod}" refused || return 0
+  # The boot and the rewrite ran under the hold; the evidence for them is the
+  # next thing said, so it waits for it.
+  cue S12
   show "the host stamped one policy and served another — same sandbox, one character apart" \
     "cat ${WORK}/tamper-flip.log"
   show "and the pod never ran — this is kubelet's account, from outside the guest" \
@@ -638,8 +644,12 @@ PY
   is the number the host hands over at mount time.
 EOF
   pause
+  # The substitution itself is its own sentence of narration: hold here until it
+  # is being spoken, or the flip lands on screen under the beat before it.
+  cue S05
   show "the hash the runtime presents is read out of this file, which belongs to the host" \
     "sudo cat ${target_file}"
+
 
   sudo cp "${target_file}" "${target_file}.demobak" >/dev/null 2>&1 \
     || { warn "could not back the file up — skipping the substitution"; return 0; }
@@ -664,6 +674,9 @@ EOF
 
   demo_pod_yaml "${pod}" '"sleep", "300"'
   kubectl delete pod "${pod}" -n "${NS}" --ignore-not-found >/dev/null 2>&1 || true
+  # The verdict and the reason for it are the last sentence of this act's
+  # narration; the launch that produces them starts when that sentence does.
+  cue S06
   _prompt "kubectl apply -f ${WORK}/${pod}.yaml"
   kubectl apply -f "${WORK}/${pod}.yaml" >/dev/null || die "kubectl apply failed for ${pod}"
   log "the sandbox still boots — it is the container that has to be judged"
@@ -676,7 +689,7 @@ EOF
     "kubectl get pod ${pod} -n ${NS} -o custom-columns='NAME:.metadata.name,PHASE:.status.phase,CONTAINER:.status.containerStatuses[0].name,STATE:.status.containerStatuses[0].state.terminated.reason,EXIT:.status.containerStatuses[0].state.terminated.exitCode'; echo; python3 ${WORK}/verity-denial.py ${NS} ${pod} --headline"
   show "and the guest's answer in full" "python3 ${WORK}/verity-denial.py ${NS} ${pod}"
   show "where that sentence came from: the frame from the agent, the reason from the measured document itself" \
-    "grep -n 'is blocked by policy: no policy container satisfied' ${E2E_REPO_DIR}/src/agent/policy/src/decision.rs; grep -n 'dm-verity layers: request presents' ${WORK}/a.toml | cut -c1-100"
+    "grep -n 'is blocked by policy: no policy container satisfied' ${E2E_REPO_DIR}/src/agent/policy/src/decision.rs; grep -o 'dm-verity layers: request presents.*' ${WORK}/a.toml | fold -s -w 100 | sed 's/^/  /'"
   say <<'EOF'
 
   The host did not compose that refusal, it relayed it. The sentence frame is
@@ -852,7 +865,7 @@ EOF
 
   local t0; t0=$(date '+%Y-%m-%d %H:%M:%S')
   demo_pod_yaml demo-a '"sleep", "3600"' --defer
-  gen_policy_shown demo-a
+  gen_policy_shown demo-a S08
 
   # Opened from the file, before anything is applied: the format is worth
   # understanding on its own, and a running pod would only add the question of
@@ -916,16 +929,14 @@ EOF
   pause
   start_demo_pod demo-a
 
-  say <<'EOF'
-
-  Before following the document into the hardware, it is worth establishing what
-  just booted — a pod is only as confidential as the sandbox underneath it.
-EOF
-  show_sandbox_backing demo-a
-
   decode_initdata demo-a "${WORK}/a.toml"
   scene
 
+  # The digest comes before the sandbox it was stamped for. Both orders make
+  # sense read as a script, but only this one matches the narration: the words
+  # follow the document into the hardware report first, and only then ask what
+  # is running underneath.
+  cue S09
   local d1; d1=$(initdata_digest_expected "${WORK}/a.toml")
   show "anyone can compute the expected measurement from that document alone" \
     "openssl dgst -sha256 -binary ${WORK}/a.toml | base64"
@@ -975,6 +986,21 @@ EOF
 EOF
   pause
   scene
+
+  # Moved here from just after demo-a booted. A pod is only as confidential as
+  # the sandbox underneath it, and this is where the narration asks what that
+  # is — after the document has been followed all the way into the report.
+  cue S10
+  say <<'EOF'
+
+  So much for the document. What is actually running under it: the layers this
+  pod's measured policy admits, with the root hashes it names for them, and the
+  Cloud Hypervisor process serving the VM they are mounted in.
+EOF
+  show "the layers demo-a's measured policy admits, by the root hash it names for each" \
+    "grep -oE 'X-kata\\.dmverity\\.roothash=[a-f0-9]{64}' ${WORK}/a.toml | cut -d= -f2 | sort -u | nl -w4 -s '  layer  ' | sed 's/\\([0-9a-f]\\{16\\}\\)[0-9a-f]*/\\1.../'"
+  show_sandbox_backing demo-a
+
   say <<'EOF'
 
   A relying party rejecting the second digest is one half. The other half is
@@ -1015,6 +1041,11 @@ EOF
   rewritten image, so expect a wait with nothing on screen.
 EOF
   pause
+  # The tamper needs a fresh CVM to boot before it can be refused, and that wait
+  # is silent — so it starts under S11, the hold, and S12 releases the verdict
+  # once the words about it begin. Starting it at S12 instead would run the
+  # whole boot inside a seven-second line of narration.
+  cue S11
   live_binding_experiment
 }
 

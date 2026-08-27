@@ -544,6 +544,9 @@ EOF
 pause
 
 # ---------------------------------------------------------------------------
+# The refusal above is its own sentence of narration; the answer to it only
+# starts when the narration gets there.
+cue S14
 step "3 — sign and publish a fragment that authorizes exactly that sidecar"
 # Back to a pod of our own from here on: steps 4-5 need a pod carrying the
 # measured issuer list, which act 1's pod does not have. The switch has to
@@ -685,6 +688,10 @@ say <<EOF
   to judge them was measured into the guest at launch. Withholding is the only
   move it has left.
 EOF
+pause
+# Signing and publishing is the next sentence: the module and the anchor it has
+# to satisfy are what S14 is spoken over, and they stay up until S15 starts.
+cue S15
 show "sign the module into an envelope, then publish the envelope" \
   "echo \"sign-fragment sign --issuer ${ISSUER} \\\\\"; echo '    --feed ${SIDECAR_FEED} --svn ${SVN} \\'; echo '    --module sidecar.rego --key <issuer key> --x509-chain <leaf,ca>'; echo; echo 'fragmentgen --cose cose.hex --push ${SIDECAR_REF}'"
 
@@ -731,6 +738,10 @@ EOF
 pause
 
 # ---------------------------------------------------------------------------
+# S16 is spoken over the spec that names the fragment and the measured policy
+# that still has no sidecar in it — the two halves of "signed by an issuer the
+# attested policy named before launch".
+cue S16
 step "4 — the same sidecar, now authorized by the delivered fragment"
 log "identical workload; the pod now declares the fragment and the host delivers it"
 wipe_pod
@@ -761,6 +772,9 @@ show "the pod's own policy still admits only what act 1's did — the sidecar is
 _prompt "kubectl apply -f ${WORK}/step4.yaml"
 kubectl apply -f "${WORK}/step4.yaml"
 log "starting pod ${POD} — a fresh CVM, this time declaring the fragment"
+# "It passes, and the sidecar starts" — and then step 5, which is the rest of
+# that same sentence: the receipt, and the replay that fails.
+cue S17
 wait_for 300 "sidecar ready" container_ready sidecar
 [[ "$(ready_of busybox)" = "true" ]] || die "busybox is not ready"
 ok "both containers running — the fragment authorized a container the measured policy never contained"

@@ -246,6 +246,13 @@ fi
 # deleting anything it did not create.
 NS="${E2E_NS:-coco-e2e}"
 
+# A screen wipe that cannot take the take down with it. This script runs under
+# `set -e`, and clear(1) fails when TERM is unset — which is exactly what
+# happens when the take is driven from a non-interactive shell. Falling back to
+# the escape sequence keeps the wipe (the footage has to start on an empty
+# screen) without making the whole run depend on a terminfo lookup.
+_clear() { clear 2>/dev/null || printf '\033[H\033[2J\033[3J'; }
+
 reset_stage() {
   kubectl get ns "${NS}" >/dev/null 2>&1 || return 0
   kubectl delete pod -n "${NS}" -l demo=parma --ignore-not-found >/dev/null 2>&1 || true
@@ -333,10 +340,11 @@ segment S05 "m2" "one hex digit of one hash changed" act:2 '' <<'VO'
 Watch: we change one hex digit of one hash. Not the data. One digit.
 VO
 
-segment S06 "m2" "pod verdict — StartError, exit 128 — then the full layer list beside the policy" act:2 '' <<'VO'
+segment S06 "m2" "pod verdict — StartError, exit 128 — then the rule the refusal came from" act:2 '' <<'VO'
 The container never starts, and the refusal is written inside the boundary — the
-host is only relaying it. And it holds for the set, not just the one: the right
-hashes in the wrong order is still a refusal.
+host is only relaying it. And the rule it came from holds for the set, not just
+the one: hashes that match but sit on different partitions are an ordering
+disagreement, and it refuses those too.
 VO
 
 # ---- moment 3: the rules are generated, measured, and enforced --------------
@@ -362,11 +370,11 @@ And here's the pod running under them: those layers, those hashes, and the
 Cloud Hypervisor process for its VM.
 VO
 
-segment S11 "m3" "hold on the running pod — no new terminal output" none '' <<'VO'
-Every check inside the guest asks one question: does what you presented match
-exactly what was declared? Not just whether some rule allows it — a one-for-one
-match: nothing reordered, duplicated or slipped in alongside. And it's fixed at
-boot: no code path accepts a new one, compiled out rather than switched off.
+segment S11 "m3" "hold — the substituted policy is staged and a pod launched under it" none '' <<'VO'
+One pod, one VM, one measured document. And the guest keeps asking the same
+question of everything presented to it, for the whole life of the workload: is
+this what was declared? It's fixed at boot — no code path accepts a different
+document, compiled out rather than switched off.
 VO
 
 segment S12 "m3" "a substituted policy staged, and the guest's refusal" act:1 '' <<'VO'
@@ -380,28 +388,28 @@ Now something that pod's policy never named: a sidecar. It doesn't matter that
 it's a legitimate container, or who asks — it has no entry, so it doesn't start.
 VO
 
-segment S14 "m4" "the policy_fragments annotation being attached to the pod spec" act:frag '' <<'VO'
+segment S14 "m4" "the rule that would authorize it, and the measured anchor it must satisfy" act:frag '' <<'VO'
 Normally, changing that means redeploying and re-attesting. Instead, the policy
 names the issuers it will accept new rules from. Here's a signed rule being
 attached to the pod spec — one more annotation, next to the measured policy.
 VO
 
-segment S15 "m4" "hold on the annotation, then the measured issuer list beside it" act:frag '' <<'VO'
+segment S15 "m4" "signing and publishing the fragment, then decoding it back out of the envelope" act:frag '' <<'VO'
 It's called a fragment, and it can come from the customer or from Azure — a
 managed sidecar is the same mechanism. Notice it arrives through the host. What
 gets it accepted is the signature, never the delivery.
 VO
 
-segment S16 "m4" "the guest verifying the fragment's signature and its version floor" act:frag '' <<'VO'
+segment S16 "m4" "the pod spec naming the fragment, beside a measured policy with no sidecar in it" act:frag '' <<'VO'
 It's signed by an issuer the attested policy
-named before launch, at a version at or above the floor that policy set. An old
-rule replayed fails that same test.
+named before launch, at a version at or above the floor that policy set.
 VO
 
-segment S17 "m4" "the sidecar Running beside the original container; then the receipt-required feed" act:frag '' <<'VO'
+segment S17 "m4" "the sidecar Running beside the original container; then the receipt checks over ttRPC" act:frag '' <<'VO'
 It passes, and the sidecar starts — no redeploy, no re-attestation. And what's
 measured at launch can ask for more: that a feed's rules also carry a
-transparency-ledger receipt, proving they were published in the open.
+transparency-ledger receipt, proving they were published in the open. An old
+rule replayed fails that same test.
 VO
 
 # ---- close ------------------------------------------------------------------
@@ -429,6 +437,9 @@ mmss() { awk -v t="$1" 'BEGIN{ printf "%d:%02d", int(t/60), int(t%60) }'; }
 
 # ------------------------------------------------------------------- conduct
 STARTS=(); ENDS=()
+# Set by conduct() for a hands-free take; empty everywhere else, including the
+# recording plan, which prints the act commands for an operator to run by hand.
+CUE_DIR=""
 
 slate() {
   local i="$1"
@@ -457,14 +468,26 @@ seg_seconds() {
 # and anything on the screen is on the footage the words are spoken over. What
 # is left is the commands and their output, which is the evidence.
 act_command() {
+  local cue=""
+  # Only a hands-free take drives the acts, so only it can release their cues.
+  # Handing DEMO_CUE_DIR to an operator running the act himself would stall his
+  # run at the first beat waiting for a cue nobody is going to send.
+  [[ "${AUTO}" = "1" && -n "${CUE_DIR}" ]] && cue="DEMO_CUE_DIR=${CUE_DIR} "
   case "$1" in
-    act:frag) printf 'DEMO_PAUSE=0 DEMO_NARRATE=0 DEMO_STEPS=0 DEMO_HEADINGS=0 bash %s/demo-fragment-sidecar.sh' "${HERE}" ;;
-    act:*)    printf 'DEMO_PAUSE=0 DEMO_NARRATE=0 DEMO_STEPS=0 DEMO_HEADINGS=0 DEMO_ACTS=%s bash %s/demo.sh' "${1#act:}" "${HERE}" ;;
+    act:frag) printf '%sDEMO_PAUSE=0 DEMO_NARRATE=0 DEMO_STEPS=0 DEMO_HEADINGS=0 bash %s/demo-fragment-sidecar.sh' "${cue}" "${HERE}" ;;
+    act:*)    printf '%sDEMO_PAUSE=0 DEMO_NARRATE=0 DEMO_STEPS=0 DEMO_HEADINGS=0 DEMO_ACTS=%s bash %s/demo.sh' "${cue}" "${1#act:}" "${HERE}" ;;
   esac
 }
 
 conduct() {
   local t0 i prev_src="" act_pid="" dur cmd acc=0
+  # The acts are paced against this: a file per segment, touched as that segment
+  # begins, which the act waits on before playing the beat that belongs to it.
+  # Without it an act runs at full speed and finishes while the narration about
+  # it is still being spoken, which is how a sentence ends up describing a
+  # screen that scrolled away thirty seconds earlier.
+  CUE_DIR="$(mktemp -d)"
+  trap 'rm -rf "${CUE_DIR}"' EXIT
   reset_stage
   if [[ "${AUTO}" = "1" ]]; then
     # Hands-free take. The acts are started here and left to run while the
@@ -474,6 +497,22 @@ conduct() {
       "${c_bld}" "${c_off}"
     printf '%sfor the length of its narration, so the footage matches the audio.%s\n\n' \
       "${c_dim}" "${c_off}"
+    # Only if the audio is actually here. Without it seg_seconds falls back to a
+    # word-count estimate, which is a planning number and roughly a fifth short
+    # -- so the acts get released early, the cues drift, and the take is
+    # unusable in a way nothing on screen would reveal. Say so before the
+    # recording starts rather than after it is cut.
+    local missing=0 j
+    for ((j = 0; j < N; j++)); do
+      [[ -s "${DEMO_EXEC_OUT}/tts/${SEG_ID[j]}.mp3" ]] || missing=$((missing + 1))
+    done
+    if (( missing > 0 )); then
+      printf '%s%d of %d narration clips are missing from %s/tts.%s\n' \
+        "${c_ylw}" "${missing}" "${N}" "${DEMO_EXEC_OUT}" "${c_off}"
+      printf '%sthis take would be paced by word-count estimate, not by the audio —%s\n' \
+        "${c_ylw}" "${c_off}"
+      printf '%srun --tts first, or copy the clips here.%s\n\n' "${c_ylw}" "${c_off}"
+    fi
   else
     # What this is, said once, because the shape of it surprises people: the cut
     # interleaves segments that come from the same run of demo.sh — S04, S05 and
@@ -498,10 +537,16 @@ conduct() {
   # already running by the time Enter is pressed — so it is all in the capture.
   # Clear immediately: the take should open on an empty screen, not on the
   # instructions for making it.
-  clear
+  _clear
   t0="$(date +%s.%N)"
 
   for ((i = 0; i < N; i++)); do
+    # Release this segment's beat before anything else happens in the iteration:
+    # from here on the act is free to play what these words are about, and the
+    # hold at the bottom of the loop is what keeps it on screen for their length.
+    if [[ -n "${CUE_DIR}" ]]; then
+      touch "${CUE_DIR}/${SEG_ID[i]}"
+    fi
     # A hands-free pass is paced by the narration by construction, so its wall
     # clock carries no information the audio does not already carry. Leaving
     # STARTS empty keeps emit() on a basis that means something.
@@ -533,7 +578,7 @@ conduct() {
             fi
             act_pid=""
             reset_stage
-            clear
+            _clear
             bash -c "${cmd}" 2>&1 &
             act_pid="$!"
           else
@@ -550,7 +595,7 @@ conduct() {
         # inside the capture. A segment the editor can cut cleanly is one whose
         # footage starts at the top of an empty screen.
         [[ "${AUTO}" = "1" ]] || read -r -p "  press Enter to run ${SEG_ID[i]} ..." _
-        clear
+        _clear
         printf '%s%s@%s%s:%s%s%s$ %s\n' "${c_grn}" "$(whoami)" "$(hostname -s 2>/dev/null || echo host)" \
           "${c_off}" "${c_blu}" "${PWD/#${HOME}/\~}" "${c_off}" "${SEG_CMD[i]}"
         # Same highlighter the acts use — the conductor's own segments are the

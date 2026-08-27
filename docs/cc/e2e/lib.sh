@@ -163,6 +163,39 @@ die()   { printf '%s[FAIL]%s %s\n' "${_c_red}" "${_c_off}" "$*" >&2; exit 1; }
 
 step()  { printf '\n%s========== %s ==========%s\n' "${_c_blu}" "$*" "${_c_off}"; }
 
+# ------------------------------------------------------------------------ cues
+#
+# Pacing for a voice-over take. demo-exec.sh holds each segment on screen for
+# the length of its narration, and an act left to run at its own speed finishes
+# long before the words about it do -- so the beat being described has scrolled
+# away, and the screen is frozen on something else while the sentence about it
+# is spoken. That is not a cosmetic problem: the narration ends up asserting
+# things no longer on screen.
+#
+# So the conductor drives the beats instead of racing them. It creates a cue
+# directory, and touches a file named for each segment as that segment begins;
+# an act waits here for the segment its next beat belongs to. The act therefore
+# advances exactly when the narration does.
+#
+# Run standalone -- no DEMO_CUE_DIR -- this is a no-op, so the acts keep working
+# as ordinary scripts with their own prose and pauses.
+#
+# The timeout matters: a cue that never arrives (a segment removed from the cut,
+# a typo in an id) would otherwise hang the take with no explanation. Say so and
+# carry on unpaced, which is exactly the behaviour we had before.
+cue() {
+  local id="$1" dir="${DEMO_CUE_DIR:-}" waited=0 limit="${DEMO_CUE_TIMEOUT:-600}"
+  [[ -n "${id}" && -n "${dir}" ]] || return 0
+  while [[ ! -e "${dir}/${id}" ]]; do
+    sleep 0.1
+    waited=$((waited + 1))
+    if (( waited >= limit * 10 )); then
+      warn "no cue '${id}' after ${limit}s — running unpaced from here"
+      return 0
+    fi
+  done
+}
+
 # Mark a step complete so re-running the suite skips it.
 mark_done()   { touch "${E2E_STATE_DIR}/$1.done"; }
 is_done()     { [[ -f "${E2E_STATE_DIR}/$1.done" ]]; }
