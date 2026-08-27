@@ -272,17 +272,15 @@ whether it got the rules that were approved.
 VO
 
 segment S10 "m3" "the pod Running: its erofs layers with their hashes, and the CLH process" act:1 '' <<'VO'
-And here's the pod running under them. Its image layers are erofs, each with a
-dm-verity hash the policy names, and this is the Cloud Hypervisor process for
-its VM.
+And here's the pod running under them. Its layers each carry a dm-verity hash
+the policy names, and this is the Cloud Hypervisor process for its VM.
 VO
 
 segment S11 "m3" "hold on the running pod — no new terminal output" none '' <<'VO'
 Every check inside the guest asks one question: does what you presented match
 exactly what was declared? Not just whether some rule allows it — a one-for-one
-match, so nothing can be reordered, duplicated or slipped in alongside. And that
-document is fixed at boot: no code path accepts a new one, compiled out rather
-than switched off.
+match: nothing reordered, duplicated or slipped in alongside. And it's fixed at
+boot: no code path accepts a new one, compiled out rather than switched off.
 VO
 
 segment S12 "m3" "a substituted policy staged, and the guest's refusal" act:1 '' <<'VO'
@@ -708,6 +706,35 @@ mp3_seconds() {
   printf '%s' "${d}"
 }
 
+# Turn a narration line into the SSML body that is actually spoken.
+#
+# SSML is XML: an unescaped ampersand or angle bracket is a 400, not a warning.
+# So escape first, then insert markup — do it the other way round and the tags
+# get escaped into literal text and read aloud.
+#
+# Pauses: this narration uses em dashes the way speech uses a beat before a
+# qualifier, but the voice runs straight through them, which turns "written
+# inside the boundary — the host is only relaying it" into one breathless
+# clause.
+#
+# Pronunciation: neural voices guess at unfamiliar identifiers, and "erofs" came
+# out mangled. A <sub> alias rather than <phoneme>: this voice rejects phoneme
+# outright — HTTP 400 with an empty body, with or without the SSML namespace —
+# whereas an alias is just words, and words are what a voice is good at. Add
+# terms here as they turn up.
+#
+# In both cases only the SSML is touched. The text files keep the ordinary
+# spelling and punctuation, because a shot list and a subtitle should read
+# normally.
+ssml_body() {
+  printf '%s' "$1" \
+    | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' \
+    | sed -e 's| — | <break time="320ms"/> |g' \
+          -e 's| – | <break time="240ms"/> |g' \
+          -e 's|: |: <break time="200ms"/> |g' \
+    | sed -e 's|[eE][rR][oO][fF][sS]|<sub alias="ee roh eff ess">erofs</sub>|g'
+}
+
 synthesize() {
   local out="${DEMO_EXEC_OUT}" i txt tok code dur planned w spoken over=0 total=0 made=0 kept=0
   mkdir -p "${out}/tts"
@@ -722,31 +749,16 @@ synthesize() {
 
   printf '\n%ssynthesizing %d lines — %s%s\n' "${c_bld}" "${N}" "${SPEECH_VOICE}" "${c_off}"
   for ((i = 0; i < N; i++)); do
-    # Re-synthesizing an unchanged line costs time and money and returns the
-    # same audio, so keep what is already there. But "already there" has to mean
-    # "and it says the same thing": keying the cache on the file merely existing
-    # meant every rewrite silently kept the old take, and the only way to find
-    # out was to listen to the whole cut. The spoken text is stored beside the
-    # audio and compared. SPEECH_FORCE=1 still overrides.
+    # The SSML, not the plain line, is what determines the audio — so it is what
+    # the cache has to compare. Keying on the spoken text would mean a change to
+    # pronunciation or pausing silently kept the old take, which is the same
+    # trap as keying on the file merely existing.
+    txt="$(ssml_body "${SEG_VO[i]}")"
     spoken="${out}/tts/${SEG_ID[i]}.spoken"
     if [[ -s "${out}/tts/${SEG_ID[i]}.mp3" && "${SPEECH_FORCE:-0}" != "1" ]] \
-       && [[ -f "${spoken}" ]] && [[ "$(cat "${spoken}")" == "${SEG_VO[i]}" ]]; then
+       && [[ -f "${spoken}" ]] && [[ "$(cat "${spoken}")" == "${txt}" ]]; then
       kept=$((kept + 1))
     else
-      # SSML is XML: an unescaped ampersand or angle bracket is a 400, not a
-      # warning. Escape first, then insert breaks — do it the other way round
-      # and the break tags get escaped into literal text.
-      #
-      # The dashes need the breaks. This narration uses em dashes the way speech
-      # uses a beat before a qualifier, but the voice runs straight through them,
-      # which turns "written inside the boundary — the host is only relaying it"
-      # into one breathless clause. The text files keep the dash, because a shot
-      # list and a subtitle should read normally; only the SSML gets the pause.
-      txt="$(printf '%s' "${SEG_VO[i]}" \
-        | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' \
-        | sed -e 's/ — / <break time="320ms"\/> /g' \
-              -e 's/ – / <break time="240ms"\/> /g' \
-              -e 's/: /: <break time="200ms"\/> /g')"
       code="$(curl -sS -o "${out}/tts/${SEG_ID[i]}.mp3" -w '%{http_code}' \
         -X POST "${SPEECH_ENDPOINT%/}/tts/cognitiveservices/v1" \
         -H "Authorization: Bearer ${tok}" \
@@ -760,7 +772,7 @@ synthesize() {
         continue
       fi
       made=$((made + 1))
-      printf '%s' "${SEG_VO[i]}" > "${spoken}"
+      printf '%s' "${txt}" > "${spoken}"
     fi
 
     # A line that overruns its segment is the one thing that breaks a
