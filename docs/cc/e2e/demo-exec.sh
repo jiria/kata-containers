@@ -542,7 +542,9 @@ conduct() {
         clear
         printf '%s%s@%s%s:%s%s%s$ %s\n' "${c_grn}" "$(whoami)" "$(hostname -s 2>/dev/null || echo host)" \
           "${c_off}" "${c_blu}" "${PWD/#${HOME}/\~}" "${c_off}" "${SEG_CMD[i]}"
-        bash -c "${SEG_CMD[i]}" 2>&1 || true
+        # Same highlighter the acts use — the conductor's own segments are the
+        # same kind of footage and should not read as a different program.
+        bash -c "${SEG_CMD[i]}" 2>&1 | bash "${HERE}/demo-hl.sh" || true
         prev_src="self"
         ;;
     esac

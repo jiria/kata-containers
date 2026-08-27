@@ -76,6 +76,7 @@ heading() { _CUR_STEP="$*"; _heading_on && _lib_step "$@"; _vo "$*"; return 0; }
 # (DEMO_NARRATE=0) and captured to a plain-text script (DEMO_SCRIPT), while the
 # commands and their output are always shown.
 _HOST_LABEL="$(whoami)@$(hostname -s 2>/dev/null || echo host)"
+_HL="$(dirname "${BASH_SOURCE[0]}")/demo-hl.sh"
 
 _vo() {
   [[ -n "${DEMO_SCRIPT:-}" ]] || return 0
@@ -140,7 +141,8 @@ show() {
     printf '\n  %s\n' "${tag}"
   fi
   _prompt "$*"
-  bash -c "$*" 2>&1
+  # As in demo.sh: colour the output, and only when a terminal is watching.
+  bash -c "$*" 2>&1 | bash "${_HL}"
   # One command per break, as in demo.sh: a beat that runs something always
   # holds afterwards, so two commands never scroll past between keypresses.
   pause

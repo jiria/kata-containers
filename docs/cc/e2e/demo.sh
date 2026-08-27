@@ -193,6 +193,10 @@ want_act() { [[ ",${ACTS}," == *",$1,"* ]]; }
 # to carry the explanation, which is why they are shown with the host they run on
 # and their output is bracketed rather than left to run into the next beat.
 _HOST_LABEL="$(whoami)@$(hostname -s 2>/dev/null || echo host)"
+# One highlighter for both acts and for the conductor's own segments, so the
+# palette cannot drift between them — or from track B's inset, which follows
+# the same rule: colour carries the verdict.
+_HL="$(dirname "${BASH_SOURCE[0]}")/demo-hl.sh"
 
 # Every beat gets a visible number so a reviewer can say "beat 14 is wrong"
 # instead of quoting a line of output back. Screen only: DEMO_SCRIPT stays clean
@@ -270,7 +274,10 @@ show() {
     printf '\n  %s\n' "${tag}"
   fi
   _prompt "$*"
-  bash -c "$*" 2>&1
+  # Output goes through the highlighter so the word that decides the beat is
+  # findable in the second the camera gives it. It is a no-op when stdout is not
+  # a terminal, so captured runs stay plain.
+  bash -c "$*" 2>&1 | bash "${_HL}"
   # One command per break. A beat that runs something always holds afterwards,
   # so two commands never scroll past between keypresses — the audience gets to
   # read every output before the next one replaces it as the thing on screen.
