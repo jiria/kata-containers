@@ -229,10 +229,10 @@ VO
 
 # ---- moment 2: down to the bytes of the image -------------------------------
 segment S04 "m2" "the layer's dm-verity root hash, as named in the measured policy" act:2 '' <<'VO'
-Every layer is an erofs image, and the kernel proves its contents against that
-layer's dm-verity root hash — the format the OCI is standardizing on. The policy
-names the hash, so the host can only present layers that hash to what was
-declared.
+Every layer is an erofs image: a mainline Linux filesystem, and a proposed OCI
+layer format. The kernel proves each layer's contents against its dm-verity root
+hash, and the policy names that hash — so the host can only present layers that
+hash to what was declared.
 VO
 
 segment S05 "m2" "one hex digit of one hash changed" act:2 '' <<'VO'
@@ -295,10 +295,10 @@ measured policy from a moment ago.
 VO
 
 segment S15 "m4" "hold on the annotation, then the measured issuer list beside it" act:frag '' <<'VO'
-It's called a fragment, and it can come from the customer or from the platform:
-Azure shipping a managed sidecar is the same mechanism. Notice it arrives
-through the host — which only carries it. What gets it accepted is the
-signature, never the delivery.
+It's called a fragment, and it can come from the customer or from Azure — a
+managed sidecar is the same mechanism. Notice it arrives through the host —
+which only carries it. What gets it accepted is the signature, never the
+delivery.
 VO
 
 segment S16 "m4" "the guest verifying the fragment's signature and its version floor" act:frag '' <<'VO'
