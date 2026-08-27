@@ -59,6 +59,8 @@ _demo_clear() {
 _heading_on() { [[ "${DEMO_HEADINGS:-1}" = "1" ]]; }
 eval "_lib_log() $(declare -f log | tail -n +2)"
 log() { [[ "${DEMO_NARRATE:-1}" = "1" ]] || return 0; _lib_log "$@"; }
+eval "_lib_ok() $(declare -f ok | tail -n +2)"
+ok()  { [[ "${DEMO_NARRATE:-1}" = "1" ]] || return 0; _lib_ok "$@"; }
 
 # `|| true` matters: this script runs under `set -e`, and _demo_clear returns
 # non-zero whenever clearing is off (piped runs, DEMO_PAUSE=0). Without it the

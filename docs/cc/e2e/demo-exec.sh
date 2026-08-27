@@ -1220,6 +1220,12 @@ concat_narration() {
 [[ "${TTS}" = "1" ]] && synthesize
 emit
 
+# A take ends with the recorder still rolling and, in --auto, sometimes with an
+# act still finishing — so this summary lands on the footage, interleaved with
+# whatever the act is still writing. It is for whoever is assembling the cut,
+# not for the camera. The files are written either way; run without --run to
+# read the list.
+if [[ "${RUN}" != "1" ]]; then
 printf '\n%swrote %s%s\n' "${c_bld}" "${DEMO_EXEC_OUT}" "${c_off}"
 printf '  %-22s %s\n' voiceover.txt "one narration block per line, line N = segment N"
 printf '  %-22s %s\n' voiceover.srt "${TIMING_BASIS} — Project > Subtitles > Import"
@@ -1240,3 +1246,4 @@ printf '\n  %s%s words of narration, timeline runs %s — %s%s\n' "${c_dim}" \
   "${TIMING_BASIS}" "${c_off}"
 awk -F'\t' -v c="${c_ylw}" -v o="${c_off}" 'END{ if ($4+0 > 240) printf "  %sover four minutes — trim a line%s\n", c, o }' \
   "${DEMO_EXEC_OUT}/segments.tsv"
+fi

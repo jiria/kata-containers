@@ -54,9 +54,10 @@
 #   DEMO_CLEAR=0     keep the screen when paused (default: clear between beats,
 #                    redrawing the act heading; scrollback is preserved)
 #   DEMO_ACTS=0,2    run only these acts (default: 0,1,2,3,4)
-#   DEMO_NARRATE=0   suppress the written prose and the [e2e] commentary,
-#                    leaving the commands and their output — for narrating live
-#                    over the top, or for a voice-over cut
+#   DEMO_NARRATE=0   suppress the written prose, the [e2e] commentary and the
+#                    [ ok] verdict lines, leaving the commands and their output
+#                    — for narrating live over the top, or for a voice-over cut.
+#                    warn/die are never suppressed
 #   DEMO_HEADINGS=0  drop the act banners too (default: show them). Set alongside
 #                    DEMO_NARRATE=0 when the spoken track already says where we
 #                    are; the screen still clears between beats
@@ -105,8 +106,17 @@ _heading_on() { [[ "${DEMO_HEADINGS:-1}" = "1" ]]; }
 # and results come from the commands themselves. So it follows the prose switch:
 # under a voice-over cut these lines say aloud what the narration is already
 # saying, on top of the footage it is spoken over.
+#
+# ok() goes with it, for a narrower reason. Every ok() in this script is drawn
+# from state the beat has just put on screen — the pod table, the events, the
+# two digests side by side — or from state track B is showing live. So on a
+# narrated take it is a second voice reading out a result the viewer can see,
+# and the raw output stays either way. warn() and die() do not follow it: those
+# report that the demo did not do what it claims, which has to be visible.
 eval "_lib_log() $(declare -f log | tail -n +2)"
 log() { [[ "${DEMO_NARRATE:-1}" = "1" ]] || return 0; _lib_log "$@"; }
+eval "_lib_ok() $(declare -f ok | tail -n +2)"
+ok()  { [[ "${DEMO_NARRATE:-1}" = "1" ]] || return 0; _lib_ok "$@"; }
 
 step() { _CUR_STEP="$*"; _demo_clear; _heading_on && _lib_step "$@"; _vo "$*"; return 0; }
 
