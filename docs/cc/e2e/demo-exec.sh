@@ -790,7 +790,12 @@ emit_mlt() {
       awk -v g="${gap}" 'BEGIN{ exit !(g > 0.001) }' \
         && printf '    <blank length="%s"/>\n' "$(hms "${gap}")"
       alen="$(mp3_seconds "${out}/tts/${SEG_ID[i]}.mp3")"
-      printf '    <entry producer="vo%02d" in="00:00:00.000" out="%s"/>\n' "${i}" "$(hms "${alen}")"
+      # The nested kdenlive:id is what binds a timeline clip to its bin clip.
+      # Without it MLT still plays the track, but Kdenlive builds its timeline
+      # model from these ids and silently shows an empty track.
+      printf '    <entry producer="vo%02d" in="00:00:00.000" out="%s">\n' "${i}" "$(hms "${alen}")"
+      printf '      <property name="kdenlive:id">%d</property>\n' "$((i + 3))"
+      printf '    </entry>\n'
       prev="$(awk -v a="${st[i]}" -v l="${alen}" 'BEGIN{printf "%.3f", a+l}')"
     done
     printf '  </playlist>\n'
