@@ -238,7 +238,7 @@ VO
 # ---- moment 2: down to the bytes of the image -------------------------------
 segment S04 "m2" "the layer's dm-verity root hash, as named in the measured policy" act:2 '' <<'VO'
 That boundary protects the memory, not what runs inside it. That's the policy's
-job — and here's one thing it declares. Every layer is an erofs image: a
+job — and here's one thing it declares. Every layer is an EROFS image: a
 mainline Linux filesystem, and a proposed OCI layer format. The kernel proves
 each layer against its dm-verity root hash, and that hash is in the policy — so
 the host can only present what was declared.
@@ -260,10 +260,10 @@ So who writes that document, and when?
 VO
 
 segment S08 "m3" "genpolicy rewriting the spec — the cc_init_data annotation appears" act:1 '' <<'VO'
-The customer does, before deploying. Genpolicy derives it from this exact pod
-spec and writes it back as one annotation, so the rules are settled before the
-workload is ever submitted. That's the measured document the guest enforces:
-what may run, what may be mounted, who may get a shell.
+The customer does, before deploying. Genpolicy derives a Rego policy from this
+exact pod spec and writes it back as one annotation, so the rules are settled
+before the workload is ever submitted. That's the measured document the guest
+enforces: what may run, what may be mounted, who may get a shell.
 VO
 
 segment S09 "m3" "the same digest in the hardware report at launch" act:1 '' <<'VO'
@@ -271,7 +271,7 @@ Its digest goes into the hardware report at launch, so the guest can tell
 whether it got the rules that were approved.
 VO
 
-segment S10 "m3" "the pod Running: its erofs layers with their hashes, and the CLH process" act:1 '' <<'VO'
+segment S10 "m3" "the pod Running: its EROFS layers with their hashes, and the CLH process" act:1 '' <<'VO'
 And here's the pod running under them. Its layers each carry a dm-verity hash
 the policy names, and this is the Cloud Hypervisor process for its VM.
 VO
@@ -717,11 +717,15 @@ mp3_seconds() {
 # inside the boundary — the host is only relaying it" into one breathless
 # clause.
 #
-# Pronunciation: neural voices guess at unfamiliar identifiers, and "erofs" came
-# out mangled. A <sub> alias rather than <phoneme>: this voice rejects phoneme
-# outright — HTTP 400 with an empty body, with or without the SSML namespace —
-# whereas an alias is just words, and words are what a voice is good at. Add
-# terms here as they turn up.
+# Pronunciation: neural voices guess at unfamiliar identifiers, and this voice
+# reads "EROFS" as a word rather than spelling it. Capitalisation alone does not
+# help — measured against this voice, "an erofs image" and "an EROFS image" come
+# back the same length, so the case is ignored. Hyphenating it in the narration
+# would spell it, but then the shot list and the subtitles carry "E-R-O-F-S",
+# which is not how anyone writes it. So the text keeps the real spelling and the
+# alias does the spelling out. A <sub> alias rather than <phoneme>: this voice
+# rejects phoneme outright, HTTP 400 with an empty body, with or without the
+# SSML namespace. Add terms here as they turn up.
 #
 # In both cases only the SSML is touched. The text files keep the ordinary
 # spelling and punctuation, because a shot list and a subtitle should read
@@ -732,7 +736,7 @@ ssml_body() {
     | sed -e 's| — | <break time="320ms"/> |g' \
           -e 's| – | <break time="240ms"/> |g' \
           -e 's|: |: <break time="200ms"/> |g' \
-    | sed -e 's|[eE][rR][oO][fF][sS]|<sub alias="ee roh eff ess">erofs</sub>|g'
+    | sed -e 's|[eE][rR][oO][fF][sS]|<sub alias="E-R-O-F-S">EROFS</sub>|g'
 }
 
 synthesize() {
