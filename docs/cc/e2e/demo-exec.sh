@@ -33,6 +33,9 @@
 #                    one, so it drops straight into an editor already aligned.
 #   shotlist.md      per segment: what is on screen, which command produced it,
 #                    and the line spoken over it. This is the editor's map.
+#   recording-plan.md the same segments grouped by take, in capture order, with
+#                    the command for each. This is the operator's map — the shot
+#                    list read the other way round.
 #   segments.tsv     measured start/end/duration per segment (after --run).
 #   chapters.txt     ffmpeg-style chapter marks.
 #   tts/S01.txt ...  one file per line, for per-segment audio synthesis.
@@ -116,6 +119,11 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${DEMO_EXEC_WPM:=170}"
 : "${DEMO_EXEC_FPS:=30}"
 : "${DEMO_EXEC_OUT:=/tmp/demo-exec-$(date -u +%Y%m%d-%H%M%S)}"
+# The breath between spoken blocks. Used both for the estimated timeline and for
+# the silence spliced into narration-full.mp3, so the full track and the markers
+# cannot disagree about how long the cut is.
+SEG_GAP_MS=600
+SEG_GAP_S="$(awk -v m="${SEG_GAP_MS}" 'BEGIN{printf "%.3f", m/1000}')"
 
 RUN=0
 AUTO=0
@@ -296,9 +304,8 @@ VO
 
 segment S15 "m4" "hold on the annotation, then the measured issuer list beside it" act:frag '' <<'VO'
 It's called a fragment, and it can come from the customer or from Azure — a
-managed sidecar is the same mechanism. Notice it arrives through the host —
-which only carries it. What gets it accepted is the signature, never the
-delivery.
+managed sidecar is the same mechanism. Notice it arrives through the host. What
+gets it accepted is the signature, never the delivery.
 VO
 
 segment S16 "m4" "the guest verifying the fragment's signature and its version floor" act:frag '' <<'VO'
@@ -409,6 +416,12 @@ emit() {
     [[ -s "${out}/tts/${SEG_ID[i]}.mp3" ]] || { have_audio=0; break; }
   done
 
+  # The gap the markers assume has to be the gap the full track actually
+  # contains, or the two disagree by a second across eighteen segments. The
+  # service returns a slightly longer clip than the break asks for, so measure
+  # it rather than trusting the nominal value.
+  [[ -s "${out}/tts/_gap.mp3" ]] && SEG_GAP_S="$(mp3_seconds "${out}/tts/_gap.mp3")"
+
   if [[ ${#STARTS[@]} -eq ${N} ]]; then
     TIMING_BASIS="measured from a conducted run"; st=("${STARTS[@]}"); en=("${ENDS[@]}")
   else
@@ -421,7 +434,7 @@ emit() {
       st+=("${cur}")
       cur="$(awk -v a="${cur}" -v b="${e}" 'BEGIN{printf "%.3f", a+b}')"
       en+=("${cur}")
-      cur="$(awk -v a="${cur}" 'BEGIN{printf "%.3f", a+0.6}')"   # breath between blocks
+      cur="$(awk -v a="${cur}" -v g="${SEG_GAP_S}" 'BEGIN{printf "%.3f", a+g}')"   # breath between blocks
     done
     [[ "${have_audio}" = "1" ]] && TIMING_BASIS="measured from the synthesized narration"
   fi
@@ -464,7 +477,81 @@ emit() {
   printf '%s\n' "$(inset_command)" > "${out}/track-b-inset.sh"
   chmod +x "${out}/track-b-inset.sh"
 
+  emit_recording_plan st[@] en[@]
   emit_kdenlive st[@] en[@]
+}
+
+# ----------------------------------------------------------- recording plan
+# The shot list is the *editor's* map: it is ordered by narration, and three of
+# its moments are delegated to acts that each produce one continuous recording.
+# That ordering is exactly wrong for the person holding the camera — S04, S05
+# and S06 all come out of a single act 2 run, and recording act 2 three times to
+# match the script would be absurd. So this is the other view of the same table:
+# grouped by take, in the order the takes should be captured, with the command
+# for each and the segments it feeds. Without it the operator has to invert the
+# shot list by hand, which is how a take gets missed.
+emit_recording_plan() {
+  local -a st=("${!1}") en=("${!2}")
+  local out="${DEMO_EXEC_OUT}" i j src n=0 found
+  local -a srcs=()
+
+  # Distinct sources, in order of first appearance.
+  for ((i = 0; i < N; i++)); do
+    src="${SEG_SRC[i]:-self}"
+    found=0
+    for ((j = 0; j < n; j++)); do [[ "${srcs[j]}" = "${src}" ]] && found=1 && break; done
+    [[ "${found}" = "0" ]] && srcs+=("${src}") && n=$((n + 1))
+  done
+
+  {
+    printf '# Executive cut — recording plan\n\n'
+    printf 'Generated %s by `demo-exec.sh`. Companion to `shotlist.md`: same segments,\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'grouped by **take** instead of by narration order.\n\n'
+    printf 'This script does not capture video. It conducts: `--run` slates each segment and\n'
+    printf 'runs the live ones. Screen capture is yours to start and stop.\n\n'
+    printf '## Before you record\n\n'
+    printf '1. `DEMO_PREP=1 bash %s/demo.sh` — builds genpolicy and warms the image pull.\n' "${HERE}"
+    printf '   Skip this and act 1 spends ~70s compiling while the audience watches.\n'
+    printf '2. `./demo-exec.sh --tts` — narration audio, if it is not current.\n'
+    printf '3. Start the track B inset and keep it in shot: `./demo-exec.sh --inset`.\n'
+    printf '4. Set the terminal to the capture size you will keep for every take. Takes\n'
+    printf '   recorded at different sizes cannot be intercut cleanly.\n\n'
+    printf '## Takes\n\n'
+    printf 'Takes are numbered in the order their first shot appears in the cut, not in a\n'
+    printf 'required order — each is an independent recording, so capture them in whatever\n'
+    printf 'order suits the cluster.\n\n'
+    for ((j = 0; j < n; j++)); do
+      src="${srcs[j]}"
+      printf '### Take %d — %s\n\n' "$((j + 1))" \
+        "$(case "${src}" in
+             self)     echo 'live, from this script' ;;
+             none)     echo 'no terminal' ;;
+             act:frag) echo '`demo-fragment-sidecar.sh`' ;;
+             act:*)    echo "\`demo.sh\` act ${src#act:}" ;;
+           esac)"
+      case "${src}" in
+        self) printf 'Run `./demo-exec.sh --run` and record the segments below as they are slated.\n\n' ;;
+        none) printf 'Nothing to capture. These are title cards, or a hold on the previous shot —\n'
+              printf 'the narration runs over what is already on screen.\n\n' ;;
+        act:frag) printf '```\nDEMO_PAUSE=0 bash %s/demo-fragment-sidecar.sh\n```\n\n' "${HERE}"
+                  printf 'One continuous recording. The editor pulls the shots below out of it.\n\n' ;;
+        act:*) printf '```\nDEMO_PAUSE=0 DEMO_ACTS=%s bash %s/demo.sh\n```\n\n' "${src#act:}" "${HERE}"
+               printf 'One continuous recording. The editor pulls the shots below out of it.\n\n' ;;
+      esac
+      printf '| id | at | length | on screen |\n|----|----|--------|-----------|\n'
+      for ((i = 0; i < N; i++)); do
+        [[ "${SEG_SRC[i]:-self}" = "${src}" ]] || continue
+        printf '| %s | %s | %ss | %s |\n' "${SEG_ID[i]}" "$(mmss "${st[i]}")" \
+          "$(awk -v a="${en[i]}" -v b="${st[i]}" 'BEGIN{printf "%.1f", a-b}')" "${SEG_SHOT[i]}"
+      done
+      printf '\n'
+    done
+    printf '## After\n\n'
+    printf 'Import `kdenlive-vo.mlt` (narration already laid out), then `kdenlive-markers.txt`\n'
+    printf 'as timeline markers. Each marker is a **range**, so a segment cut to its marker is\n'
+    printf 'cut to length. `voiceover.srt` drops in as subtitles, already aligned.\n'
+  } > "${out}/recording-plan.md"
 }
 
 # ------------------------------------------------------------------ kdenlive
@@ -694,7 +781,59 @@ synthesize() {
   awk -v t="${total}" 'BEGIN{ if (t > 240) printf "   <- over four minutes\n"; else printf "\n" }'
   [[ "${over}" -gt 0 ]] && printf '  %s%d line(s) over budget — shorten them, or raise SPEECH_RATE%s\n' \
     "${c_ylw}" "${over}" "${c_off}"
+
+  concat_narration "${tok}"
   return 0
+}
+
+# One file of the whole cut, for listening to it end to end before any footage
+# exists. This used to be made by hand, which meant every rewrite left a stale
+# full track sitting next to freshly-voiced segments with nothing to say so —
+# the same trap as keying the segment cache on the file merely existing. It is
+# built here so it cannot drift.
+#
+# Byte concatenation is legitimate for these files: every segment comes back
+# from the same endpoint in the same CBR format, so the frames are compatible
+# and no re-encode is needed (there is no ffmpeg on the authoring machine). The
+# gaps are real audio for the same reason — a silent clip synthesized once from
+# a break-only SSML, spliced between segments, so the full track runs to the
+# same length as the timeline instead of ~10s short.
+concat_narration() {
+  local tok="$1" out="${DEMO_EXEC_OUT}" gap="${out}/tts/_gap.mp3" i code full="${out}/narration-full.mp3"
+  local -a parts=()
+
+  for ((i = 0; i < N; i++)); do
+    [[ -s "${out}/tts/${SEG_ID[i]}.mp3" ]] || {
+      printf '  %snarration-full.mp3 not written — %s is missing%s\n' \
+        "${c_ylw}" "${SEG_ID[i]}" "${c_off}"
+      return 0
+    }
+  done
+
+  if [[ ! -s "${gap}" ]]; then
+    code="$(curl -sS -o "${gap}" -w '%{http_code}' \
+      -X POST "${SPEECH_ENDPOINT%/}/tts/cognitiveservices/v1" \
+      -H "Authorization: Bearer ${tok}" \
+      -H "Content-Type: application/ssml+xml" \
+      -H "X-Microsoft-OutputFormat: audio-24khz-96kbitrate-mono-mp3" \
+      -d "<speak version='1.0' xml:lang='en-US'><voice name='${SPEECH_VOICE}'><break time='${SEG_GAP_MS}ms'/></voice></speak>" \
+      2>/dev/null || echo 000)"
+    [[ "${code}" = "200" ]] || { rm -f "${gap}"; }
+  fi
+
+  for ((i = 0; i < N; i++)); do
+    [[ "${i}" -gt 0 && -s "${gap}" ]] && parts+=("${gap}")
+    parts+=("${out}/tts/${SEG_ID[i]}.mp3")
+  done
+
+  cat "${parts[@]}" > "${full}"
+  if [[ -s "${gap}" ]]; then
+    printf '  %sfull track: %s (%s, with %sms between lines)%s\n' \
+      "${c_dim}" "narration-full.mp3" "$(mmss "$(mp3_seconds "${full}")")" "${SEG_GAP_MS}" "${c_off}"
+  else
+    printf '  %sfull track: narration-full.mp3 (%s) — no gap clip, lines run together%s\n' \
+      "${c_ylw}" "$(mmss "$(mp3_seconds "${full}")")" "${c_off}"
+  fi
 }
 
 # -------------------------------------------------------------------- main
@@ -715,6 +854,7 @@ else
   printf '  %-22s %s\n' kdenlive-vo.mlt "(not written — run --tts first to produce the audio)"
 fi
 printf '  %-22s %s\n' shotlist.md "what is on screen per segment, and where the footage comes from"
+printf '  %-22s %s\n' recording-plan.md "the same segments grouped by take — record in this order"
 printf '  %-22s %s\n' segments.tsv "machine-readable timings"
 printf '  %-22s %s\n' track-b-inset.sh "the live inset to keep in shot"
 printf '\n  %s%s words of narration, timeline runs %s — %s%s\n' "${c_dim}" \
