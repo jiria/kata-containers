@@ -171,16 +171,24 @@ c_grn=$'\033[32m'; c_ylw=$'\033[33m'; c_dim=$'\033[2m'
 # The inset is the credibility anchor: track A is a real run with the waiting
 # cut out, but track B is unmistakably a live cluster reacting in real time. It
 # wants its own terminal, small, in a corner, running for the whole take.
+#
+# Three panes in one window, cheapest first: what pods exist, what the cluster
+# last did, and the spec of the pod under test. The spec is printed whole and
+# cut to the window width rather than wrapped — a wrapped YAML line reads as
+# two keys and makes the pane look like noise. watch clips the tail, so the
+# spec fills whatever height is left and the two panes above it stay put.
 inset_command() {
   cat <<'EOF'
 watch -n1 --color -t '
-  kubectl get pods -n coco-e2e -o custom-columns=\
-NAME:.metadata.name,PHASE:.status.phase,READY:.status.containerStatuses[*].ready \
-    --no-headers 2>/dev/null | head -6
+  kubectl get pods -n coco-e2e --no-headers 2>/dev/null | head -6
   echo
   kubectl get events -n coco-e2e --sort-by=.lastTimestamp \
-    -o custom-columns=REASON:.reason,OBJECT:.involvedObject.name --no-headers 2>/dev/null \
-    | tail -4'
+    -o custom-columns=REASON:.reason,OBJECT:.involvedObject.name,CONTAINER:.involvedObject.fieldPath \
+    --no-headers 2>/dev/null \
+    | sed -e "s/spec.containers{\(.*\)}/\1/" -e "s/<none>/-/" | tail -4
+  echo
+  p=$(kubectl get pods -n coco-e2e -o name 2>/dev/null | grep -v demo-prep | head -1)
+  [ -n "$p" ] && kubectl get -n coco-e2e "$p" -o yaml 2>/dev/null | cut -c1-110'
 EOF
 }
 
@@ -407,10 +415,13 @@ seg_seconds() {
 }
 
 # The command that produces a segment's footage, or nothing if it is not an act.
+# DEMO_NARRATE=0 because the acts carry their own written prose, and this cut is
+# voice-over: prose on the screen is prose on the footage the words are meant to
+# be spoken over. The headings stay — they are structure, not narration.
 act_command() {
   case "$1" in
-    act:frag) printf 'DEMO_PAUSE=0 bash %s/demo-fragment-sidecar.sh' "${HERE}" ;;
-    act:*)    printf 'DEMO_PAUSE=0 DEMO_ACTS=%s bash %s/demo.sh' "${1#act:}" "${HERE}" ;;
+    act:frag) printf 'DEMO_PAUSE=0 DEMO_NARRATE=0 bash %s/demo-fragment-sidecar.sh' "${HERE}" ;;
+    act:*)    printf 'DEMO_PAUSE=0 DEMO_NARRATE=0 DEMO_ACTS=%s bash %s/demo.sh' "${1#act:}" "${HERE}" ;;
   esac
 }
 
@@ -698,9 +709,9 @@ emit_recording_plan() {
         self) printf 'Run `./demo-exec.sh --run` and record the segments below as they are slated.\n\n' ;;
         none) printf 'Nothing to capture. These are title cards, or a hold on the previous shot —\n'
               printf 'the narration runs over what is already on screen.\n\n' ;;
-        act:frag) printf '```\nDEMO_PAUSE=0 bash %s/demo-fragment-sidecar.sh\n```\n\n' "${HERE}"
+        act:frag) printf '```\n%s\n```\n\n' "$(act_command "${src}")"
                   printf 'One continuous recording. The editor pulls the shots below out of it.\n\n' ;;
-        act:*) printf '```\nDEMO_PAUSE=0 DEMO_ACTS=%s bash %s/demo.sh\n```\n\n' "${src#act:}" "${HERE}"
+        act:*) printf '```\n%s\n```\n\n' "$(act_command "${src}")"
                printf 'One continuous recording. The editor pulls the shots below out of it.\n\n' ;;
       esac
       printf '| id | at | length | on screen |\n|----|----|--------|-----------|\n'

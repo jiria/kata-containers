@@ -1380,5 +1380,8 @@ if [[ "${ACTS}" == "0,1,2,3,4" ]]; then
       the SVN floor, and confined to its own feed's namespace (act 4).
 EOF
 else
-  printf '\n  ran acts: %s (of 0,1,2,3,4)\n' "${ACTS}"
+  # A note to whoever ran a subset, and so commentary: it follows DEMO_NARRATE
+  # like the rest of the prose, because on a voice-over take it would land on
+  # the last shot.
+  [[ "${DEMO_NARRATE:-1}" = "1" ]] && printf '\n  ran acts: %s (of 0,1,2,3,4)\n' "${ACTS}"
 fi
