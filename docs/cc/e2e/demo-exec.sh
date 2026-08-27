@@ -177,18 +177,35 @@ c_grn=$'\033[32m'; c_ylw=$'\033[33m'; c_dim=$'\033[2m'
 # cut to the window width rather than wrapped — a wrapped YAML line reads as
 # two keys and makes the pane look like noise. watch clips the tail, so the
 # spec fills whatever height is left and the two panes above it stay put.
+#
+# kubectl emits no colour of its own, so the panes are coloured here, on one
+# principle: colour carries the verdict. Green means it worked, red means it
+# was refused, yellow means it is still happening — so a viewer who reads
+# nothing else can still see the refusals land. In the spec, the keys the demo
+# is actually about are the only thing highlighted; everything else is keys in
+# cyan against plain values, which is legibility rather than meaning.
 inset_command() {
   cat <<'EOF'
 watch -n1 --color -t '
-  kubectl get pods -n coco-e2e --no-headers 2>/dev/null | head -6
+  e=$(printf "\033"); R="${e}[0m"; G="${e}[32m"; Y="${e}[33m"; C="${e}[36m"
+  RD="${e}[31m"; B="${e}[1m"
+  kubectl get pods -n coco-e2e --no-headers 2>/dev/null | head -6 \
+    | sed -E -e "s/(Running|Completed)/${G}\1${R}/" \
+             -e "s/(Pending|ContainerCreating|PodInitializing|Terminating)/${Y}\1${R}/" \
+             -e "s/(Error|CrashLoopBackOff|StartError|Failed|ImagePullBackOff)/${RD}\1${R}/"
   echo
   kubectl get events -n coco-e2e --sort-by=.lastTimestamp \
     -o custom-columns=REASON:.reason,OBJECT:.involvedObject.name,CONTAINER:.involvedObject.fieldPath \
     --no-headers 2>/dev/null \
-    | sed -e "s/spec.containers{\(.*\)}/\1/" -e "s/<none>/-/" | tail -4
+    | sed -e "s/spec.containers{\(.*\)}/\1/" -e "s/<none>/-/" | tail -4 \
+    | sed -E -e "s/^(Started|Pulled|Created|Scheduled)/${G}\1${R}/" \
+             -e "s/^(Killing|Failed[A-Za-z]*|BackOff|Unhealthy|Preempt[A-Za-z]*)/${RD}\1${R}/" \
+             -e "s/^(Pulling|Provisioning|Resizing)/${Y}\1${R}/"
   echo
   p=$(kubectl get pods -n coco-e2e -o name 2>/dev/null | grep -v demo-prep | head -1)
-  [ -n "$p" ] && kubectl get -n coco-e2e "$p" -o yaml 2>/dev/null | cut -c1-110'
+  [ -n "$p" ] && kubectl get -n coco-e2e "$p" -o yaml 2>/dev/null | cut -c1-110 \
+    | sed -E -e "s@(io\.katacontainers\.[A-Za-z0-9_.]*|cc_init_data|policy_fragments)@${B}${Y}\1${R}@" \
+             -e "s@^([[:space:]]*)([A-Za-z0-9_./-]+):@\1${C}\2${R}:@"'
 EOF
 }
 
