@@ -229,10 +229,10 @@ VO
 
 # ---- moment 2: down to the bytes of the image -------------------------------
 segment S04 "m2" "the layer's dm-verity root hash, as named in the measured policy" act:2 '' <<'VO'
-Every layer is an erofs image: a mainline Linux filesystem, and a proposed OCI
-layer format. The kernel proves each layer's contents against its dm-verity root
-hash, and the policy names that hash — so the host can only present layers that
-hash to what was declared.
+Here's that policy — and one of the things it declares. Every layer is an erofs
+image: a mainline Linux filesystem, and a proposed OCI layer format. The kernel
+proves each layer against its dm-verity root hash, and that hash is written in
+the policy — so the host can only present what was declared.
 VO
 
 segment S05 "m2" "one hex digit of one hash changed" act:2 '' <<'VO'
@@ -241,20 +241,19 @@ VO
 
 segment S06 "m2" "pod verdict — StartError, exit 128 — then the full layer list beside the policy" act:2 '' <<'VO'
 The container never starts, and the refusal is written inside the boundary — the
-host is only relaying it. And it is not just this hash: presented layers must
-match declared layers one for one, each pinned to its position.
+host is only relaying it. And it holds for the set, not just the one: the right
+hashes in the wrong order is still a refusal.
 VO
 
 # ---- moment 3: the rules are generated, measured, and enforced --------------
 segment S07 "m3" "the pod spec, before anything is done to it" act:1 '' <<'VO'
-A confidential container is governed by a policy: what may run, what may be
-mounted, whether anyone can get a shell.
+So where does that document come from, and who decides what goes in it?
 VO
 
 segment S08 "m3" "genpolicy rewriting the spec — the cc_init_data annotation appears" act:1 '' <<'VO'
-Here's that policy being generated from this exact pod spec and injected back
-into it as a single annotation — that's the measured document the guest will
-enforce.
+From the deployment itself: generated out of this exact pod spec and injected
+back as a single annotation. That's the measured document the guest enforces —
+what may run, what may be mounted, who may get a shell.
 VO
 
 segment S09 "m3" "the same digest in the hardware report at launch" act:1 '' <<'VO'
@@ -315,10 +314,10 @@ VO
 
 # ---- close ------------------------------------------------------------------
 segment S18 "close" "title card — no terminal" none '' <<'VO'
-Hardware isolation, the image verified block by block, rules that hold for the
-workload's whole life, and a safe way to evolve them — all shown running. These
-are ready for Manifold to build on now, and we're upstreaming them into Kata
-Confidential Containers in parallel.
+Hardware isolation, images verified block by block, rules that hold for the
+workload's whole life, and a safe way to evolve them — all running today. Ready
+for Manifold to build on now, while we upstream them into Kata Confidential
+Containers.
 VO
 
 N=${#SEG_ID[@]}
