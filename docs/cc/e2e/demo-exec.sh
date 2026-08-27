@@ -82,7 +82,9 @@
 #                                   no timings, because the run is paced by the
 #                                   narration and so measures only it.
 #   ./demo-exec.sh --tts            synthesize the narration with Azure Speech.
-#   ./demo-exec.sh --inset          print the track B command and exit.
+#   ./demo-exec.sh --inset          start the live track B inset in this
+#                                   terminal. --inset --print writes the
+#                                   command out instead of running it.
 #   ./demo-exec.sh --reset          clear the demo's pods and events, and exit.
 #                                   Run before each take: the inset shows the
 #                                   last few events, so a take otherwise opens
@@ -152,6 +154,7 @@ while [[ $# -gt 0 ]]; do
     --voice) shift; SPEECH_VOICE="$1"; TTS=1 ;;
     --rate)  shift; SPEECH_RATE="$1";  TTS=1 ;;
     --inset) INSET_ONLY=1 ;;
+    --print) INSET_PRINT=1 ;;
     --reset) RESET_ONLY=1 ;;
     # Print the header block itself, so help cannot drift out of step with the
     # documentation the way a hard-coded line range does.
@@ -210,9 +213,14 @@ EOF
 }
 
 if [[ "${INSET_ONLY:-0}" = "1" ]]; then
-  printf '%s# track B — run this in a second terminal, keep it in shot%s\n\n' "${c_dim}" "${c_off}"
-  inset_command
-  exit 0
+  if [[ "${INSET_PRINT:-0}" = "1" ]]; then
+    printf '%s# track B — run this in a second terminal, keep it in shot%s\n\n' "${c_dim}" "${c_off}"
+    inset_command
+    exit 0
+  fi
+  # Straight into the pane. Copying a twenty-line command out of a terminal is
+  # its own small ceremony, and on camera the paste is visible before the take.
+  exec bash -c "$(inset_command)"
 fi
 
 # ------------------------------------------------------------- stage reset
@@ -466,7 +474,7 @@ conduct() {
     printf '%scontinuous hands-free take instead, use --auto.%s\n\n' "${c_dim}" "${c_off}"
   fi
   printf '%s\n' "${c_ylw}start your screen recording now, and keep the track B inset in shot.${c_off}"
-  printf '%s\n' "${c_ylw}(./demo-exec.sh --inset prints the inset command)${c_off}"
+  printf '%s\n' "${c_ylw}(./demo-exec.sh --inset starts the inset in a second terminal)${c_off}"
   # The narration is deliberately not shown here. It is voice-over, added in
   # post, and anything on this screen is inside the capture — printing it puts
   # the words on the footage they are meant to be spoken over. Read it in
