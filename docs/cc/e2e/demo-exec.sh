@@ -711,27 +711,74 @@ emit_mlt() {
   local root="${out}"
   command -v cygpath >/dev/null 2>&1 && root="$(cygpath -m "${out}" 2>/dev/null || printf '%s' "${out}")"
 
+  # Timeline length, needed up front because the background track has to span it.
+  local total=0
+  for ((i = 0; i < N; i++)); do
+    [[ -s "${out}/tts/${SEG_ID[i]}.mp3" ]] || continue
+    alen="$(mp3_seconds "${out}/tts/${SEG_ID[i]}.mp3")"
+    total="$(awk -v a="${st[i]}" -v l="${alen}" -v t="${total}" \
+      'BEGIN{e=a+l; printf "%.3f", (e>t ? e : t)}')"
+  done
+
   {
     printf '<?xml version="1.0" encoding="utf-8"?>\n'
-    printf '<mlt LC_NUMERIC="C" version="7.0.0" producer="main_bin" profile="demo_exec" root="%s">\n' "${root}"
+    # No profile="..." attribute: that names a profile *file* for MLT to look up
+    # in its share/profiles directory, and "demo_exec" is not one of them, so it
+    # fails to open. The inline <profile> element below is the definition.
+    printf '<mlt LC_NUMERIC="C" version="7.0.0" producer="main_bin" root="%s">\n' "${root}"
     printf '  <profile description="demo-exec" width="1920" height="1080" progressive="1"'
     printf ' sample_aspect_num="1" sample_aspect_den="1" display_aspect_num="16"'
     printf ' display_aspect_den="9" frame_rate_num="%s" frame_rate_den="1" colorspace="709"/>\n' \
       "${DEMO_EXEC_FPS}"
 
+    # Kdenlive puts a black background under every timeline and assumes track 0
+    # is it. Without one the document loads, but the video tracks sit on nothing.
+    printf '  <producer id="black_track" in="00:00:00.000" out="%s">\n' "$(hms "${total}")"
+    printf '    <property name="length">%s</property>\n' "$(hms "${total}")"
+    printf '    <property name="eof">continue</property>\n'
+    printf '    <property name="resource">black</property>\n'
+    printf '    <property name="aspect_ratio">1</property>\n'
+    printf '    <property name="mlt_service">color</property>\n'
+    printf '    <property name="mlt_image_format">rgba</property>\n'
+    printf '    <property name="set.test_audio">0</property>\n'
+    printf '  </producer>\n'
+
     for ((i = 0; i < N; i++)); do
       [[ -s "${out}/tts/${SEG_ID[i]}.mp3" ]] || continue
       alen="$(mp3_seconds "${out}/tts/${SEG_ID[i]}.mp3")"
       printf '  <producer id="vo%02d" in="00:00:00.000" out="%s">\n' "${i}" "$(hms "${alen}")"
-      printf '    <property name="resource">tts/%s.mp3</property>\n' "${SEG_ID[i]}"
+      printf '    <property name="length">%s</property>\n' "$(hms "${alen}")"
+      printf '    <property name="eof">pause</property>\n'
+      # Absolute, native-form path. Relative-plus-root is the tidier MLT idiom,
+      # but Kdenlive only honours it when the project was saved with relative
+      # paths turned on, and otherwise looks the clip up as given and reports it
+      # missing. Kdenlive's own default is absolute, so match it. The trade is
+      # that moving this directory breaks the links — but the directory is a
+      # fixed, durable output location, and a project that opens beats one that
+      # relocates.
+      printf '    <property name="resource">%s/tts/%s.mp3</property>\n' "${root}" "${SEG_ID[i]}"
       printf '    <property name="mlt_service">avformat</property>\n'
       printf '    <property name="kdenlive:clipname">%s</property>\n' "${SEG_ID[i]}"
+      # Bin ids have to be unique and are 1-based with 1 reserved, so start at 2.
+      printf '    <property name="kdenlive:id">%d</property>\n' "$((i + 2))"
       printf '  </producer>\n'
     done
 
+    # The project bin. This is also where Kdenlive keeps the document version it
+    # complains about not being able to read when it is missing.
+    printf '  <playlist id="main_bin">\n'
+    printf '    <property name="kdenlive:docproperties.version">1.1</property>\n'
+    printf '    <property name="kdenlive:docproperties.profile">demo-exec</property>\n'
+    printf '    <property name="kdenlive:docproperties.decimalPoint">.</property>\n'
+    printf '    <property name="xml_retain">1</property>\n'
+    for ((i = 0; i < N; i++)); do
+      [[ -s "${out}/tts/${SEG_ID[i]}.mp3" ]] || continue
+      alen="$(mp3_seconds "${out}/tts/${SEG_ID[i]}.mp3")"
+      printf '    <entry producer="vo%02d" in="00:00:00.000" out="%s"/>\n' "${i}" "$(hms "${alen}")"
+    done
+    printf '  </playlist>\n'
+
     printf '  <playlist id="playlist_vo">\n'
-    printf '    <property name="kdenlive:audio_track">1</property>\n'
-    printf '    <property name="kdenlive:track_name">narration</property>\n'
     prev=0
     for ((i = 0; i < N; i++)); do
       [[ -s "${out}/tts/${SEG_ID[i]}.mp3" ]] || continue
@@ -743,9 +790,21 @@ emit_mlt() {
       prev="$(awk -v a="${st[i]}" -v l="${alen}" 'BEGIN{printf "%.3f", a+l}')"
     done
     printf '  </playlist>\n'
+    # Second playlist of the pair: a Kdenlive track is a tractor over two
+    # playlists, so that a clip can cross-fade with its own neighbour.
+    printf '  <playlist id="playlist_vo_b"/>\n'
 
-    printf '  <tractor id="tractor_main" title="demo-exec narration">\n'
-    printf '    <track producer="playlist_vo"/>\n'
+    printf '  <tractor id="tractor_vo" in="00:00:00.000" out="%s">\n' "$(hms "${total}")"
+    printf '    <property name="kdenlive:audio_track">1</property>\n'
+    printf '    <property name="kdenlive:trackName">narration</property>\n'
+    printf '    <track hide="video" producer="playlist_vo"/>\n'
+    printf '    <track hide="video" producer="playlist_vo_b"/>\n'
+    printf '  </tractor>\n'
+
+    printf '  <tractor id="maintractor" in="00:00:00.000" out="%s">\n' "$(hms "${total}")"
+    printf '    <property name="kdenlive:projectTractor">1</property>\n'
+    printf '    <track producer="black_track"/>\n'
+    printf '    <track producer="tractor_vo"/>\n'
     printf '  </tractor>\n'
     printf '</mlt>\n'
   } > "${out}/demo-exec.kdenlive"
