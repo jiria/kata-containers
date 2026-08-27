@@ -267,13 +267,14 @@ enforces: what may run, what may be mounted, who may get a shell.
 VO
 
 segment S09 "m3" "the same digest in the hardware report at launch" act:1 '' <<'VO'
-Its digest goes into the hardware report at launch, so the guest can tell
-whether it got the rules that were approved.
+Its digest is stamped into the hardware report at launch. The guest refuses to
+run unless its rules match that stamp, and attestation checks it's the one you
+approved.
 VO
 
 segment S10 "m3" "the pod Running: its EROFS layers with their hashes, and the CLH process" act:1 '' <<'VO'
-And here's the pod running under them. Its layers each carry a dm-verity hash
-the policy names, and this is the Cloud Hypervisor process for its VM.
+And here's the pod running under them: those layers, those hashes, and the
+Cloud Hypervisor process for its VM.
 VO
 
 segment S11 "m3" "hold on the running pod — no new terminal output" none '' <<'VO'
