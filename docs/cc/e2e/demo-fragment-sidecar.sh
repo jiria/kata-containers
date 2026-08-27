@@ -53,15 +53,22 @@ _demo_clear() {
   printf '\033[H\033[2J'
 }
 
+# Same three switches as demo.sh, for the same reason: this act is cut into the
+# same voice-over take. DEMO_HEADINGS=0 drops the banners, and log() follows the
+# prose switch because it is commentary — failures go through warn/die.
+_heading_on() { [[ "${DEMO_HEADINGS:-1}" = "1" ]]; }
+eval "_lib_log() $(declare -f log | tail -n +2)"
+log() { [[ "${DEMO_NARRATE:-1}" = "1" ]] || return 0; _lib_log "$@"; }
+
 # `|| true` matters: this script runs under `set -e`, and _demo_clear returns
 # non-zero whenever clearing is off (piped runs, DEMO_PAUSE=0). Without it the
 # whole script exits silently at the first heading.
-step() { _CUR_STEP="$*"; _demo_clear || true; _lib_step "$@"; _vo "$*"; }
+step() { _CUR_STEP="$*"; _demo_clear || true; _heading_on && _lib_step "$@"; _vo "$*"; return 0; }
 
 # A heading that deliberately does not clear: use it when the section reads the
 # evidence still on screen. The closing summary refers to the pod that step 4
 # just brought up, so wiping it first would leave the summary unsupported.
-heading() { _CUR_STEP="$*"; _lib_step "$@"; _vo "$*"; }
+heading() { _CUR_STEP="$*"; _heading_on && _lib_step "$@"; _vo "$*"; return 0; }
 
 # Narration, mirroring demo.sh: prose can be suppressed for a live voice-over
 # (DEMO_NARRATE=0) and captured to a plain-text script (DEMO_SCRIPT), while the

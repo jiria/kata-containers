@@ -54,8 +54,12 @@
 #   DEMO_CLEAR=0     keep the screen when paused (default: clear between beats,
 #                    redrawing the act heading; scrollback is preserved)
 #   DEMO_ACTS=0,2    run only these acts (default: 0,1,2,3,4)
-#   DEMO_NARRATE=0   suppress the written prose, leaving only the headings,
-#                    commands and their output — for narrating live over the top
+#   DEMO_NARRATE=0   suppress the written prose and the [e2e] commentary,
+#                    leaving the commands and their output — for narrating live
+#                    over the top, or for a voice-over cut
+#   DEMO_HEADINGS=0  drop the act banners too (default: show them). Set alongside
+#                    DEMO_NARRATE=0 when the spoken track already says where we
+#                    are; the screen still clears between beats
 #   DEMO_STEPS=0     hide the per-beat numbers (default: show them, so a beat can
 #                    be referred to by number when reviewing)
 #   DEMO_SCRIPT=path write the spoken script to this file as well, one line per
@@ -91,12 +95,25 @@ _demo_clear() {
   printf '\033[H\033[2J'
 }
 
-step() { _CUR_STEP="$*"; _demo_clear; _lib_step "$@"; _vo "$*"; }
+# Headings are structure for someone watching the script run. Under a voice-over
+# cut they are neither: the spoken track already says where we are, and an act
+# banner on screen is a second, competing title. DEMO_HEADINGS=0 drops the
+# banners while leaving the clear between beats, which is layout, not commentary.
+_heading_on() { [[ "${DEMO_HEADINGS:-1}" = "1" ]]; }
+
+# lib.sh's log() carries commentary, not evidence — failures go through warn/die
+# and results come from the commands themselves. So it follows the prose switch:
+# under a voice-over cut these lines say aloud what the narration is already
+# saying, on top of the footage it is spoken over.
+eval "_lib_log() $(declare -f log | tail -n +2)"
+log() { [[ "${DEMO_NARRATE:-1}" = "1" ]] || return 0; _lib_log "$@"; }
+
+step() { _CUR_STEP="$*"; _demo_clear; _heading_on && _lib_step "$@"; _vo "$*"; return 0; }
 
 # A heading that deliberately does not clear: for a section that reads the
 # evidence still on screen. The closing summary sums up the act that just ran,
 # so wiping it first would leave the summary unsupported.
-heading() { _CUR_STEP="$*"; _lib_step "$@"; _vo "$*"; }
+heading() { _CUR_STEP="$*"; _heading_on && _lib_step "$@"; _vo "$*"; return 0; }
 
 NS="${E2E_NS:-coco-e2e}"
 ACTS="${DEMO_ACTS:-0,1,2,3,4}"
@@ -1382,6 +1399,10 @@ EOF
 else
   # A note to whoever ran a subset, and so commentary: it follows DEMO_NARRATE
   # like the rest of the prose, because on a voice-over take it would land on
-  # the last shot.
-  [[ "${DEMO_NARRATE:-1}" = "1" ]] && printf '\n  ran acts: %s (of 0,1,2,3,4)\n' "${ACTS}"
+  # the last shot. Written as an if, not `[[ ]] &&`: this is the last statement
+  # in the script, so a false test would become the script's exit status and a
+  # perfectly good take would report failure.
+  if [[ "${DEMO_NARRATE:-1}" = "1" ]]; then
+    printf '\n  ran acts: %s (of 0,1,2,3,4)\n' "${ACTS}"
+  fi
 fi

@@ -440,13 +440,15 @@ seg_seconds() {
 }
 
 # The command that produces a segment's footage, or nothing if it is not an act.
-# DEMO_NARRATE=0 because the acts carry their own written prose, and this cut is
-# voice-over: prose on the screen is prose on the footage the words are meant to
-# be spoken over. The headings stay — they are structure, not narration.
+# Everything the acts write for a reader is turned off here — prose
+# (DEMO_NARRATE), beat numbers (DEMO_STEPS) and act banners (DEMO_HEADINGS) —
+# because this cut is voice-over: the spoken track already says where we are,
+# and anything on the screen is on the footage the words are spoken over. What
+# is left is the commands and their output, which is the evidence.
 act_command() {
   case "$1" in
-    act:frag) printf 'DEMO_PAUSE=0 DEMO_NARRATE=0 bash %s/demo-fragment-sidecar.sh' "${HERE}" ;;
-    act:*)    printf 'DEMO_PAUSE=0 DEMO_NARRATE=0 DEMO_ACTS=%s bash %s/demo.sh' "${1#act:}" "${HERE}" ;;
+    act:frag) printf 'DEMO_PAUSE=0 DEMO_NARRATE=0 DEMO_STEPS=0 DEMO_HEADINGS=0 bash %s/demo-fragment-sidecar.sh' "${HERE}" ;;
+    act:*)    printf 'DEMO_PAUSE=0 DEMO_NARRATE=0 DEMO_STEPS=0 DEMO_HEADINGS=0 DEMO_ACTS=%s bash %s/demo.sh' "${1#act:}" "${HERE}" ;;
   esac
 }
 
@@ -481,6 +483,11 @@ conduct() {
   # shotlist.md or voiceover.txt, on a second screen, outside the frame.
   printf '%s\n' "${c_dim}(narration is not printed — it is in shotlist.md, off-camera)${c_off}"
   read -r -p "press Enter when recording ..." _
+  # Everything printed above is direction for the operator, and the recorder is
+  # already running by the time Enter is pressed — so it is all in the capture.
+  # Clear immediately: the take should open on an empty screen, not on the
+  # instructions for making it.
+  clear
   t0="$(date +%s.%N)"
 
   for ((i = 0; i < N; i++)); do
