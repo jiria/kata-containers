@@ -205,11 +205,10 @@ segment() {
 
 # ---- open -------------------------------------------------------------------
 segment S01 "open" "title card — no terminal" none '' <<'VO'
-Confidential containers on Azure already give each workload its own hardware-isolated
-VM, with image layers the kernel verifies block by block. What we've added is what all
-of that is anchored to: rules the host cannot reinterpret, that hold for the whole life
-of the workload, and that the customer or the platform can still evolve safely. Let me
-walk the chain.
+A confidential container on Azure runs in its own hardware-isolated VM, governed by one
+document: a policy measured into the hardware report at launch. Every layer, every
+mount, every container has to match what that document declared, for the whole life of
+the workload. Let me walk the chain.
 VO
 
 # ---- moment 1: what the workload actually runs in ---------------------------
@@ -231,9 +230,9 @@ VO
 # ---- moment 2: down to the bytes of the image -------------------------------
 segment S04 "m2" "the layer's dm-verity root hash, as named in the measured policy" act:2 '' <<'VO'
 Every layer is an erofs image, and the kernel proves its contents against that
-layer's dm-verity root hash — the format the OCI is standardizing on. What we
-added is who chooses the hash: it is named in the measured policy, so the host
-can only present layers the policy approved.
+layer's dm-verity root hash — the format the OCI is standardizing on. The policy
+names the hash, so the host can only present layers that hash to what was
+declared.
 VO
 
 segment S05 "m2" "one hex digit of one hash changed" act:2 '' <<'VO'
@@ -270,11 +269,11 @@ its VM.
 VO
 
 segment S11 "m3" "hold on the running pod — no new terminal output" none '' <<'VO'
-Measuring a policy at launch is not new. What we changed is the question it asks.
-It used to be: is there a rule that permits this? Now it is: does what you
-presented match exactly what was declared? And it holds for the rest of the
-workload's life — there is no code path to accept a new policy after boot,
-compiled out rather than switched off.
+Every check inside the guest asks one question: does what you presented match
+exactly what was declared? Not just whether some rule allows it — a one-for-one
+match, so nothing can be reordered, duplicated or slipped in alongside. And that
+document is fixed at boot: no code path accepts a new one, compiled out rather
+than switched off.
 VO
 
 segment S12 "m3" "a substituted policy staged, and the guest's refusal" act:1 '' <<'VO'
@@ -289,9 +288,10 @@ it's a legitimate container, or who asks — it has no entry, so it doesn't star
 VO
 
 segment S14 "m4" "the policy_fragments annotation being attached to the pod spec" act:frag '' <<'VO'
-Security this strict normally means you redeploy and re-attest to change that.
-We don't. Here's the signed rule being attached to the pod spec — one more
-annotation, next to the measured policy from a moment ago.
+Security this strict normally means redeploying and re-attesting to change that.
+Instead, the policy names the issuers it will accept new rules from. Here's a
+signed rule being attached to the pod spec — one more annotation, next to the
+measured policy from a moment ago.
 VO
 
 segment S15 "m4" "hold on the annotation, then the measured issuer list beside it" act:frag '' <<'VO'
@@ -622,7 +622,7 @@ mp3_seconds() {
 }
 
 synthesize() {
-  local out="${DEMO_EXEC_OUT}" i txt tok code dur planned w over=0 total=0 made=0 kept=0
+  local out="${DEMO_EXEC_OUT}" i txt tok code dur planned w spoken over=0 total=0 made=0 kept=0
   mkdir -p "${out}/tts"
 
   tok="$(speech_token || true)"
@@ -636,8 +636,14 @@ synthesize() {
   printf '\n%ssynthesizing %d lines — %s%s\n' "${c_bld}" "${N}" "${SPEECH_VOICE}" "${c_off}"
   for ((i = 0; i < N; i++)); do
     # Re-synthesizing an unchanged line costs time and money and returns the
-    # same audio, so keep what is already there. SPEECH_FORCE=1 after a rewrite.
-    if [[ -s "${out}/tts/${SEG_ID[i]}.mp3" && "${SPEECH_FORCE:-0}" != "1" ]]; then
+    # same audio, so keep what is already there. But "already there" has to mean
+    # "and it says the same thing": keying the cache on the file merely existing
+    # meant every rewrite silently kept the old take, and the only way to find
+    # out was to listen to the whole cut. The spoken text is stored beside the
+    # audio and compared. SPEECH_FORCE=1 still overrides.
+    spoken="${out}/tts/${SEG_ID[i]}.spoken"
+    if [[ -s "${out}/tts/${SEG_ID[i]}.mp3" && "${SPEECH_FORCE:-0}" != "1" ]] \
+       && [[ -f "${spoken}" ]] && [[ "$(cat "${spoken}")" == "${SEG_VO[i]}" ]]; then
       kept=$((kept + 1))
     else
       # SSML is XML: an unescaped ampersand or angle bracket is a 400, not a
@@ -667,6 +673,7 @@ synthesize() {
         continue
       fi
       made=$((made + 1))
+      printf '%s' "${SEG_VO[i]}" > "${spoken}"
     fi
 
     # A line that overruns its segment is the one thing that breaks a
