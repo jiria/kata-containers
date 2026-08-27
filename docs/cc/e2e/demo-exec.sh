@@ -50,11 +50,14 @@
 #                          positions are frame numbers. Needs DEMO_EXEC_FPS to
 #                          match the project profile; the .txt does not.
 #   voiceover.srt          Project ▸ Subtitles ▸ Import Subtitle File.
-#   kdenlive-vo.mlt        a project you can open directly: every narration clip
+#   demo-exec.kdenlive     a project you can open directly: every narration clip
 #                          already laid out on an audio track at its segment's
 #                          start time. Written only when --tts has produced the
 #                          audio. Open it, then drag the screen recording onto
 #                          the video track above and slide it into place.
+#                          It is MLT XML — which is what a Kdenlive project is —
+#                          but it has to carry the .kdenlive extension: the open
+#                          dialog filters on it, so a .mlt is invisible there.
 #
 # Both marker formats and the SRT are read straight out of Kdenlive's importers
 # (markerlistmodel.cpp: importFromTxt takes `<timecode> <comment> [seconds]`,
@@ -109,7 +112,7 @@
 # Env:
 #   DEMO_EXEC_OUT=dir   where to write (default /tmp/demo-exec-<timestamp>)
 #   DEMO_EXEC_WPM=144   speaking rate used for duration estimates
-#   DEMO_EXEC_FPS=30    project frame rate, for the JSON markers and the .mlt
+#   DEMO_EXEC_FPS=30    project frame rate, for the JSON markers and the project
 #   E2E_REPO_DIR        source tree, for the config-path lookup in moment 1
 #   SPEECH_ENDPOINT     default https://jiriatts.cognitiveservices.azure.com
 #   SPEECH_SUB          subscription holding that resource
@@ -634,7 +637,7 @@ emit_recording_plan() {
       printf '\n'
     done
     printf '## After\n\n'
-    printf 'Import `kdenlive-vo.mlt` (narration already laid out), then `kdenlive-markers.txt`\n'
+    printf 'Open `demo-exec.kdenlive` (narration already laid out), then import `kdenlive-markers.txt`\n'
     printf 'as timeline markers. Each marker is a **range**, so a segment cut to its marker is\n'
     printf 'cut to length. `voiceover.srt` drops in as subtitles, already aligned.\n'
   } > "${out}/recording-plan.md"
@@ -745,7 +748,7 @@ emit_mlt() {
     printf '    <track producer="playlist_vo"/>\n'
     printf '  </tractor>\n'
     printf '</mlt>\n'
-  } > "${out}/kdenlive-vo.mlt"
+  } > "${out}/demo-exec.kdenlive"
 }
 
 # --------------------------------------------------------------------- TTS
@@ -952,10 +955,10 @@ printf '  %-22s %s\n' voiceover.txt "one narration block per line, line N = segm
 printf '  %-22s %s\n' voiceover.srt "${TIMING_BASIS} — Project > Subtitles > Import"
 printf '  %-22s %s\n' kdenlive-markers.txt "Timeline Markers > Import — one labelled range per segment"
 printf '  %-22s %s\n' kdenlive-markers.json "same markers, frame-based (needs fps ${DEMO_EXEC_FPS})"
-if [[ -s "${DEMO_EXEC_OUT}/kdenlive-vo.mlt" ]]; then
-  printf '  %-22s %s\n' kdenlive-vo.mlt "open directly — narration already laid out on an audio track"
+if [[ -s "${DEMO_EXEC_OUT}/demo-exec.kdenlive" ]]; then
+  printf '  %-22s %s\n' demo-exec.kdenlive "open directly — narration already laid out on an audio track"
 else
-  printf '  %-22s %s\n' kdenlive-vo.mlt "(not written — run --tts first to produce the audio)"
+  printf '  %-22s %s\n' demo-exec.kdenlive "(not written — run --tts first to produce the audio)"
 fi
 printf '  %-22s %s\n' shotlist.md "what is on screen per segment, and where the footage comes from"
 printf '  %-22s %s\n' recording-plan.md "the same segments grouped by take — record in this order"
