@@ -73,11 +73,14 @@
 #                                   stateful experiments prompt you to run the
 #                                   corresponding act of demo.sh and record it.
 #                                   Timings are stamped either way.
-#   ./demo-exec.sh --run --auto     smoke-test the conductor: no prompts, so it
-#                                   runs straight through in seconds. Not a
-#                                   recording — it stamps no timings, because a
-#                                   run nobody was recording did not measure
-#                                   anything.
+#   ./demo-exec.sh --run --auto     one continuous hands-free take. The acts
+#                                   are started here in turn and each segment is
+#                                   held on screen for the length of its
+#                                   narration, so a single capture comes out
+#                                   already paced to the voice-over. Prints no
+#                                   slates — the screen is the footage. Stamps
+#                                   no timings, because the run is paced by the
+#                                   narration and so measures only it.
 #   ./demo-exec.sh --tts            synthesize the narration with Azure Speech.
 #   ./demo-exec.sh --inset          print the track B command and exit.
 #   ./demo-exec.sh --reset          clear the demo's pods and events, and exit.
@@ -391,21 +394,48 @@ slate() {
   printf '%s%s%s\n' "${c_bld}${c_blu}" "$(printf '%.0s─' {1..72})" "${c_off}"
 }
 
+# How long a segment is entitled to on screen. The synthesized audio is the
+# authority when it exists, because that is what the footage will actually be
+# cut against; the word-count estimate is only a stand-in before --tts has run.
+seg_seconds() {
+  local i="$1" out="${DEMO_EXEC_OUT}"
+  if [[ -s "${out}/tts/${SEG_ID[i]}.mp3" ]]; then
+    mp3_seconds "${out}/tts/${SEG_ID[i]}.mp3"
+  else
+    est_seconds "$(words_of "${SEG_VO[i]}")"
+  fi
+}
+
+# The command that produces a segment's footage, or nothing if it is not an act.
+act_command() {
+  case "$1" in
+    act:frag) printf 'DEMO_PAUSE=0 bash %s/demo-fragment-sidecar.sh' "${HERE}" ;;
+    act:*)    printf 'DEMO_PAUSE=0 DEMO_ACTS=%s bash %s/demo.sh' "${1#act:}" "${HERE}" ;;
+  esac
+}
+
 conduct() {
-  local t0 i prev_src=""
+  local t0 i prev_src="" act_pid="" dur cmd acc=0
   reset_stage
-  # What this is, said once, because the shape of it surprises people: the cut
-  # interleaves segments that come from the same run of demo.sh — S04, S05 and
-  # S06 are all act 2 — so the acts cannot be driven from here. Running act 2
-  # three times would produce three different runs of the same experiment. The
-  # acts are separate takes, recorded once each; this walks the cut in order so
-  # the live segments get captured and the rest get called.
-  printf '%sthis conducts the cut; it does not run the three stateful acts.%s\n' \
-    "${c_bld}" "${c_off}"
-  printf '%sthose are separate takes — see recording-plan.md.%s\n\n' "${c_dim}" "${c_off}"
   if [[ "${AUTO}" = "1" ]]; then
-    printf '%s--auto: smoke test, no prompts, no timings stamped. Not a recording.%s\n' \
-      "${c_ylw}" "${c_off}"
+    # Hands-free take. The acts are started here and left to run while the
+    # screen is held for each segment's narration length, so a single screen
+    # recording comes out already paced to the voice-over.
+    printf '%s--auto: hands-free take. The acts run here; each segment is held%s\n' \
+      "${c_bld}" "${c_off}"
+    printf '%sfor the length of its narration, so the footage matches the audio.%s\n\n' \
+      "${c_dim}" "${c_off}"
+  else
+    # What this is, said once, because the shape of it surprises people: the cut
+    # interleaves segments that come from the same run of demo.sh — S04, S05 and
+    # S06 are all act 2 — so a manual pass cannot drive the acts. Running act 2
+    # three times would produce three different runs of the same experiment. The
+    # acts are separate takes, recorded once each; this walks the cut in order so
+    # the live segments get captured and the rest get called.
+    printf '%sthis conducts the cut; it does not run the three stateful acts.%s\n' \
+      "${c_bld}" "${c_off}"
+    printf '%sthose are separate takes — see recording-plan.md. For one%s\n' "${c_dim}" "${c_off}"
+    printf '%scontinuous hands-free take instead, use --auto.%s\n\n' "${c_dim}" "${c_off}"
   fi
   printf '%s\n' "${c_ylw}start your screen recording now, and keep the track B inset in shot.${c_off}"
   printf '%s\n' "${c_ylw}(./demo-exec.sh --inset prints the inset command)${c_off}"
@@ -414,16 +444,19 @@ conduct() {
   # the words on the footage they are meant to be spoken over. Read it in
   # shotlist.md or voiceover.txt, on a second screen, outside the frame.
   printf '%s\n' "${c_dim}(narration is not printed — it is in shotlist.md, off-camera)${c_off}"
-  [[ "${AUTO}" = "1" ]] || read -r -p "press Enter when recording ..." _
+  read -r -p "press Enter when recording ..." _
   t0="$(date +%s.%N)"
 
   for ((i = 0; i < N; i++)); do
-    # An --auto pass is not a conducted run: nothing was recorded and nobody
-    # waited, so the wall clock measures the speed of a for-loop. Leaving STARTS
-    # empty keeps emit() on a basis that means something.
+    # A hands-free pass is paced by the narration by construction, so its wall
+    # clock carries no information the audio does not already carry. Leaving
+    # STARTS empty keeps emit() on a basis that means something.
+    # No slate on a hands-free take: the screen *is* the footage, and the blue
+    # banner would land on top of a running act. The slates are for an operator
+    # stepping through, and there is no operator here.
     [[ "${AUTO}" = "1" ]] || \
       STARTS+=("$(awk -v a="$(date +%s.%N)" -v b="${t0}" 'BEGIN{printf "%.3f", a-b}')")
-    slate "${i}"
+    [[ "${AUTO}" = "1" ]] || slate "${i}"
     case "${SEG_SRC[i]}" in
       none) : ;;
       act:*)
@@ -431,14 +464,29 @@ conduct() {
         # of act 1 are five shots in one recording, and repeating the command
         # under each one reads as an instruction to run it again.
         if [[ "${SEG_SRC[i]}" = "${prev_src}" ]]; then
-          printf '  %sstill in that recording — keep it rolling%s\n' "${c_dim}" "${c_off}"
+          [[ "${AUTO}" = "1" ]] || \
+            printf '  %sstill in that recording — keep it rolling%s\n' "${c_dim}" "${c_off}"
         else
-          printf '  %sfootage source: %s — run and record that act, then continue%s\n' \
-            "${c_ylw}" "${SEG_SRC[i]#act:}" "${c_off}"
-          case "${SEG_SRC[i]}" in
-            act:frag) printf '  %s%s%s\n' "${c_dim}" "DEMO_PAUSE=0 bash ${HERE}/demo-fragment-sidecar.sh" "${c_off}" ;;
-            *)        printf '  %s%s%s\n' "${c_dim}" "DEMO_PAUSE=0 DEMO_ACTS=${SEG_SRC[i]#act:} bash ${HERE}/demo.sh" "${c_off}" ;;
-          esac
+          cmd="$(act_command "${SEG_SRC[i]}")"
+          if [[ "${AUTO}" = "1" ]]; then
+            # One act at a time. reset_stage deletes the demo's pods, so it
+            # cannot run while an act still has any, and an act cut off midway
+            # leaves state the next act would trip over.
+            if [[ -n "${act_pid}" ]]; then
+              # An act that failed must not take the whole take down with it:
+              # under set -e, wait propagates the act's exit status.
+              wait "${act_pid}" 2>/dev/null || true
+            fi
+            act_pid=""
+            reset_stage
+            clear
+            bash -c "${cmd}" 2>&1 &
+            act_pid="$!"
+          else
+            printf '  %sfootage source: %s — run and record that act, then continue%s\n' \
+              "${c_ylw}" "${SEG_SRC[i]#act:}" "${c_off}"
+            printf '  %s%s%s\n' "${c_dim}" "${cmd}" "${c_off}"
+          fi
         fi
         prev_src="${SEG_SRC[i]}"
         ;;
@@ -455,10 +503,37 @@ conduct() {
         prev_src="self"
         ;;
     esac
-    [[ "${AUTO}" = "1" ]] || read -r -p "  press Enter for the next segment ..." _
-    [[ "${AUTO}" = "1" ]] || \
+    if [[ "${AUTO}" = "1" ]]; then
+      # Pace against an absolute target rather than a per-segment stopwatch.
+      # Sleeping "what is left of this line" lets every segment's overhead push
+      # the next one later, and eighteen of those add up; sleeping until a
+      # cumulative mark absorbs the overhead instead. The mark is built the same
+      # way the audio is concatenated — line, then the same breath between
+      # blocks — so the take lands on the narration's own clock.
+      dur="$(seg_seconds "${i}")"
+      acc="$(awk -v a="${acc}" -v d="${dur}" -v g="${SEG_GAP_S}" \
+        'BEGIN{printf "%.3f", a + d + g}')"
+      local rest
+      rest="$(awk -v a="$(date +%s.%N)" -v b="${t0}" -v m="${acc}" \
+        'BEGIN{r = m - (a - b); if (r > 0.05) printf "%.2f", r}')"
+      [[ -n "${rest}" ]] && sleep "${rest}"
+      # A segment already past its mark gets no hold, and that is not a failure.
+      true
+    else
+      read -r -p "  press Enter for the next segment ..." _
       ENDS+=("$(awk -v a="$(date +%s.%N)" -v b="${t0}" 'BEGIN{printf "%.3f", a-b}')")
+    fi
   done
+
+  if [[ "${AUTO}" = "1" && -n "${act_pid}" ]]; then
+    # The last act may still be running when the narration has run out. Say so
+    # rather than killing it — an overrun is a real fact about the cut.
+    if kill -0 "${act_pid}" 2>/dev/null; then
+      printf '\n%sthe last act is still running past the end of the narration.%s\n' \
+        "${c_ylw}" "${c_off}"
+      wait "${act_pid}" 2>/dev/null || true
+    fi
+  fi
 }
 
 # ------------------------------------------------------------------- artefacts
