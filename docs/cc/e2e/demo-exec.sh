@@ -693,6 +693,30 @@ emit_kdenlive() {
 # A project file with the narration already laid out. Only meaningful once the
 # audio exists, so it is skipped otherwise rather than emitting a project full
 # of missing clips — a broken project is worse than no project.
+
+# Kdenlive identifies a sequence by UUID, in braces. Three ways to get one,
+# because this script runs on the recording node and on a Windows workstation:
+# the kernel's, uuidgen's, and failing both, awk seeded from the clock and the
+# pid. The last is not a real UUID by RFC, but nothing here needs it to be
+# globally unique — only to be unique within one project file.
+gen_uuid() {
+  local u=""
+  [[ -r /proc/sys/kernel/random/uuid ]] && u="$(cat /proc/sys/kernel/random/uuid)"
+  [[ -n "${u}" ]] || u="$(uuidgen 2>/dev/null | tr 'A-Z' 'a-z')"
+  [[ -n "${u}" ]] || u="$(awk -v s="$(date +%s)$$" 'BEGIN{
+      srand(s); h="0123456789abcdef"; o="";
+      for (i = 0; i < 32; i++) {
+        if (i == 8 || i == 12 || i == 16 || i == 20) o = o "-";
+        # Pin the version and variant nibbles so the result is a well-formed
+        # v4 UUID rather than merely a plausible-looking string.
+        if (i == 12) { o = o "4"; continue }
+        if (i == 16) { o = o substr("89ab", int(rand() * 4) + 1, 1); continue }
+        o = o substr(h, int(rand() * 16) + 1, 1);
+      }
+      print o }')"
+  printf '{%s}' "${u}"
+}
+
 emit_mlt() {
   local -a st=("${!1}")
   local out="${DEMO_EXEC_OUT}" i have=0 alen prev=0 gap
@@ -720,6 +744,16 @@ emit_mlt() {
       'BEGIN{e=a+l; printf "%.3f", (e>t ? e : t)}')"
   done
 
+  # Kdenlive 24.04 and later model a timeline as a *sequence*: a tractor whose
+  # id is a UUID, which is itself a clip in the project bin. A plain MLT tractor
+  # is not one, and Kdenlive rejects it with "found an invalid sequence clip in
+  # bin". So the UUID is not decoration — it is the identity the bin entry, the
+  # document properties and the project tractor all agree on.
+  local uuid
+  uuid="$(gen_uuid)"
+  local tframes
+  tframes="$(awk -v t="${total}" -v f="${DEMO_EXEC_FPS}" 'BEGIN{printf "%d", t*f + 0.5}')"
+
   {
     printf '<?xml version="1.0" encoding="utf-8"?>\n'
     # No profile="..." attribute: that names a profile *file* for MLT to look up
@@ -731,17 +765,49 @@ emit_mlt() {
     printf ' display_aspect_den="9" frame_rate_num="%s" frame_rate_den="1" colorspace="709"/>\n' \
       "${DEMO_EXEC_FPS}"
 
-    # Kdenlive puts a black background under every timeline and assumes track 0
-    # is it. Without one the document loads, but the video tracks sit on nothing.
-    printf '  <producer id="black_track" in="00:00:00.000" out="%s">\n' "$(hms "${total}")"
-    printf '    <property name="length">%s</property>\n' "$(hms "${total}")"
+    # Track 0 of every Kdenlive timeline is a black background. Note the id is
+    # producer0 and the *property* is what marks it as the black track — that is
+    # the way Kdenlive writes it, and it is the way it expects to read it back.
+    printf '  <producer id="producer0" in="00:00:00.000" out="%s">\n' "$(hms "${total}")"
+    printf '    <property name="length">2147483647</property>\n'
     printf '    <property name="eof">continue</property>\n'
     printf '    <property name="resource">black</property>\n'
     printf '    <property name="aspect_ratio">1</property>\n'
     printf '    <property name="mlt_service">color</property>\n'
+    printf '    <property name="kdenlive:playlistid">black_track</property>\n'
     printf '    <property name="mlt_image_format">rgba</property>\n'
     printf '    <property name="set.test_audio">0</property>\n'
     printf '  </producer>\n'
+
+    # A track is a tractor over a pair of playlists — the pair is what lets a
+    # clip cross-fade with its own neighbour on the same track.
+    printf '  <playlist id="playlist0">\n'
+    printf '    <property name="kdenlive:audio_track">1</property>\n'
+    prev=0
+    for ((i = 0; i < N; i++)); do
+      [[ -s "${out}/tts/${SEG_ID[i]}.mp3" ]] || continue
+      gap="$(awk -v a="${st[i]}" -v b="${prev}" 'BEGIN{d=a-b; if (d < 0.001) d=0; printf "%.3f", d}')"
+      awk -v g="${gap}" 'BEGIN{ exit !(g > 0.001) }' \
+        && printf '    <blank length="%s"/>\n' "$(hms "${gap}")"
+      alen="$(mp3_seconds "${out}/tts/${SEG_ID[i]}.mp3")"
+      printf '    <entry producer="vo%02d" in="00:00:00.000" out="%s"/>\n' "${i}" "$(hms "${alen}")"
+      prev="$(awk -v a="${st[i]}" -v l="${alen}" 'BEGIN{printf "%.3f", a+l}')"
+    done
+    printf '  </playlist>\n'
+    printf '  <playlist id="playlist1">\n'
+    printf '    <property name="kdenlive:audio_track">1</property>\n'
+    printf '  </playlist>\n'
+
+    printf '  <tractor id="tractor0" in="00:00:00.000">\n'
+    printf '    <property name="kdenlive:audio_track">1</property>\n'
+    printf '    <property name="kdenlive:trackheight">67</property>\n'
+    printf '    <property name="kdenlive:timeline_active">1</property>\n'
+    printf '    <property name="kdenlive:collapsed">0</property>\n'
+    printf '    <property name="kdenlive:thumbs_format"/>\n'
+    printf '    <property name="kdenlive:audio_rec"/>\n'
+    printf '    <track hide="video" producer="playlist0"/>\n'
+    printf '    <track hide="video" producer="playlist1"/>\n'
+    printf '  </tractor>\n'
 
     for ((i = 0; i < N; i++)); do
       [[ -s "${out}/tts/${SEG_ID[i]}.mp3" ]] || continue
@@ -759,52 +825,74 @@ emit_mlt() {
       printf '    <property name="resource">%s/tts/%s.mp3</property>\n' "${root}" "${SEG_ID[i]}"
       printf '    <property name="mlt_service">avformat</property>\n'
       printf '    <property name="kdenlive:clipname">%s</property>\n' "${SEG_ID[i]}"
-      # Bin ids have to be unique and are 1-based with 1 reserved, so start at 2.
-      printf '    <property name="kdenlive:id">%d</property>\n' "$((i + 2))"
+      printf '    <property name="kdenlive:duration">%s</property>\n' "$(hms "${alen}")"
+      # Bin ids have to be unique. 1 is reserved and 2 is the sequence, so the
+      # narration clips start at 3.
+      printf '    <property name="kdenlive:id">%d</property>\n' "$((i + 3))"
+      printf '    <property name="kdenlive:clip_type">0</property>\n'
+      printf '    <property name="kdenlive:folderid">-1</property>\n'
       printf '  </producer>\n'
     done
 
-    # The project bin. This is also where Kdenlive keeps the document version it
-    # complains about not being able to read when it is missing.
-    printf '  <playlist id="main_bin">\n'
-    printf '    <property name="kdenlive:docproperties.version">1.1</property>\n'
-    printf '    <property name="kdenlive:docproperties.profile">demo-exec</property>\n'
-    printf '    <property name="kdenlive:docproperties.decimalPoint">.</property>\n'
-    printf '    <property name="xml_retain">1</property>\n'
-    for ((i = 0; i < N; i++)); do
-      [[ -s "${out}/tts/${SEG_ID[i]}.mp3" ]] || continue
-      alen="$(mp3_seconds "${out}/tts/${SEG_ID[i]}.mp3")"
-      printf '    <entry producer="vo%02d" in="00:00:00.000" out="%s"/>\n' "${i}" "$(hms "${alen}")"
-    done
-    printf '  </playlist>\n'
-
-    printf '  <playlist id="playlist_vo">\n'
-    prev=0
-    for ((i = 0; i < N; i++)); do
-      [[ -s "${out}/tts/${SEG_ID[i]}.mp3" ]] || continue
-      gap="$(awk -v a="${st[i]}" -v b="${prev}" 'BEGIN{d=a-b; if (d < 0.001) d=0; printf "%.3f", d}')"
-      awk -v g="${gap}" 'BEGIN{ exit !(g > 0.001) }' \
-        && printf '    <blank length="%s"/>\n' "$(hms "${gap}")"
-      alen="$(mp3_seconds "${out}/tts/${SEG_ID[i]}.mp3")"
-      printf '    <entry producer="vo%02d" in="00:00:00.000" out="%s"/>\n' "${i}" "$(hms "${alen}")"
-      prev="$(awk -v a="${st[i]}" -v l="${alen}" 'BEGIN{printf "%.3f", a+l}')"
-    done
-    printf '  </playlist>\n'
-    # Second playlist of the pair: a Kdenlive track is a tractor over two
-    # playlists, so that a clip can cross-fade with its own neighbour.
-    printf '  <playlist id="playlist_vo_b"/>\n'
-
-    printf '  <tractor id="tractor_vo" in="00:00:00.000" out="%s">\n' "$(hms "${total}")"
-    printf '    <property name="kdenlive:audio_track">1</property>\n'
-    printf '    <property name="kdenlive:trackName">narration</property>\n'
-    printf '    <track hide="video" producer="playlist_vo"/>\n'
-    printf '    <track hide="video" producer="playlist_vo_b"/>\n'
+    # The sequence: the timeline itself, and simultaneously a clip in the bin.
+    printf '  <tractor id="%s" in="00:00:00.000" out="%s">\n' "${uuid}" "$(hms "${total}")"
+    printf '    <property name="kdenlive:uuid">%s</property>\n' "${uuid}"
+    printf '    <property name="kdenlive:clipname">narration</property>\n'
+    printf '    <property name="kdenlive:sequenceproperties.hasAudio">1</property>\n'
+    printf '    <property name="kdenlive:sequenceproperties.hasVideo">0</property>\n'
+    printf '    <property name="kdenlive:sequenceproperties.activeTrack">1</property>\n'
+    printf '    <property name="kdenlive:sequenceproperties.tracksCount">1</property>\n'
+    printf '    <property name="kdenlive:sequenceproperties.tracks">1</property>\n'
+    printf '    <property name="kdenlive:sequenceproperties.audioTarget">1</property>\n'
+    printf '    <property name="kdenlive:sequenceproperties.documentuuid">%s</property>\n' "${uuid}"
+    printf '    <property name="kdenlive:control_uuid">%s</property>\n' "${uuid}"
+    printf '    <property name="kdenlive:duration">%s</property>\n' "$(hms "${total}")"
+    printf '    <property name="kdenlive:maxduration">%s</property>\n' "${tframes}"
+    # 17 is the producer type Kdenlive uses for a sequence clip.
+    printf '    <property name="kdenlive:producer_type">17</property>\n'
+    printf '    <property name="kdenlive:id">2</property>\n'
+    printf '    <property name="kdenlive:clip_type">0</property>\n'
+    printf '    <property name="kdenlive:file_size">0</property>\n'
+    printf '    <property name="kdenlive:folderid">-1</property>\n'
+    printf '    <track producer="producer0"/>\n'
+    printf '    <track producer="tractor0"/>\n'
+    # Every audio track is summed into the master by an always-active mix.
+    # Kdenlive marks these internal_added so it knows they are not user edits.
+    printf '    <transition id="transition0">\n'
+    printf '      <property name="a_track">0</property>\n'
+    printf '      <property name="b_track">1</property>\n'
+    printf '      <property name="mlt_service">mix</property>\n'
+    printf '      <property name="kdenlive_id">mix</property>\n'
+    printf '      <property name="internal_added">237</property>\n'
+    printf '      <property name="always_active">1</property>\n'
+    printf '      <property name="accepts_blanks">1</property>\n'
+    printf '      <property name="sum">1</property>\n'
+    printf '    </transition>\n'
     printf '  </tractor>\n'
 
-    printf '  <tractor id="maintractor" in="00:00:00.000" out="%s">\n' "$(hms "${total}")"
+    # The project bin. This is also where the document version lives — its
+    # absence is what Kdenlive means by "version of the project file cannot be
+    # read".
+    printf '  <playlist id="main_bin">\n'
+    printf '    <property name="kdenlive:docproperties.version">1.1</property>\n'
+    printf '    <property name="kdenlive:docproperties.kdenliveversion">24.02.0</property>\n'
+    printf '    <property name="kdenlive:docproperties.uuid">%s</property>\n' "${uuid}"
+    printf '    <property name="kdenlive:docproperties.activetimeline">%s</property>\n' "${uuid}"
+    printf '    <property name="kdenlive:docproperties.audioChannels">2</property>\n'
+    printf '    <property name="kdenlive:docproperties.decimalPoint">.</property>\n'
+    printf '    <property name="kdenlive:docproperties.profile">demo-exec</property>\n'
+    printf '    <property name="xml_retain">1</property>\n'
+    printf '    <entry producer="%s" in="00:00:00.000" out="00:00:00.000"/>\n' "${uuid}"
+    for ((i = 0; i < N; i++)); do
+      [[ -s "${out}/tts/${SEG_ID[i]}.mp3" ]] || continue
+      alen="$(mp3_seconds "${out}/tts/${SEG_ID[i]}.mp3")"
+      printf '    <entry producer="vo%02d" in="00:00:00.000" out="%s"/>\n' "${i}" "$(hms "${alen}")"
+    done
+    printf '  </playlist>\n'
+
+    printf '  <tractor id="tractor_project" in="00:00:00.000" out="%s">\n' "$(hms "${total}")"
     printf '    <property name="kdenlive:projectTractor">1</property>\n'
-    printf '    <track producer="black_track"/>\n'
-    printf '    <track producer="tractor_vo"/>\n'
+    printf '    <track producer="%s" in="00:00:00.000" out="%s"/>\n' "${uuid}" "$(hms "${total}")"
     printf '  </tractor>\n'
     printf '</mlt>\n'
   } > "${out}/demo-exec.kdenlive"
