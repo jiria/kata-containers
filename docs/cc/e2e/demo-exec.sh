@@ -381,7 +381,6 @@ slate() {
   printf '\n\n%s%s  %s  %s%s\n' "${c_bld}${c_blu}" "$(printf '%.0s─' {1..72})" "${SEG_ID[i]}" \
     "${SEG_MOMENT[i]}" "${c_off}"
   printf '  %s%s%s\n' "${c_dim}" "${SEG_SHOT[i]}" "${c_off}"
-  printf '  %s“%s”%s\n' "${c_grn}" "${SEG_VO[i]}" "${c_off}"
   printf '%s%s%s\n' "${c_bld}${c_blu}" "$(printf '%.0s─' {1..72})" "${c_off}"
 }
 
@@ -390,6 +389,11 @@ conduct() {
   reset_stage
   printf '%s\n' "${c_ylw}start your screen recording now, and keep the track B inset in shot.${c_off}"
   printf '%s\n' "${c_ylw}(./demo-exec.sh --inset prints the inset command)${c_off}"
+  # The narration is deliberately not shown here. It is voice-over, added in
+  # post, and anything on this screen is inside the capture — printing it puts
+  # the words on the footage they are meant to be spoken over. Read it in
+  # shotlist.md or voiceover.txt, on a second screen, outside the frame.
+  printf '%s\n' "${c_dim}(narration is not printed — it is in shotlist.md, off-camera)${c_off}"
   [[ "${AUTO}" = "1" ]] || read -r -p "press Enter when recording ..." _
   t0="$(date +%s.%N)"
 
@@ -407,7 +411,13 @@ conduct() {
         esac
         ;;
       *)
-        printf '\n%s%s@%s%s:%s%s%s$ %s\n' "${c_grn}" "$(whoami)" "$(hostname -s 2>/dev/null || echo host)" \
+        # Clear first: everything above this point — the slate, the previous
+        # segment's output, the prompt — is for the operator, and all of it is
+        # inside the capture. A segment the editor can cut cleanly is one whose
+        # footage starts at the top of an empty screen.
+        [[ "${AUTO}" = "1" ]] || read -r -p "  press Enter to run ${SEG_ID[i]} ..." _
+        clear
+        printf '%s%s@%s%s:%s%s%s$ %s\n' "${c_grn}" "$(whoami)" "$(hostname -s 2>/dev/null || echo host)" \
           "${c_off}" "${c_blu}" "${PWD/#${HOME}/\~}" "${c_off}" "${SEG_CMD[i]}"
         bash -c "${SEG_CMD[i]}" 2>&1 || true
         ;;
@@ -434,11 +444,16 @@ emit() {
   done
 
   # Timings, best source first:
-  #   1. a conducted run  — real on-screen time, the only thing that reflects
-  #                         how long the machine actually took.
-  #   2. synthesized audio — real spoken time. Once the mp3s exist, the word
-  #                         count is a worse estimate of its own narration than
-  #                         the narration is, so never prefer it over the audio.
+  #   1. synthesized audio — real spoken time. The narration is the master
+  #                         clock: narration-full.mp3 is always concatenated at
+  #                         a fixed gap, so markers and subtitles measured from
+  #                         anything else disagree with the track the editor
+  #                         lays under them.
+  #   2. a conducted run  — real on-screen time. Tells you how long the machine
+  #                         took, which is worth knowing, but it is not the
+  #                         timeline: it includes the operator, and with a
+  #                         press-Enter-to-run prompt it includes them reading.
+  #                         Used only when no audio exists.
   #   3. word count       — the plan, before either exists.
   local -a st en
   local cur=0 have_audio=1
@@ -453,7 +468,7 @@ emit() {
   # it rather than trusting the nominal value.
   [[ -s "${out}/tts/_gap.mp3" ]] && SEG_GAP_S="$(mp3_seconds "${out}/tts/_gap.mp3")"
 
-  if [[ ${#STARTS[@]} -eq ${N} ]]; then
+  if [[ ${#STARTS[@]} -eq ${N} && "${have_audio}" != "1" ]]; then
     TIMING_BASIS="measured from a conducted run"; st=("${STARTS[@]}"); en=("${ENDS[@]}")
   else
     for ((i = 0; i < N; i++)); do
