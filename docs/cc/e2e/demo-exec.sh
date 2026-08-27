@@ -73,6 +73,10 @@
 #   ./demo-exec.sh --run --auto     same without waiting for Enter.
 #   ./demo-exec.sh --tts            synthesize the narration with Azure Speech.
 #   ./demo-exec.sh --inset          print the track B command and exit.
+#   ./demo-exec.sh --reset          clear the demo's pods and events, and exit.
+#                                   Run before each take: the inset shows the
+#                                   last few events, so a take otherwise opens
+#                                   on the previous one's.
 #
 # NARRATION AUDIO
 #
@@ -138,6 +142,7 @@ while [[ $# -gt 0 ]]; do
     --voice) shift; SPEECH_VOICE="$1"; TTS=1 ;;
     --rate)  shift; SPEECH_RATE="$1";  TTS=1 ;;
     --inset) INSET_ONLY=1 ;;
+    --reset) RESET_ONLY=1 ;;
     # Print the header block itself, so help cannot drift out of step with the
     # documentation the way a hard-coded line range does.
     -h|--help)
@@ -172,6 +177,32 @@ EOF
 if [[ "${INSET_ONLY:-0}" = "1" ]]; then
   printf '%s# track B — run this in a second terminal, keep it in shot%s\n\n' "${c_dim}" "${c_off}"
   inset_command
+  exit 0
+fi
+
+# ------------------------------------------------------------- stage reset
+# Track B shows the last few events in the namespace, and Kubernetes keeps
+# events for an hour by default. So the inset opens on whatever ran last —
+# typically `Killing demo-prep` from the warm-up — and an audience has no way to
+# know that is not part of the demo. Clearing the namespace before a take makes
+# the first thing they see belong to the take.
+#
+# Scoped to the demo's own pods and its own namespace: this runs on a cluster
+# someone may be using for something else, and a recording aid has no business
+# deleting anything it did not create.
+NS="${E2E_NS:-coco-e2e}"
+
+reset_stage() {
+  kubectl get ns "${NS}" >/dev/null 2>&1 || return 0
+  kubectl delete pod -n "${NS}" -l demo=parma --ignore-not-found >/dev/null 2>&1 || true
+  kubectl delete pod -n "${NS}" demo-frag-sidecar demo-prep \
+    --ignore-not-found >/dev/null 2>&1 || true
+  kubectl delete events -n "${NS}" --all >/dev/null 2>&1 || true
+  printf '%sstage reset: %s has no demo pods and no events%s\n' "${c_dim}" "${NS}" "${c_off}"
+}
+
+if [[ "${RESET_ONLY:-0}" = "1" ]]; then
+  reset_stage
   exit 0
 fi
 
@@ -356,6 +387,7 @@ slate() {
 
 conduct() {
   local t0 i
+  reset_stage
   printf '%s\n' "${c_ylw}start your screen recording now, and keep the track B inset in shot.${c_off}"
   printf '%s\n' "${c_ylw}(./demo-exec.sh --inset prints the inset command)${c_off}"
   [[ "${AUTO}" = "1" ]] || read -r -p "press Enter when recording ..." _
@@ -516,6 +548,11 @@ emit_recording_plan() {
     printf '3. Start the track B inset and keep it in shot: `./demo-exec.sh --inset`.\n'
     printf '4. Set the terminal to the capture size you will keep for every take. Takes\n'
     printf '   recorded at different sizes cannot be intercut cleanly.\n\n'
+    printf '## Between takes\n\n'
+    printf 'Run `./demo-exec.sh --reset` before each one. The inset shows the last few\n'
+    printf 'events in the namespace and Kubernetes keeps them for an hour, so a take that\n'
+    printf 'starts without it opens on the previous take'"'"'s events — or on `Killing\n'
+    printf 'demo-prep` from the warm-up. `--run` does this for you; takes 3 to 5 do not.\n\n'
     printf '## Takes\n\n'
     printf 'Takes are numbered in the order their first shot appears in the cut, not in a\n'
     printf 'required order — each is an independent recording, so capture them in whatever\n'
