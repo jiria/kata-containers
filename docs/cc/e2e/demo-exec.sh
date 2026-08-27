@@ -205,8 +205,8 @@ segment() {
 
 # ---- open -------------------------------------------------------------------
 segment S01 "open" "title card — no terminal" none '' <<'VO'
-This is Kata Confidential Containers, the open-source stack behind confidential containers on
-A-K-S. A workload runs in its own hardware-isolated VM, governed by one
+We've enhanced the upstream Kata Confidential Containers stack to make it ready for Manifold's
+scenarios. A workload runs in its own hardware-isolated VM, governed by one
 document: a policy measured into the hardware report at launch. Every layer, every
 mount, every container has to match what that document declared, for the whole life of
 the workload. Let me walk the chain.
