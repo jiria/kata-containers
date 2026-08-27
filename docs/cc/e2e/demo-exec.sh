@@ -187,16 +187,25 @@ c_grn=$'\033[32m'; c_ylw=$'\033[33m'; c_dim=$'\033[2m'
 # nothing else can still see the refusals land. In the spec, the keys the demo
 # is actually about are the only thing highlighted; everything else is keys in
 # cyan against plain values, which is legibility rather than meaning.
+#
+# Each pane is labelled, because on a recording nobody can ask what they are
+# looking at. The label says what the pane is and, where it matters, whose
+# account it is: the events are the kubelet's, from outside the guest, which is
+# the whole point of showing them next to a refusal decided inside it.
 inset_command() {
   cat <<'EOF'
 watch -n1 --color -t '
   e=$(printf "\033"); R="${e}[0m"; G="${e}[32m"; Y="${e}[33m"; C="${e}[36m"
-  RD="${e}[31m"; B="${e}[1m"
+  RD="${e}[31m"; B="${e}[1m"; D="${e}[2m"
+  printf "%sPODS%s %sconfidential sandboxes in coco-e2e - phase and readiness%s\n" \
+    "${B}${C}" "${R}" "${D}" "${R}"
   kubectl get pods -n coco-e2e --no-headers 2>/dev/null | head -6 \
     | sed -E -e "s/(Running|Completed)/${G}\1${R}/" \
              -e "s/(Pending|ContainerCreating|PodInitializing|Terminating)/${Y}\1${R}/" \
              -e "s/(Error|CrashLoopBackOff|StartError|Failed|ImagePullBackOff)/${RD}\1${R}/"
   echo
+  printf "%sEVENTS%s %swhat the kubelet reports, newest last - from outside the guest%s\n" \
+    "${B}${C}" "${R}" "${D}" "${R}"
   kubectl get events -n coco-e2e --sort-by=.lastTimestamp \
     -o custom-columns=REASON:.reason,OBJECT:.involvedObject.name,CONTAINER:.involvedObject.fieldPath \
     --no-headers 2>/dev/null \
@@ -206,6 +215,8 @@ watch -n1 --color -t '
              -e "s/^(Pulling|Provisioning|Resizing)/${Y}\1${R}/"
   echo
   p=$(kubectl get pods -n coco-e2e -o name 2>/dev/null | grep -v demo-prep | head -1)
+  if [ -n "$p" ]; then h="${p#pod/} - what the host was asked to run"; else h="no demo pod yet"; fi
+  printf "%sSPEC%s %s%s%s\n" "${B}${C}" "${R}" "${D}" "${h}" "${R}"
   [ -n "$p" ] && kubectl get -n coco-e2e "$p" -o yaml 2>/dev/null | cut -c1-110 \
     | sed -E -e "s@(io\.katacontainers\.[A-Za-z0-9_.]*|cc_init_data|policy_fragments)@${B}${Y}\1${R}@" \
              -e "s@^([[:space:]]*)([A-Za-z0-9_./-]+):@\1${C}\2${R}:@"'
