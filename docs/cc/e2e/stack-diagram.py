@@ -671,12 +671,10 @@ def build_fragment():
 
     s.line(BOUND, ZY - 66, BOUND, ZY + ZH + 30, stroke=TRUSTED, width=4,
            opacity=0.6)
-    # At the top of the line, not the bottom: the delivery arc below crosses the
-    # boundary down there, and the two would overprint.
     s.add('<text x="%d" y="%d" transform="rotate(-90 %d %d)" font-family="'
           "'Segoe UI', Arial, sans-serif\" font-size=\"16\" fill=\"%s\" "
           'text-anchor="middle" letter-spacing="2" opacity="0.8">%s</text>'
-          % (BOUND + 6, ZY + 20, BOUND + 6, ZY + 20, TRUSTED,
+          % (BOUND + 6, ZY + ZH + 140, BOUND + 6, ZY + ZH + 140, TRUSTED,
              "HARDWARE BOUNDARY"))
 
     BY, BH, BW = ZY + 60, 300, 380
@@ -726,28 +724,6 @@ def build_fragment():
         s.line(xs[i] + BW + 12, BY + BH / 2, xs[i + 1] - 12, BY + BH / 2,
                stroke=col, width=3,
                marker={INK: "a-ink", DOC: "a-doc", WARM: "a-warm"}[col])
-
-    # The delivery itself, which the row of cards does not show: the host hands
-    # the fragment across the boundary while the pod is running, and can do it
-    # again with a newer one. Drawn in the host's colour and dashed, because it
-    # is the one act the host performs here -- it carries the bytes in, and the
-    # checks above decide what happens to them. It lands where the first check
-    # is, not further along: a fragment handed in later is still checked from
-    # the beginning, and an arrow reaching past those cards would say otherwise.
-    AY = BY + BH + 140
-    s.path("M %d %d C %d %d, %d %d, %d %d L %d %d C %d %d, %d %d, %d %d"
-           % (xs[0] + BW / 2, BY + BH + 8,
-              xs[0] + BW / 2, AY - 20, xs[0] + BW / 2 + 50, AY, 430, AY,
-              620, AY,
-              680, AY, 700, AY - 20, 700, ZY + ZH + 10),
-           stroke=UNTRUSTED, width=3, dash="8 6", marker="a-bad")
-    s.text(870, AY + 44,
-           "the host can hand one in while the pod runs, and hand in a newer "
-           "one later",
-           size=21, fill=UNTRUSTED, anchor="middle")
-    s.text(870, AY + 76,
-           "the policy is extended without redeploying the pod",
-           size=21, fill=DIM, anchor="middle")
 
     s.text(64, H - 76,
            "The host can deliver a fragment. It cannot make the guest accept "
