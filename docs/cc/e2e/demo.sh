@@ -528,24 +528,45 @@ _tamper_run() {
   _prompt "kubectl apply -f ${WORK}/${pod}.yaml"
   kubectl apply -f "${WORK}/${pod}.yaml" 2>&1 | bash "${_HL}" \
     || die "kubectl apply failed for ${pod}"
-  pause
   log "starting pod ${pod} with the watcher armed (${mode})"
 
-  local i
-  for i in $(seq 1 30); do
-    _TAMPER_PHASE=$(kubectl get pod "${pod}" -n "${NS}" -o jsonpath='{.status.phase}' 2>/dev/null)
-    [[ "${_TAMPER_PHASE}" = "Running" ]] && break
-    # A refused sandbox shows up as a kubelet retry, which is the signal the
-    # guest declined — there is no message from inside the guest to wait for.
-    # Only ever believe that once the watcher says it rewrote something: an
-    # untampered pod that is merely slow to boot looks identical otherwise.
-    if [[ "${want}" = "refused" ]] \
-       && grep -q 'rewrote the initdata image' "${logf}" 2>/dev/null \
-       && _tamper_events "${pod}" | grep -q .; then
-      break
-    fi
-    sleep 5
-  done
+  # The boot takes a minute or so, and nothing was on screen for any of it —
+  # the narration described a substitution while the capture showed a finished
+  # command and a cursor. The watcher writes what it did as it does it, so
+  # follow that log through the wait: the rewrite, and the two digests that no
+  # longer agree, appear while the sandbox is still coming up.
+  #
+  # The poll runs in the background so the follow can hold the screen; tail
+  # exits on its own when the watcher does, and the watcher is killed as soon as
+  # the verdict is in. `--pid` rather than a kill from here: a tail left writing
+  # to the terminal after the shot has moved on corrupts the next one.
+  (
+    tries=0
+    while (( tries < 30 )); do
+      tries=$((tries + 1))
+      [[ "$(kubectl get pod "${pod}" -n "${NS}" -o jsonpath='{.status.phase}' 2>/dev/null)" = Running ]] && break
+      # A refused sandbox shows up as a kubelet retry, which is the signal the
+      # guest declined — there is no message from inside the guest to wait for.
+      # Only ever believe that once the watcher says it rewrote something: an
+      # untampered pod that is merely slow to boot looks identical otherwise.
+      if [[ "${want}" = "refused" ]] \
+         && grep -q 'rewrote the initdata image' "${logf}" 2>/dev/null \
+         && _tamper_events "${pod}" | grep -q .; then
+        break
+      fi
+      sleep 5
+    done
+    sudo pkill -f "initdata-tamper.py --mode ${mode}" >/dev/null 2>&1 || true
+  ) &
+  local poller=$!
+
+  _prompt "tail -f ${logf}"
+  tail -f --pid="${watcher}" "${logf}" 2>/dev/null | bash "${_HL}"
+  wait "${poller}" 2>/dev/null || true
+  # Read back in this shell: the poll ran in a subshell and its copy of the
+  # phase went with it.
+  _TAMPER_PHASE=$(kubectl get pod "${pod}" -n "${NS}" -o jsonpath='{.status.phase}' 2>/dev/null)
+  pause
 
   sudo pkill -f "initdata-tamper.py --mode ${mode}" >/dev/null 2>&1 || true
   wait "${watcher}" 2>/dev/null || true
@@ -579,8 +600,10 @@ live_binding_experiment() {
   # The boot and the rewrite ran under the hold; the evidence for them is the
   # next thing said, so it waits for it.
   cue S12
-  show "the host stamped one policy and served another — same sandbox, one character apart" \
-    "cat ${WORK}/tamper-flip.log"
+  # The watcher's log is no longer shown here: it is followed live through the
+  # boot (see _tamper_run), so by this point the audience has already watched
+  # the rewrite happen and the two digests diverge. Repeating it as a static
+  # screen would be the same evidence twice.
   show "and the pod never ran — this is kubelet's account, from outside the guest" \
     "kubectl get pod ${tpod} -n ${NS} -o custom-columns=NAME:.metadata.name,STATUS:.status.phase --no-headers; kubectl get events -n ${NS} --field-selector involvedObject.name=${tpod} -o custom-columns=REASON:.reason,MESSAGE:.message --no-headers | grep -i sandbox | cut -c1-150"
   if [[ "${_TAMPER_PHASE}" = "Running" ]]; then

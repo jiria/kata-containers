@@ -12,7 +12,10 @@
 # screen agree: COLOUR CARRIES THE VERDICT.
 #
 #   green    it worked / it was allowed / it is running
-#   red      it was refused, and by whom — this is the demo's punchline
+#   red      it was refused, and by whom — this is the demo's punchline. The
+#            bare words `true` and `false` are in these two lists for the same
+#            reason: in a Rego policy they *are* the verdict, and the shot of
+#            the default rules is a screen of nothing else.
 #   yellow   still happening; nothing has been decided yet
 #   bold     the identifiers the whole argument is about: digests, dm-verity
 #            root hashes, the measured-policy keys
@@ -50,7 +53,7 @@ G="${e}[32m"; RD="${e}[31m"; Y="${e}[33m"; C="${e}[36m"
 # already wrapped in escapes, which no longer match a word-boundary rule.
 exec sed -u -E \
   -e "s/(is blocked by policy[^,]*|CreateContainerRequest is blocked[^ ]*)/${B}${RD}\1${R}/g" \
-  -e "s/\b(denied|Denied|DENIED|refused|Refused|rejected|Rejected|StartError|CrashLoopBackOff|ImagePullBackOff|CreateContainerError|Unhealthy|mismatch|MISMATCH|FailedCreatePodSandBox|Failed|Error|error)\b/${RD}\1${R}/g" \
+  -e "s/\b(denied|Denied|DENIED|refused|Refused|rejected|Rejected|StartError|CrashLoopBackOff|ImagePullBackOff|CreateContainerError|Unhealthy|mismatch|MISMATCH|FailedCreatePodSandBox|Failed|Error|error|false|DIFFERENT)\b/${RD}\1${R}/g" \
   -e "s/\b(Running|Completed|Succeeded|allowed|Allowed|verified|Verified|match|matches|matched|true)\b/${G}\1${R}/g" \
   -e "s/\b(Pending|ContainerCreating|PodInitializing|Terminating|Waiting|Pulling|creating|starting)\b/${Y}\1${R}/g" \
   -e "s/\b([0-9a-f]{32,})\b/${B}\1${R}/g" \
