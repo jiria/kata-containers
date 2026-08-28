@@ -30,10 +30,15 @@
 # One exception to the first two, and it is deliberate: where several commands
 # make a single argument, they accumulate on one screen and only the wipe is
 # dropped — the pause between them stays, so the editor can still shorten the
-# typing without losing the fact that the outputs belong together. S09 is the
-# case: the pod, the Cloud Hypervisor process serving its VM, and that process's
-# handles on the hypervisor are a chain, and three screens make it three
-# unrelated facts.
+# typing without losing the fact that the outputs belong together. Two cases:
+#
+#   S09  the pod, the Cloud Hypervisor process serving its VM, and that
+#        process's handles on the hypervisor. A chain, threaded by the sandbox
+#        id — three screens make it three unrelated facts.
+#   S10  the digest computed from the document, and the digest the host stamped
+#        into the report. A comparison, and only one screen can hold it.
+#
+# The two groups stay separate from each other: they are different sentences.
 #
 # Timing is not this script's business. Neither are the title cards or the
 # architecture diagrams (stack-*.svg) — those are injected in the edit.
@@ -202,13 +207,20 @@ if want_moment 2; then
   printf '\033[H\033[2J'
   sleep "${DEMO_GAP}"
 
+  # S10 is a comparison: the digest anyone can compute from the document, and
+  # the digest the host stamped into the report. On two screens it is two
+  # base64 strings; on one it is the claim.
   seg S10
   decode_initdata demo-a "${WORK}/a.toml"
   D1="$(initdata_digest_expected "${WORK}/a.toml")"
+  DEMO_KEEP=1
   show "anyone can compute the expected measurement from that document alone" \
     "openssl dgst -sha256 -binary ${WORK}/a.toml | base64"
   show "and that is the value the runtime stamped into the SNP report's HOST_DATA" \
     "sudo journalctl -t kata --since '${T0}' --no-pager | grep -F 'initdata  digest' | tail -1"
+  DEMO_KEEP=0
+  printf '\033[H\033[2J'
+  sleep "${DEMO_GAP}"
   [[ -n "$(initdata_journal_line "${T0}" "${D1}")" ]] \
     || warn "did not find the computed digest in the journal — check 'journalctl -t kata'"
 
