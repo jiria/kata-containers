@@ -68,7 +68,7 @@
 #   S05       stack-before.svg
 #   S12       stack-enforce.svg
 #   S17 S18   stack-fragment.svg
-#   S28 S29   stack-exec.svg + closing title card
+#   S30 S31   stack-exec.svg + closing title card
 #
 # Usage:
 #   ./demo-shots.sh                 every moment, in order (~15 min)
@@ -333,12 +333,12 @@ PYEOF
 fi
 
 # ---------------------------------------------------------------- moment 3
-# S19 - S27 — fragments. A child process, not a sourced helper: this is a whole
+# S19 - S29 — fragments. A child process, not a sourced helper: this is a whole
 # demo with its own fixtures and its own cleanup, and it has to be able to fail
 # without taking the moments already recorded down with it.
 if want_moment 3; then
-  seg S19-S27
-  printf 'S19-S27\t--\tfragments: every beat of demo-fragment-sidecar.sh, one shot each\n' >> "${SHOT_LIST}"
+  seg S19-S29
+  printf 'S19-S29\t--\tfragments: every beat of demo-fragment-sidecar.sh, one shot each\n' >> "${SHOT_LIST}"
   printf '\033[H\033[2J'
   sleep "${DEMO_GAP}"
   # A child process, so its shots cannot be counted here. It keeps the rhythm
