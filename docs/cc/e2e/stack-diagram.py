@@ -84,7 +84,7 @@ class Svg:
             'markerWidth="6" markerHeight="6" orient="auto-start-reverse">'
             '<path d="M 0 0 L 10 5 L 0 10 z" fill="%s"/></marker>' % (n, c)
             for n, c in (("dim", DIM), ("doc", DOC), ("ok", TRUSTED),
-                         ("bad", UNTRUSTED), ("warm", WARM)))
+                         ("bad", UNTRUSTED), ("warm", WARM), ("ink", INK)))
         return ('<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%d" '
                 'viewBox="0 0 %d %d"><defs>%s</defs>'
                 '<rect width="%d" height="%d" fill="%s"/>%s</svg>'
@@ -269,7 +269,7 @@ def build(detail):
     # workload makes is answered on the far side of the boundary.
     ry = ZB + (72 if d else 52)
     s.line(BX + 40, ry, BOUND, ry, stroke=INK, dash="5 6", width=3, opacity=0.85)
-    s.line(BOUND, ry, CX + 24, ry, stroke=TRUSTED, width=4, marker="a-ok")
+    s.line(BOUND, ry, CX + 24, ry, stroke=INK, width=4, marker="a-ink")
     if d:
         s.text(BX + 44, ry - 44,
                "CreateContainerRequest, ExecProcessRequest, …",
@@ -370,12 +370,12 @@ def build_simple():
                    anchor="middle")
 
     ay = PY + 330
-    s.line(HX + HW, ay, GX, ay, stroke=INK, width=4, marker="a-dim", dash="6 7")
+    s.line(HX + HW, ay, GX, ay, stroke=INK, width=4, marker="a-ink", dash="6 7")
     label(ay - 22, "every container request", 24, INK, "600")
     label(ay + 34, "ttRPC over vsock", 21, DIM)
 
     by = PY + 440
-    s.line(GX, by, HX + HW, by, stroke=TRUSTED, width=4, marker="a-ok")
+    s.line(GX, by, HX + HW, by, stroke=INK, width=4, marker="a-ink")
     label(by - 20, "allow / deny", 24, TRUSTED, "700",
           parts=[("allow", TRUSTED), (" / ", DIM), ("deny", UNTRUSTED)])
 
@@ -383,6 +383,83 @@ def build_simple():
            "The host asks. The guest answers — against a document it was "
            "measured with, and the host cannot change.",
            size=24, fill=DIM)
+    return s.render()
+
+
+def build_before():
+    """Before deployment, on its own. Everything the guest will enforce is
+    decided here, on the customer's machine, before the host sees the pod."""
+    s = Svg()
+
+    s.text(64, 62, "Before deployment", size=38, weight="600")
+    s.text(64, 102,
+           "the rules are derived from the pod spec — nothing is written by hand",
+           size=24, fill=DIM)
+
+    ZX, ZY, ZW, ZH = 70, 300, 1780, 420
+    s.box(ZX, ZY, ZW, ZH, stroke=DOC, dash="6 8", rx=16, opacity=0.4)
+    s.text(ZX + 24, ZY - 42, "THE CUSTOMER'S MACHINE", size=22, fill=DOC,
+           weight="700", spacing=2)
+    s.text(ZX + 24, ZY - 14, "before the host has seen anything", size=20,
+           fill=DIM)
+
+    BY, BH, BW = ZY + 60, 300, 380
+    xs = [110, 550, 990, 1430]
+
+    def card(x, title, lines, accent, fill=None, mono_from=99, mono_to=99,
+             ts=29):
+        s.box(x, BY, BW, BH, stroke=accent, fill=fill or "none", rx=10,
+              opacity=1 if fill else 0.9)
+        s.text(x + 26, BY + 56, title, size=ts, weight="600")
+        for i, ln in enumerate(lines):
+            s.text(x + 26, BY + 108 + 34 * i, ln, size=21, fill=DIM,
+                   mono=(mono_from <= i <= mono_to))
+
+    card(xs[0], "the pod spec",
+         ["the workload as written",
+          "image · command · mounts",
+          "",
+          "runtimeClassName: kata-cc"],
+         LINE, mono_from=3, mono_to=3)
+
+    card(xs[1], "genpolicy",
+         ["reads that exact spec",
+          "and derives the rules",
+          "",
+          "no hand-written policy"],
+         DOC)
+
+    card(xs[2], "the measured document",
+         ["policy.rego",
+          "fragment-issuers.toml",
+          "aa.toml · cdh.toml",
+          "",
+          "one annotation on the pod"],
+         DOC, fill="#0d2136", mono_from=0, mono_to=2, ts=27)
+
+    card(xs[3], "its sha256",
+         ["the digest of that document,",
+          "stamped into the hardware",
+          "when the guest launches",
+          "",
+          "nothing else is trusted"],
+         WARM)
+    # the digest is the only thing that leaves this stage as a fact
+    s.text(xs[3] + 26, BY + 108 + 34 * 4, "", size=21)
+
+    for i in range(3):
+        x1 = xs[i] + BW
+        s.line(x1 + 12, BY + BH / 2, xs[i + 1] - 12, BY + BH / 2,
+               stroke=DOC if i < 2 else WARM, width=3,
+               marker="a-doc" if i < 2 else "a-warm")
+
+    s.text(64, H - 76,
+           "Every rule the guest will enforce is decided here — and every request "
+           "starts denied, so the generated rules turn on only what this pod needs.",
+           size=23, fill=DIM)
+    s.text(64, H - 40,
+           "The host never contributes to this document. It only carries it.",
+           size=23, fill=WARM)
     return s.render()
 
 
@@ -396,4 +473,7 @@ if __name__ == "__main__":
         print("wrote", p)
     p = "%s\\stack-simple.svg" % a.out
     open(p, "w", encoding="utf-8", newline="\n").write(build_simple())
+    print("wrote", p)
+    p = "%s\\stack-before.svg" % a.out
+    open(p, "w", encoding="utf-8", newline="\n").write(build_before())
     print("wrote", p)

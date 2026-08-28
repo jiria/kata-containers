@@ -4,6 +4,7 @@
 
 | file | for |
 | --- | --- |
+| `stack-before.svg` | before deployment on its own — pod spec → genpolicy → the measured document → its digest |
 | `stack-simple.svg` | the high-level card — names and boxes only: the host stack, the guest, the boundary, and the one call that crosses it |
 | `stack-exec.svg` | the executive cut's opening — few boxes, large type, readable in the seconds a title card gets |
 | `stack-detail.svg` | the same structure as the exec card with the identifiers, for the doc and for engineers who ask |
@@ -14,10 +15,11 @@ Regenerate rather than editing the SVG:
 python stack-diagram.py --out .
 ```
 
-The palette is the demo's terminal palette on purpose, so the card cuts against
-the footage instead of flashing white in the middle of it: red is the host and
-untrusted, green is measured and inside the boundary, blue is the measured
-document, amber is its digest.
+Colour carries meaning and is used consistently: red is the host and untrusted,
+green is measured and inside the boundary, blue is the measured document, amber
+is its digest. Because green means "inside the boundary" rather than "yes", the
+request and answer arrows are white and only the words `allow` / `deny` carry
+the verdict — `deny` in the same red the footage shows refusals in.
 
 ## Why the shape is what it is
 
