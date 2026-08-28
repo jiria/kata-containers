@@ -485,12 +485,14 @@ def build_launch():
            spacing=2)
     s.text(1014, ZY - 14, "and cannot reach past this line", size=20, fill=DIM)
 
-    s.line(BOUND, ZY - 66, BOUND, ZY + ZH + 40, stroke=TRUSTED, width=4,
+    # The label goes below the line, on its axis: the gutter between the two
+    # zones is too narrow to hold rotated text without touching a border.
+    s.line(BOUND, ZY - 66, BOUND, ZY + ZH + 30, stroke=TRUSTED, width=4,
            opacity=0.6)
     s.add('<text x="%d" y="%d" transform="rotate(-90 %d %d)" font-family="'
-          "'Segoe UI', Arial, sans-serif\" font-size=\"18\" fill=\"%s\" "
-          'text-anchor="middle" letter-spacing="4" opacity="0.8">%s</text>'
-          % (BOUND - 24, ZY + ZH + 4, BOUND - 24, ZY + ZH + 4, TRUSTED,
+          "'Segoe UI', Arial, sans-serif\" font-size=\"16\" fill=\"%s\" "
+          'text-anchor="middle" letter-spacing="2" opacity="0.8">%s</text>'
+          % (BOUND + 6, ZY + ZH + 140, BOUND + 6, ZY + ZH + 140, TRUSTED,
              "HARDWARE BOUNDARY"))
 
     BY, BH, BW = ZY + 60, 300, 380
