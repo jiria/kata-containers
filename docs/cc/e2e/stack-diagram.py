@@ -212,8 +212,9 @@ def build(detail):
            % (BX + BW, ZY + 124, BX + BW + 90, ZY + 124,
               CM - 110, ZY + 160, CM, ZY + 160),
            stroke=DOC, width=3, marker="a-doc")
-    s.text(LX, ZY + 96, "the document", size=17, fill=DOC)
-    s.text(LX, ZY + 118, "byte for byte", size=17, fill=DOC)
+    s.text(LX, ZY + 60, "the base document", size=17, fill=DOC)
+    s.text(LX, ZY + 82, "byte for byte", size=17, fill=DOC)
+    s.text(LX, ZY + 104, "and, later, fragments", size=17, fill=DOC)
 
     s.path("M %d %d C %d %d %d %d %d %d"
            % (BX + BW, ZY + 464, BX + BW + 90, ZY + 464,
@@ -255,7 +256,8 @@ def build(detail):
                "SRM: two-phase commit, fragment store, SVN floor"]),
              mono_from=99, accent=TRUSTED)
 
-    unit(s, x, y + 20, w, "and it can be extended without redeploying",
+    y4 = y + 20
+    unit(s, x, y4, w, "and it can be extended without redeploying",
          (["a signed rule, from an issuer the measured policy already",
            "named, at or above the version floor it set"]
           if not d else
@@ -263,6 +265,19 @@ def build(detail):
            "host-delivered, trusted only on its signature",
            "security-reference-monitor/src/fragments.rs"]),
          mono_from=99 if not d else 2, accent=TRUSTED)
+
+    # The host delivers fragments too, and that was not on the page: both curves
+    # above are launch-time, so the diagram read as though the host hands over
+    # one document and is then done with it. It leaves from the same point as the
+    # base document -- same untrusted path -- but dashed and landing on the last
+    # card, because it arrives later, with the pod already running.
+    FY = ZY + 124
+    FT = y4 + 48
+    s.path("M %d %d C %d %d, %d %d, %d %d C %d %d, %d %d, %d %d"
+           % (BX + BW, FY,
+              1040, FY, 1100, FY + 40, 1100, (FY + FT) / 2,
+              1100, FT - 30, 1105, FT, CM, FT),
+           stroke=DOC, width=3, dash="7 6", marker="a-doc")
 
     # ---- the request path across the boundary --------------------------------
     # This line is the one the audience must not skim: every request the
