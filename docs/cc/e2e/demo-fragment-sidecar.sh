@@ -31,8 +31,8 @@
 #
 # Env:
 #   DEMO_PAUSE=1   wait for Enter between steps (default: run straight through)
-#   DEMO_SETTLE=n  seconds to hold after each command's output when not pausing
-#                  (default: 0.5 under a conductor-driven take, 0 otherwise)
+#   DEMO_SETTLE=n  seconds to hold before each command when not pausing
+#                  (default: 1 under a conductor-driven take, 0 otherwise)
 #   E2E_NS         namespace (default coco-e2e)
 set -euo pipefail
 
@@ -99,7 +99,17 @@ _beat() {
 
 # A real prompt with real output under it, unindented: the evidence should look
 # like what an engineer would see running the command themselves.
+# As in demo.sh: on a conductor-driven take, hold before every command so the
+# previous output stands on its own frame first. Not in `pause` — that misses
+# every beat that does not end by pausing, including the first of the act.
+_settle() {
+  [[ "${DEMO_PAUSE:-0}" != "1" ]] || return 0
+  local s="${DEMO_SETTLE:-${DEMO_CUE_DIR:+1}}"
+  if [[ -n "${s}" && "${s}" != "0" ]]; then sleep "${s}"; fi
+}
+
 _prompt() {
+  _settle
   printf '\n%s%s%s:%s%s%s$ %s\n' \
     "${_c_grn}" "${_HOST_LABEL}" "${_c_off}" \
     "${_c_blu}" "${PWD/#${HOME}/\~}" "${_c_off}" "$*"
@@ -170,14 +180,7 @@ E2E_REPO_DIR="${E2E_REPO_DIR:-${HOME}/kata-containers}"
 MARK="sleep-601-demo-sidecar"
 
 pause() {
-  # Same settle as demo.sh, and for the same reason: on a hands-free take there
-  # is no keypress between beats, so let each output stand on its own for a
-  # moment before the next prompt lands on top of it.
-  if [[ "${DEMO_PAUSE:-0}" != "1" ]]; then
-    local settle="${DEMO_SETTLE:-${DEMO_CUE_DIR:+0.5}}"
-    if [[ -n "${settle}" && "${settle}" != "0" ]]; then sleep "${settle}"; fi
-    return 0
-  fi
+  [[ "${DEMO_PAUSE:-0}" = "1" ]] || return 0
   printf '\n    press Enter to continue '
   read -r _
 }

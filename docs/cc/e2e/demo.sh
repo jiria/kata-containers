@@ -51,10 +51,9 @@
 #
 # Env:
 #   DEMO_PAUSE=1     wait for Enter between beats (default: run straight through)
-#   DEMO_SETTLE=0.5  seconds to hold after each command's output when not
-#                    pausing, so consecutive outputs read as separate beats on a
-#                    recording (default: 0.5 under a conductor-driven take, 0
-#                    otherwise; set 0 to disable)
+#   DEMO_SETTLE=1    seconds to hold before each command, so consecutive outputs
+#                    read as separate beats on a recording (default: 1 under a
+#                    conductor-driven take, 0 otherwise; set 0 to disable)
 #   DEMO_CLEAR=0     keep the screen when paused (default: clear between beats,
 #                    redrawing the act heading; scrollback is preserved)
 #   DEMO_ACTS=0,2    run only these acts (default: 0,1,2,3,4)
@@ -165,21 +164,12 @@ _verity_recover_stray() {
   done < <(sudo find "${SNAP}" -maxdepth 2 -name 'layer.erofs.dmverity.demobak' 2>/dev/null)
 }
 
-# Two ways to hold after a beat. Interactively the keypress is the hold. On a
-# hands-free take there is no keypress, and a command that starts the instant
-# the previous one stopped printing puts two outputs into what reads as a single
-# frame — the eye gets one blurred beat instead of two, and the narration is
-# describing the first while the second is already on screen. So settle: let the
-# output exist on its own for a moment before the next prompt appears.
-#
-# Only on a conductor-driven take (DEMO_CUE_DIR); running the act by hand to
-# check something should stay at full speed. DEMO_SETTLE overrides either way.
+# Two ways to hold after a beat. Interactively the keypress is the hold; on a
+# hands-free take the hold before the next command does the same job, and lives
+# in `_prompt` so it applies to every command rather than only the ones that
+# reach here.
 pause() {
-  if [[ "${DEMO_PAUSE:-0}" != "1" ]]; then
-    local settle="${DEMO_SETTLE:-${DEMO_CUE_DIR:+0.5}}"
-    if [[ -n "${settle}" && "${settle}" != "0" ]]; then sleep "${settle}"; fi
-    return 0
-  fi
+  [[ "${DEMO_PAUSE:-0}" = "1" ]] || return 0
   printf '\n    press Enter to continue '
   read -r _
 }
@@ -238,7 +228,22 @@ _vo() {
 # demo, so it should look like what an engineer would see if they ran the
 # command themselves — same host, same working directory, no indentation and no
 # gutter characters wrapped around it.
+# One second before every command, on a conductor-driven take. Not in `pause`:
+# that only covers beats that end by pausing, and a beat reached some other way
+# (the first of an act, a launch that runs its own wait loop) then starts with
+# the previous output still settling into frame — two commands read as one.
+# Putting it here makes the break a property of running a command at all.
+#
+# Interactive runs already have the keypress; a hand-run act stays at full
+# speed. DEMO_SETTLE overrides either way, and 0 disables it.
+_settle() {
+  [[ "${DEMO_PAUSE:-0}" != "1" ]] || return 0
+  local s="${DEMO_SETTLE:-${DEMO_CUE_DIR:+1}}"
+  if [[ -n "${s}" && "${s}" != "0" ]]; then sleep "${s}"; fi
+}
+
 _prompt() {
+  _settle
   printf '\n%s%s%s:%s%s%s$ %s\n' \
     "${_c_grn}" "${_HOST_LABEL}" "${_c_off}" \
     "${_c_blu}" "${PWD/#${HOME}/\~}" "${_c_off}" "$*"
