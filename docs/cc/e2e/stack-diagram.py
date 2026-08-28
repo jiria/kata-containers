@@ -47,6 +47,16 @@ class Svg:
                  'text-anchor="%s" font-weight="%s" opacity="%s"%s>%s</text>'
                  % (x, y, fam, size, fill, anchor, weight, opacity, ls, esc(s)))
 
+    def text_parts(self, x, y, parts, size=22, anchor="start", weight="normal"):
+        """One text element, differently coloured runs — so allow and deny do
+        not have to share a colour."""
+        spans = "".join('<tspan fill="%s">%s</tspan>' % (c, esc(t))
+                        for t, c in parts)
+        self.add('<text x="%s" y="%s" font-family="%s" font-size="%s" '
+                 'text-anchor="%s" font-weight="%s">%s</text>'
+                 % (x, y, "'Segoe UI', 'Helvetica Neue', Arial, sans-serif",
+                    size, anchor, weight, spans))
+
     def box(self, x, y, w, h, stroke=LINE, fill="none", rx=8, dash=None, width=2,
             opacity=1.0):
         d = ' stroke-dasharray="%s"' % dash if dash else ""
@@ -266,7 +276,9 @@ def build(detail):
                size=17, fill=DIM, mono=True)
     s.text(BX + 44, ry - 18, "every container request — ttRPC over vsock",
            size=23, fill=INK, weight="600")
-    s.text(CX + 44, ry + 8, "allow / deny", size=24, fill=TRUSTED, weight="700")
+    s.text_parts(CX + 44, ry + 8,
+                 [("allow", TRUSTED), (" / ", DIM), ("deny", UNTRUSTED)],
+                 size=24, weight="700")
 
     s.text(64, H - 76,
            "The host decides what to deliver. The guest decides what to accept — "
@@ -346,11 +358,16 @@ def build_simple():
     # the one thing that crosses, and the answer that comes back
     mid = (HX + HW + GX) / 2
 
-    def label(y, txt, size, fill, weight="normal", pad=18):
+    def label(y, txt, size, fill, weight="normal", pad=18, parts=None):
         w = size * 0.56 * len(txt) + pad * 2
         s.box(mid - w / 2, y - size - 6, w, size + 16, stroke=BG, fill=BG, rx=4,
               width=1)
-        s.text(mid, y, txt, size=size, fill=fill, weight=weight, anchor="middle")
+        if parts:
+            s.text_parts(mid, y, parts, size=size, anchor="middle",
+                         weight=weight)
+        else:
+            s.text(mid, y, txt, size=size, fill=fill, weight=weight,
+                   anchor="middle")
 
     ay = PY + 330
     s.line(HX + HW, ay, GX, ay, stroke=INK, width=4, marker="a-dim", dash="6 7")
@@ -359,7 +376,8 @@ def build_simple():
 
     by = PY + 440
     s.line(GX, by, HX + HW, by, stroke=TRUSTED, width=4, marker="a-ok")
-    label(by - 20, "allow / deny", 24, TRUSTED, "700")
+    label(by - 20, "allow / deny", 24, TRUSTED, "700",
+          parts=[("allow", TRUSTED), (" / ", DIM), ("deny", UNTRUSTED)])
 
     s.text(64, H - 44,
            "The host asks. The guest answers — against a document it was "
