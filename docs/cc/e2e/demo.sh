@@ -169,9 +169,21 @@ _verity_recover_stray() {
 # in `_prompt` so it applies to every command rather than only the ones that
 # reach here.
 pause() {
-  [[ "${DEMO_PAUSE:-0}" = "1" ]] || return 0
-  printf '\n    press Enter to continue '
-  read -r _
+  if [[ "${DEMO_PAUSE:-0}" = "1" ]]; then
+    printf '\n    press Enter to continue '
+    read -r _
+    return 0
+  fi
+  # A shot-list take (demo-shots.sh) needs every command to stand alone in the
+  # capture, because the cut is assembled shot by shot against a narration line.
+  # So: hold the output long enough to be read, wipe the screen, and leave a
+  # blank gap. The gap is the thing — an editor looking for the boundary between
+  # two shots should find a run of identical blank frames, not a guess about
+  # where one output stopped scrolling and the next started.
+  [[ -n "${DEMO_HOLD:-}" ]] || return 0
+  sleep "${DEMO_HOLD}"
+  printf '\033[H\033[2J'
+  sleep "${DEMO_GAP:-1}"
 }
 
 # Two kinds of break. `pause` holds while the audience reads something that

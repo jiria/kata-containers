@@ -180,9 +180,16 @@ E2E_REPO_DIR="${E2E_REPO_DIR:-${HOME}/kata-containers}"
 MARK="sleep-601-demo-sidecar"
 
 pause() {
-  [[ "${DEMO_PAUSE:-0}" = "1" ]] || return 0
-  printf '\n    press Enter to continue '
-  read -r _
+  if [[ "${DEMO_PAUSE:-0}" = "1" ]]; then
+    printf '\n    press Enter to continue '
+    read -r _
+    return 0
+  fi
+  # Same shot rhythm as demo.sh: hold, wipe, gap. See the comment there.
+  [[ -n "${DEMO_HOLD:-}" ]] || return 0
+  sleep "${DEMO_HOLD}"
+  printf '\033[H\033[2J'
+  sleep "${DEMO_GAP:-1}"
 }
 
 # Same split as demo.sh: `pause` holds while the audience reads something that
