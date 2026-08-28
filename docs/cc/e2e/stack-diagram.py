@@ -463,6 +463,189 @@ def build_before():
     return s.render()
 
 
+def build_launch():
+    """How the document reaches the hardware, and how the guest re-derives it."""
+    s = Svg()
+
+    s.text(64, 62, "Into the hardware", size=38, weight="600")
+    s.text(64, 102,
+           "the digest is stamped in at launch — and the guest re-derives it "
+           "from what it was actually served",
+           size=24, fill=DIM)
+
+    ZY, ZH = 300, 420
+    BOUND = 960
+    s.box(70, ZY, 860, ZH, stroke=UNTRUSTED, dash="6 8", rx=16, opacity=0.4)
+    s.text(94, ZY - 42, "OUTSIDE THE GUEST", size=22, fill=UNTRUSTED,
+           weight="700", spacing=2)
+    s.text(94, ZY - 14, "the host carries the document", size=20, fill=DIM)
+
+    s.box(990, ZY, 860, ZH, stroke=TRUSTED, dash="6 8", rx=16, opacity=0.4)
+    s.text(1014, ZY - 42, "INSIDE THE CVM", size=22, fill=TRUSTED, weight="700",
+           spacing=2)
+    s.text(1014, ZY - 14, "and cannot reach past this line", size=20, fill=DIM)
+
+    s.line(BOUND, ZY - 66, BOUND, ZY + ZH + 40, stroke=TRUSTED, width=4,
+           opacity=0.6)
+    s.add('<text x="%d" y="%d" transform="rotate(-90 %d %d)" font-family="'
+          "'Segoe UI', Arial, sans-serif\" font-size=\"18\" fill=\"%s\" "
+          'text-anchor="middle" letter-spacing="4" opacity="0.8">%s</text>'
+          % (BOUND - 24, ZY + ZH + 4, BOUND - 24, ZY + ZH + 4, TRUSTED,
+             "HARDWARE BOUNDARY"))
+
+    BY, BH, BW = ZY + 60, 300, 380
+    xs = [100, 545, 1010, 1455]
+
+    def card(x, title, lines, accent, fill=None, mono=(), ts=27):
+        s.box(x, BY, BW, BH, stroke=accent, fill=fill or "none", rx=10,
+              opacity=1 if fill else 0.9)
+        s.text(x + 26, BY + 56, title, size=ts, weight="600")
+        for i, ln in enumerate(lines):
+            s.text(x + 26, BY + 106 + 32 * i, ln, size=20, fill=DIM,
+                   mono=(i in mono))
+
+    card(xs[0], "the document",
+         ["policy.rego and the rest,",
+          "gzip + base64 as one TOML,",
+          "carried on the pod spec",
+          "",
+          "…hypervisor.cc_init_data"],
+         DOC, fill="#0d2136", mono={4})
+
+    card(xs[1], "its digest",
+         ["sha256 over that document,",
+          "computed before the VM starts",
+          "",
+          "one 32-byte value — the only",
+          "thing the hardware is told"],
+         WARM)
+
+    card(xs[2], "measured at launch",
+         ["the digest goes in as HOST_DATA",
+          "and is sealed into the report",
+          "the platform signs",
+          "",
+          "nothing can change it after boot"],
+         TRUSTED)
+
+    card(xs[3], "checked in the guest",
+         ["the agent hashes the initdata it",
+          "was actually served, reads",
+          "HOST_DATA back, and compares",
+          "",
+          "if they differ, it stops"],
+         TRUSTED, fill="#0d2a17")
+
+    for i, col in ((0, DOC), (1, WARM), (2, TRUSTED)):
+        s.line(xs[i] + BW + 12, BY + BH / 2, xs[i + 1] - 12, BY + BH / 2,
+               stroke=col, width=3,
+               marker={DOC: "a-doc", WARM: "a-warm", TRUSTED: "a-ok"}[col])
+
+    s.text(64, H - 76,
+           "The host computes the digest and carries the document — but it "
+           "cannot choose what the hardware records, and cannot change it after.",
+           size=23, fill=DIM)
+    s.text(64, H - 40,
+           "The guest hashes what it was actually served. If the two ever "
+           "differ it stops — and because the agent is pid 1, that takes the VM "
+           "with it.",
+           size=23, fill=WARM)
+    return s.render()
+
+
+def build_enforce():
+    """Inside the guest: what happens to a request between arriving and being
+    answered."""
+    s = Svg()
+
+    s.text(64, 62, "Inside the guest", size=38, weight="600")
+    s.text(64, 102,
+           "every request is answered against the measured document — there is "
+           "no path around it",
+           size=24, fill=DIM)
+
+    ZY, ZH = 300, 420
+    BOUND = 515
+    s.text(94, ZY - 42, "FROM THE HOST", size=22, fill=UNTRUSTED, weight="700",
+           spacing=2)
+    s.text(94, ZY - 14, "it chooses what to ask for", size=20, fill=DIM)
+
+    s.box(540, ZY, 1310, ZH, stroke=TRUSTED, dash="6 8", rx=16, opacity=0.4)
+    s.text(564, ZY - 42, "INSIDE THE CVM", size=22, fill=TRUSTED, weight="700",
+           spacing=2)
+    s.text(564, ZY - 14, "where the answer is decided", size=20, fill=DIM)
+
+    s.line(BOUND, ZY - 66, BOUND, ZY + ZH + 180, stroke=TRUSTED, width=4,
+           opacity=0.6)
+    s.add('<text x="%d" y="%d" transform="rotate(-90 %d %d)" font-family="'
+          "'Segoe UI', Arial, sans-serif\" font-size=\"18\" fill=\"%s\" "
+          'text-anchor="middle" letter-spacing="4" opacity="0.8">%s</text>'
+          % (BOUND - 24, ZY + ZH + 100, BOUND - 24, ZY + ZH + 100, TRUSTED,
+             "HARDWARE BOUNDARY"))
+
+    BY, BH, BW = ZY + 60, 300, 380
+    xs = [100, 570, 1015, 1460]
+
+    def card(x, title, lines, accent, fill=None, mono=(), ts=27, parts=None):
+        s.box(x, BY, BW, BH, stroke=accent, fill=fill or "none", rx=10,
+              opacity=1 if fill else 0.9)
+        if parts:
+            s.text_parts(x + 26, BY + 56, parts, size=ts, weight="600")
+        else:
+            s.text(x + 26, BY + 56, title, size=ts, weight="600")
+        for i, ln in enumerate(lines):
+            s.text(x + 26, BY + 106 + 32 * i, ln, size=20, fill=DIM,
+                   mono=(i in mono))
+
+    card(xs[0], "the request",
+         ["the host asks for something:",
+          "start a container, run a process,",
+          "mount a volume, open a shell",
+          "",
+          "ttRPC over vsock"],
+         INK)
+
+    card(xs[1], "the agent",
+         ["pid 1 in the guest — every",
+          "request arrives here, and there",
+          "is no other way in",
+          "",
+          "it never asks the host anything"],
+         TRUSTED)
+
+    card(xs[2], "the document",
+         ["the policy the hardware",
+          "measured, evaluated per request",
+          "",
+          "every request starts denied",
+          "layer hashes: declared vs served"],
+         DOC, fill="#0d2136")
+
+    card(xs[3], None,
+         ["only what the document names",
+          "is allowed to happen",
+          "",
+          "a refusal is the whole answer —",
+          "nothing half-applied is left"],
+         TRUSTED,
+         parts=[("allow", TRUSTED), (" / ", DIM), ("deny", UNTRUSTED)], ts=29)
+
+    for i, col in ((0, INK), (1, TRUSTED), (2, TRUSTED)):
+        s.line(xs[i] + BW + 12, BY + BH / 2, xs[i + 1] - 12, BY + BH / 2,
+               stroke=col, width=3,
+               marker="a-ink" if col is INK else "a-ok")
+
+    s.text(64, H - 76,
+           "The host decides what to ask for. It does not get to decide what "
+           "the answer is.",
+           size=23, fill=DIM)
+    s.text(64, H - 40,
+           "And the document it is answered against is the one the hardware "
+           "measured — the host cannot substitute another.",
+           size=23, fill=WARM)
+    return s.render()
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default=r"C:\Users\jiria\demo-exec")
@@ -476,4 +659,10 @@ if __name__ == "__main__":
     print("wrote", p)
     p = "%s\\stack-before.svg" % a.out
     open(p, "w", encoding="utf-8", newline="\n").write(build_before())
+    print("wrote", p)
+    p = "%s\\stack-launch.svg" % a.out
+    open(p, "w", encoding="utf-8", newline="\n").write(build_launch())
+    print("wrote", p)
+    p = "%s\\stack-enforce.svg" % a.out
+    open(p, "w", encoding="utf-8", newline="\n").write(build_enforce())
     print("wrote", p)

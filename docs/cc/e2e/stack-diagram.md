@@ -5,6 +5,8 @@
 | file | for |
 | --- | --- |
 | `stack-before.svg` | before deployment on its own — pod spec → genpolicy → the measured document → its digest |
+| `stack-launch.svg` | the launch path — the digest into `HOST_DATA`, and the guest re-deriving it |
+| `stack-enforce.svg` | inside the guest — a request from arrival to verdict |
 | `stack-simple.svg` | the high-level card — names and boxes only: the host stack, the guest, the boundary, and the one call that crosses it |
 | `stack-exec.svg` | the executive cut's opening — few boxes, large type, readable in the seconds a title card gets |
 | `stack-detail.svg` | the same structure as the exec card with the identifiers, for the doc and for engineers who ask |
@@ -86,6 +88,26 @@ then releases, because the demo does not show that.
 The guest-side dm-verity device is created by the agent when it is built with
 `USE_DEVMAPPER=yes`, but the call site was not found, so the card says only that
 root hashes are checked — which is proven — and does not draw the device.
+
+## The sequence cards
+
+`stack-before`, `stack-launch` and `stack-enforce` split the same story into
+three beats that can be shown one after another, each a single row of boxes.
+They add no claims of their own; every box restates something from the table
+above.
+
+| card | the beat | the two lines underneath |
+| --- | --- | --- |
+| `stack-before` | the document is derived from the pod spec | every request starts denied · the host never contributes to the document, it only carries it |
+| `stack-launch` | the digest is stamped in at launch | the host cannot choose what the hardware records · the guest hashes what it was actually served, and a mismatch stops the VM |
+| `stack-enforce` | a request is answered against the document | the host decides what to ask for, not what the answer is · the document cannot be substituted |
+
+Two claims on `stack-enforce` that are not in the table above:
+
+- **every request starts denied** — the generated policy shown in the demo
+  denies by default, and the generated entries turn on only what the pod needs.
+- **nothing half-applied is left** — the SRM applies changes as two-phase
+  transactions, `src/agent/security-reference-monitor/`.
 
 ## Consistency with the demo
 
