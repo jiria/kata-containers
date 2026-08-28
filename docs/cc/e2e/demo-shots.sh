@@ -26,6 +26,9 @@
 #   * a blank screen for at least a second between any two shots, so the cut
 #     point is a run of identical frames rather than a judgement call
 #   * shots in narration order, and named for the segment they serve
+#   * each pod deleted as soon as its last shot is done — track B, the live
+#     kubectl inset, is in frame for the whole take, and a pod that has finished
+#     being evidence is clutter in it for every shot that follows
 #
 # One exception to the first two, and it is deliberate: where several commands
 # make a single argument, they accumulate on one screen and only the wipe is
@@ -65,7 +68,7 @@
 #   S05       stack-before.svg
 #   S12       stack-enforce.svg
 #   S17 S18   stack-fragment.svg
-#   S27       stack-exec.svg + closing title card
+#   S28 S29   stack-exec.svg + closing title card
 #
 # Usage:
 #   ./demo-shots.sh                 every moment, in order (~15 min)
@@ -297,21 +300,39 @@ PYEOF
   else
     warn "no decision object in the error text — expected the policyDecision sentinel"
   fi
+
+  # demo-a's last shot. It is deleted here rather than by the exit trap because
+  # track B — the live kubectl inset in the corner — is in frame for the whole
+  # recording, and a pod that has finished being evidence is just clutter in it
+  # for the rest of the take. Silent and unwaited: this is stagehand work, not a
+  # shot, and the gap after S16 absorbs it.
+  kubectl delete pod demo-a -n "${NS}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 fi
 
 # ---------------------------------------------------------------- moment 3
-# S19 - S26 — fragments. A child process, not a sourced helper: this is a whole
+# S19 - S27 — fragments. A child process, not a sourced helper: this is a whole
 # demo with its own fixtures and its own cleanup, and it has to be able to fail
 # without taking the moments already recorded down with it.
 if want_moment 3; then
-  seg S19-S26
-  printf 'S19-S26\t--\tfragments: every beat of demo-fragment-sidecar.sh, one shot each\n' >> "${SHOT_LIST}"
+  seg S19-S27
+  printf 'S19-S27\t--\tfragments: every beat of demo-fragment-sidecar.sh, one shot each\n' >> "${SHOT_LIST}"
   printf '\033[H\033[2J'
   sleep "${DEMO_GAP}"
   # A child process, so its shots cannot be counted here. It keeps the rhythm
   # because DEMO_HOLD and DEMO_GAP are exported, which is the part that matters.
-  DEMO_BEAT_PREFIX=F bash "${HERE}/demo-fragment-sidecar.sh" || \
+  #
+  # DEMO_RECEIPT_TAMPER=0 drops the tampered-receipt refusal. S25-S27 narrate
+  # three beats — refused without a receipt, accepted with one, refused as a
+  # replay — and the fourth delivery only reads as a distinct failure if the
+  # decoded leaf is on screen beside it, which is more explaining than the take
+  # can afford. The walkthrough still runs all four.
+  DEMO_BEAT_PREFIX=F DEMO_RECEIPT_TAMPER=0 bash "${HERE}/demo-fragment-sidecar.sh" || \
     warn "the fragment moment did not finish — the moments already recorded are unaffected"
+  # Same reason as demo-a: the fragment pod has stopped being evidence, and the
+  # inset is still in frame. demo-fragment-sidecar.sh leaves it deliberately —
+  # run by hand, the pod is the thing you want to poke at afterwards — so the
+  # cleanup belongs here, where the take is what matters.
+  kubectl delete pod demo-frag-sidecar -n "${NS}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 fi
 
 printf '\033[H\033[2J'

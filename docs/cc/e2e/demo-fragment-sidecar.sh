@@ -882,10 +882,17 @@ pause
 # data-hash, which is the interesting negative: the receipt is signed by the real
 # ledger key and is still refused, because the root it signs no longer binds
 # these bytes.
+#
+# DEMO_RECEIPT_TAMPER=0 drops that negative. It is the subtlest of the three
+# refusals — it needs the decoded-leaf shot beside it to mean anything — and the
+# recorded take has no room to explain it. Presence, acceptance and replay are
+# still shown, so nothing the take does claim goes unproven.
 LEDGER prove-ccf --key "${LEDGER_PRIV}" --leaf "${WORK}/receipt.stmt" > "${WORK}/receipt.proof" \
   || die "mock-ledger could not mint a receipt"
-LEDGER prove-ccf --key "${LEDGER_PRIV}" --leaf "${WORK}/receipt.stmt" --tamper \
-  > "${WORK}/receipt.bad.proof" || die "mock-ledger could not mint the tampered receipt"
+if [[ "${DEMO_RECEIPT_TAMPER:-1}" = "1" ]]; then
+  LEDGER prove-ccf --key "${LEDGER_PRIV}" --leaf "${WORK}/receipt.stmt" --tamper \
+    > "${WORK}/receipt.bad.proof" || die "mock-ledger could not mint the tampered receipt"
+fi
 
 say <<'EOF'
 
@@ -906,22 +913,30 @@ say <<'EOF'
 EOF
 pause
 
-say <<'EOF'
+if [[ "${DEMO_RECEIPT_TAMPER:-1}" = "1" ]]; then
+  _DELIV_COUNT="Four"
+  _DELIV_LIST="refused for no receipt, refused for a receipt that binds
+  other bytes, accepted, then refused as a replay"
+  say <<'EOF'
 
   So try exactly that: a receipt minted by the real ledger key, one byte
   different in the leaf. Nothing about it is forged — the signature verifies.
 EOF
-show "what the tampered receipt binds instead" \
-  "python3 ${_RINSPECT} ${WORK}/receipt.bad.proof --statement ${WORK}/receipt.stmt | tail -4"
-show "deliver it" \
-  "${_CTL_CMD} \"LoadPolicyFragment cose=\$(cat ${WORK}/receipt.cose.hex) receipt_ledger=${LEDGER_ID} proof=${WORK}/receipt.bad.proof\" 2>&1 | tail -3"
-say <<'EOF'
+  show "what the tampered receipt binds instead" \
+    "python3 ${_RINSPECT} ${WORK}/receipt.bad.proof --statement ${WORK}/receipt.stmt | tail -4"
+  show "deliver it" \
+    "${_CTL_CMD} \"LoadPolicyFragment cose=\$(cat ${WORK}/receipt.cose.hex) receipt_ledger=${LEDGER_ID} proof=${WORK}/receipt.bad.proof\" 2>&1 | tail -3"
+  say <<'EOF'
 
   Refused again, and with a different status — InvalidInclusionProof rather than
   MissingReceipt. The two failures are distinguishable because they are
   different checks: one is presence, the other is what the bytes bind.
 EOF
-pause
+  pause
+else
+  _DELIV_COUNT="Three"
+  _DELIV_LIST="refused for no receipt, accepted, then refused as a replay"
+fi
 
 say <<'EOF'
 
@@ -943,9 +958,8 @@ show "deliver it a second time" \
   "${_CTL_CMD} \"LoadPolicyFragment cose=\$(cat ${WORK}/receipt.cose.hex) receipt_ledger=${LEDGER_ID} proof=${WORK}/receipt.proof\" 2>&1 | tail -3"
 say <<EOF
 
-  Four deliveries of the same signed fragment, over the same channel, to the
-  same running guest: refused for no receipt, refused for a receipt that binds
-  other bytes, accepted, then refused as a replay. What changed between them was
+  ${_DELIV_COUNT} deliveries of the same signed fragment, over the same channel, to the
+  same running guest: ${_DELIV_LIST}. What changed between them was
   only what travelled alongside the envelope — and none of the receipt fields
   are covered by the issuer's signature, which is exactly why the guest
   recomputes them rather than reading them.
