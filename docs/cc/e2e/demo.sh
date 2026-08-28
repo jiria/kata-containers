@@ -51,6 +51,10 @@
 #
 # Env:
 #   DEMO_PAUSE=1     wait for Enter between beats (default: run straight through)
+#   DEMO_SETTLE=0.5  seconds to hold after each command's output when not
+#                    pausing, so consecutive outputs read as separate beats on a
+#                    recording (default: 0.5 under a conductor-driven take, 0
+#                    otherwise; set 0 to disable)
 #   DEMO_CLEAR=0     keep the screen when paused (default: clear between beats,
 #                    redrawing the act heading; scrollback is preserved)
 #   DEMO_ACTS=0,2    run only these acts (default: 0,1,2,3,4)
@@ -161,8 +165,21 @@ _verity_recover_stray() {
   done < <(sudo find "${SNAP}" -maxdepth 2 -name 'layer.erofs.dmverity.demobak' 2>/dev/null)
 }
 
+# Two ways to hold after a beat. Interactively the keypress is the hold. On a
+# hands-free take there is no keypress, and a command that starts the instant
+# the previous one stopped printing puts two outputs into what reads as a single
+# frame — the eye gets one blurred beat instead of two, and the narration is
+# describing the first while the second is already on screen. So settle: let the
+# output exist on its own for a moment before the next prompt appears.
+#
+# Only on a conductor-driven take (DEMO_CUE_DIR); running the act by hand to
+# check something should stay at full speed. DEMO_SETTLE overrides either way.
 pause() {
-  [[ "${DEMO_PAUSE:-0}" = "1" ]] || return 0
+  if [[ "${DEMO_PAUSE:-0}" != "1" ]]; then
+    local settle="${DEMO_SETTLE:-${DEMO_CUE_DIR:+0.5}}"
+    if [[ -n "${settle}" && "${settle}" != "0" ]]; then sleep "${settle}"; fi
+    return 0
+  fi
   printf '\n    press Enter to continue '
   read -r _
 }
@@ -354,7 +371,8 @@ start_demo_pod() {
   # Shown rather than hidden: the audience should see the pod being created, and
   # by what command, not just a status line claiming it happened.
   _prompt "kubectl apply -f ${WORK}/${name}.yaml"
-  kubectl apply -f "${WORK}/${name}.yaml" || die "kubectl apply failed for ${name}"
+  kubectl apply -f "${WORK}/${name}.yaml" 2>&1 | bash "${_HL}" \
+    || die "kubectl apply failed for ${name}"
   log "this boots a fresh SEV-SNP CVM, so it is not instant"
   wait_for 300 "pod ${name} Running" \
     bash -c "kubectl get pod ${name} -n ${NS} -o jsonpath='{.status.phase}' | grep -qx Running"
@@ -478,7 +496,14 @@ _tamper_run() {
   # up before the sandbox is. Give it its first poll.
   sleep 1
 
-  kubectl apply -f "${WORK}/${pod}.yaml" >/dev/null || die "kubectl apply failed for ${pod}"
+  # The launch is evidence, not setup. The substituted image is already staged
+  # by the time this runs, so this apply *is* the experiment being performed —
+  # and applying it silently left the screen empty for the whole boot, with the
+  # narration describing a pod launch nobody could see happen.
+  _prompt "kubectl apply -f ${WORK}/${pod}.yaml"
+  kubectl apply -f "${WORK}/${pod}.yaml" 2>&1 | bash "${_HL}" \
+    || die "kubectl apply failed for ${pod}"
+  pause
   log "starting pod ${pod} with the watcher armed (${mode})"
 
   local i
@@ -678,7 +703,8 @@ EOF
   # narration; the launch that produces them starts when that sentence does.
   cue S06
   _prompt "kubectl apply -f ${WORK}/${pod}.yaml"
-  kubectl apply -f "${WORK}/${pod}.yaml" >/dev/null || die "kubectl apply failed for ${pod}"
+  kubectl apply -f "${WORK}/${pod}.yaml" 2>&1 | bash "${_HL}" \
+    || die "kubectl apply failed for ${pod}"
   log "the sandbox still boots — it is the container that has to be judged"
   wait_for_soft 180 "${pod} to reach a terminal state" \
     bash -c "kubectl get pod ${pod} -n ${NS} -o jsonpath='{.status.containerStatuses[0].state.terminated.reason}{.status.phase}' 2>/dev/null | grep -qE 'StartError|Failed'" \

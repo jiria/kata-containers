@@ -370,7 +370,7 @@ And here's the pod running under them: those layers, those hashes, and the
 Cloud Hypervisor process for its VM.
 VO
 
-segment S11 "m3" "hold — the substituted policy is staged and a pod launched under it" none '' <<'VO'
+segment S11 "m3" "the tampered pod applied, and the wait while its CVM boots under the substituted policy" none '' <<'VO'
 One pod, one VM, one measured document. And the guest keeps asking the same
 question of everything presented to it, for the whole life of the workload: is
 this what was declared? It's fixed at boot — no code path accepts a different

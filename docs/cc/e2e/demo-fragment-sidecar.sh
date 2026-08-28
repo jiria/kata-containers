@@ -31,6 +31,8 @@
 #
 # Env:
 #   DEMO_PAUSE=1   wait for Enter between steps (default: run straight through)
+#   DEMO_SETTLE=n  seconds to hold after each command's output when not pausing
+#                  (default: 0.5 under a conductor-driven take, 0 otherwise)
 #   E2E_NS         namespace (default coco-e2e)
 set -euo pipefail
 
@@ -168,7 +170,14 @@ E2E_REPO_DIR="${E2E_REPO_DIR:-${HOME}/kata-containers}"
 MARK="sleep-601-demo-sidecar"
 
 pause() {
-  [[ "${DEMO_PAUSE:-0}" = "1" ]] || return 0
+  # Same settle as demo.sh, and for the same reason: on a hands-free take there
+  # is no keypress between beats, so let each output stand on its own for a
+  # moment before the next prompt lands on top of it.
+  if [[ "${DEMO_PAUSE:-0}" != "1" ]]; then
+    local settle="${DEMO_SETTLE:-${DEMO_CUE_DIR:+0.5}}"
+    if [[ -n "${settle}" && "${settle}" != "0" ]]; then sleep "${settle}"; fi
+    return 0
+  fi
   printf '\n    press Enter to continue '
   read -r _
 }
@@ -477,7 +486,7 @@ else
   "${GENPOLICY}" -y "${WORK}/step1.yaml" -p "${WORK}/rules-none.rego" -j "${SETTINGS}" \
     --initdata-path="${WORK}/initdata.toml" >/dev/null || die "genpolicy failed"
   _prompt "kubectl apply -f ${WORK}/step1.yaml"
-  kubectl apply -f "${WORK}/step1.yaml"
+  kubectl apply -f "${WORK}/step1.yaml" 2>&1 | bash "${_HL}"
   log "starting pod ${POD} — this boots a fresh SEV-SNP CVM, so it is not instant"
   wait_for 300 "pod ${POD} Running" pod_running
   ok "busybox is running, authorized by an entry in the measured policy"
@@ -770,7 +779,7 @@ pause
 show "the pod's own policy still admits only what act 1's did — the sidecar is not in it" \
   "python3 ${WORK}/yaml-policy.py ${WORK}/step4.yaml | python3 ${WORK}/policy-containers.py"
 _prompt "kubectl apply -f ${WORK}/step4.yaml"
-kubectl apply -f "${WORK}/step4.yaml"
+kubectl apply -f "${WORK}/step4.yaml" 2>&1 | bash "${_HL}"
 log "starting pod ${POD} — a fresh CVM, this time declaring the fragment"
 # "It passes, and the sidecar starts" — and then step 5, which is the rest of
 # that same sentence: the receipt, and the replay that fails.
