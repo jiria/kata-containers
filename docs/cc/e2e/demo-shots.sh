@@ -27,6 +27,14 @@
 #     point is a run of identical frames rather than a judgement call
 #   * shots in narration order, and named for the segment they serve
 #
+# One exception to the first two, and it is deliberate: where several commands
+# make a single argument, they accumulate on one screen and only the wipe is
+# dropped — the pause between them stays, so the editor can still shorten the
+# typing without losing the fact that the outputs belong together. S09 is the
+# case: the pod, the Cloud Hypervisor process serving its VM, and that process's
+# handles on the hypervisor are a chain, and three screens make it three
+# unrelated facts.
+#
 # Timing is not this script's business. Neither are the title cards or the
 # architecture diagrams (stack-*.svg) — those are injected in the edit.
 #
@@ -76,6 +84,10 @@ export DEMO_GAP="${DEMO_GAP:-1.5}"
 # Here the gap already sits between every pair of shots, and a second settle
 # would put a second, shorter pause *inside* one.
 export DEMO_SETTLE=0
+
+# Off by default: every shot gets its own screen unless a group of them is
+# making a single argument (see S09).
+export DEMO_KEEP=0
 
 # Voice-over take: the spoken track says where we are, so nothing on screen
 # should say it too. What is left is commands and their output, which is the
@@ -180,8 +192,15 @@ if want_moment 2; then
   seg S08
   start_demo_pod demo-a
 
+  # S09 is three commands making one argument — the pod, the process serving its
+  # VM, and that process's handle on the hypervisor — so they belong on one
+  # screen. The break between them stays; only the wipe goes.
   seg S09
+  DEMO_KEEP=1
   show_sandbox_backing demo-a
+  DEMO_KEEP=0
+  printf '\033[H\033[2J'
+  sleep "${DEMO_GAP}"
 
   seg S10
   decode_initdata demo-a "${WORK}/a.toml"

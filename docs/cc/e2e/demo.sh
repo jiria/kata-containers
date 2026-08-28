@@ -182,6 +182,14 @@ pause() {
   # where one output stopped scrolling and the next started.
   [[ -n "${DEMO_HOLD:-}" ]] || return 0
   sleep "${DEMO_HOLD}"
+  # Some shots argue one point together and have to be read as one screen — the
+  # sandbox linkage is three commands, and splitting them turns a chain of
+  # evidence into three unrelated outputs. DEMO_KEEP keeps the break (the next
+  # command still types a second later) but not the wipe, so they accumulate.
+  if [[ "${DEMO_KEEP:-0}" = "1" ]]; then
+    sleep "${DEMO_GAP:-1}"
+    return 0
+  fi
   printf '\033[H\033[2J'
   sleep "${DEMO_GAP:-1}"
 }

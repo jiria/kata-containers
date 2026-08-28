@@ -185,9 +185,14 @@ pause() {
     read -r _
     return 0
   fi
-  # Same shot rhythm as demo.sh: hold, wipe, gap. See the comment there.
+  # Same shot rhythm as demo.sh: hold, wipe, gap — and DEMO_KEEP to hold a group
+  # of commands on one screen. See the comment there.
   [[ -n "${DEMO_HOLD:-}" ]] || return 0
   sleep "${DEMO_HOLD}"
+  if [[ "${DEMO_KEEP:-0}" = "1" ]]; then
+    sleep "${DEMO_GAP:-1}"
+    return 0
+  fi
   printf '\033[H\033[2J'
   sleep "${DEMO_GAP:-1}"
 }
