@@ -227,6 +227,14 @@ if want_moment 2; then
   [[ -n "$(initdata_journal_line "${T0}" "${D1}")" ]] \
     || warn "did not find the computed digest in the journal — check 'journalctl -t kata'"
 
+  # demo-a's last shot for now. It is needed again at S16, which execs into it,
+  # but nothing between here and there touches it: S13 and S14 read the decoded
+  # policy under ${WORK}, and S11 and S15 each bring a pod of their own. Leaving
+  # it up means the live pod inset shows demo-a beside demo-tampered and again
+  # beside demo-verity, which reads as two unrelated pods in a story about one.
+  # So it goes now and comes back below.
+  kubectl delete pod demo-a -n "${NS}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+
   # S11 — the swap the measurement is supposed to prevent, staged on this
   # hardware. Uses its own per-run pod names, so demo-a survives it and the
   # later shots still have something running.
@@ -283,8 +291,23 @@ PYEOF
   seg S15
   verity_substitution_experiment
 
-  # S16 — exec. demo-a has been running throughout; the substitution experiment
-  # restores the hash it changed and uses a pod of its own, so it is still up.
+  # demo-a, back for the exec shot. Silent and off-camera: S08 already showed
+  # the pod being created, and showing it a second time would say something
+  # happened here that did not. Recreated from the same file genpolicy rewrote
+  # in S06, so it carries the same measured policy the earlier shots proved.
+  #
+  # After the verity experiment rather than before it: that experiment deletes
+  # its own pod when it finishes, so starting here is the one point where the
+  # inset holds exactly one pod. Measured on this node, Pending -> Running is
+  # about five seconds, which the gap before S16 covers.
+  kubectl apply -f "${WORK}/demo-a.yaml" >/dev/null 2>&1 \
+    || die "could not recreate demo-a for the exec shot"
+  wait_for 300 "pod demo-a Running" \
+    bash -c "kubectl get pod demo-a -n ${NS} -o jsonpath='{.status.phase}' | grep -qx Running" \
+    >/dev/null 2>&1 \
+    || die "demo-a did not come back up — S16 has nothing to exec into"
+
+  # S16 — exec into demo-a, which was recreated just above.
   seg S16
   show "nobody asked to exec into this pod, so the rule that decides it was never turned on" \
     "grep -nE '^default ExecProcessRequest' ${WORK}/a.toml; grep -cE '^ExecProcessRequest' ${WORK}/a.toml | xargs -I{} echo '{} conditional rules could turn it on — this exec matches none of them'"

@@ -578,6 +578,12 @@ step "3 — sign and publish a fragment that authorizes exactly that sidecar"
 # the sandbox name onto every container's OCI spec, so an entry lifted under one
 # pod name will not match a request made under another.
 POD="${FRAG_POD}"
+# The pod goes now rather than at step 4, where it used to. Step 3 is the
+# longest stretch of the demo -- generating, lifting, signing and publishing --
+# and none of it touches a running pod: every shot in it reads a file under
+# ${WORK}. Leaving act 1's pod up for all of that means the live pod inset spends
+# the whole fragment build showing the spec we have already finished with.
+wipe_pod
 say <<'EOF'
 
   Before anything is signed, the fragment's contents have to come from
@@ -768,7 +774,9 @@ pause
 cue S16
 step "4 — the same sidecar, now authorized by the delivered fragment"
 log "identical workload; the pod now declares the fragment and the host delivers it"
-wipe_pod
+# No wipe_pod here: step 3 removed the pod before the fragment build, so there
+# is nothing left to wipe. wipe_pod is idempotent, but a call that can never do
+# anything reads as though the pod might still be up.
 render_pod "${SIDECAR_REF}" > "${WORK}/step4.yaml"
 "${GENPOLICY}" -y "${WORK}/step4.yaml" -p "${WORK}/rules-sidecar.rego" -j "${SETTINGS}" \
   --initdata-path="${WORK}/initdata.toml" >/dev/null || die "genpolicy failed"
