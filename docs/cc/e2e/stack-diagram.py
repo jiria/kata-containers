@@ -101,7 +101,7 @@ def build(detail):
     s.text(64, 58, "A pod's policy", size=34, weight="600")
     s.text(64, 94,
            "generated before deployment · measured into the hardware at launch · "
-           "enforced inside the guest",
+           "enforced inside the guest · provable from outside",
            size=22, fill=DIM)
 
     # Three zones, with a wide channel between the host and the guest: the two
@@ -209,11 +209,13 @@ def build(detail):
            % (BX + BW, ZY + 464, BX + BW + 90, ZY + 464,
               CM - 110, ZY + 210, CM, ZY + 210),
            stroke=WARM, width=3, marker="a-warm")
-    s.text(LX, ZY + 490, "its sha256,", size=17, fill=WARM)
-    s.text(LX, ZY + 512, "stamped into", size=17, fill=WARM)
-    s.text(LX, ZY + 534, "the hardware", size=17, fill=WARM)
+    # The caption sits above the curve's run through the channel; below it is
+    # where the request line now lives.
+    s.text(LX, ZY + 220, "its sha256,", size=17, fill=WARM)
+    s.text(LX, ZY + 242, "stamped into", size=17, fill=WARM)
+    s.text(LX, ZY + 264, "the hardware", size=17, fill=WARM)
     if d:
-        s.text(LX, ZY + 558, "HOST_DATA", size=15, fill=WARM, mono=True)
+        s.text(LX, ZY + 286, "HOST_DATA", size=15, fill=WARM, mono=True)
 
     # ---- column C: the guest -------------------------------------------------
     x, w = CX + 26, CW - 52
@@ -253,21 +255,116 @@ def build(detail):
          mono_from=99 if not d else 2, accent=TRUSTED)
 
     # ---- the request path across the boundary --------------------------------
+    # This line is the one the audience must not skim: every request the
+    # workload makes is answered on the far side of the boundary.
     ry = ZB + (72 if d else 52)
-    s.line(BX + 40, ry, BOUND, ry, stroke=DIM, dash="5 6")
-    s.line(BOUND, ry, CX + 24, ry, stroke=TRUSTED, width=3, marker="a-ok")
+    s.line(BX + 40, ry, BOUND, ry, stroke=INK, dash="5 6", width=3, opacity=0.85)
+    s.line(BOUND, ry, CX + 24, ry, stroke=TRUSTED, width=4, marker="a-ok")
     if d:
-        s.text(BX + 44, ry - 40,
+        s.text(BX + 44, ry - 44,
                "CreateContainerRequest, ExecProcessRequest, …",
                size=17, fill=DIM, mono=True)
-    s.text(BX + 44, ry - 16, "every container request — ttRPC over vsock",
-           size=19, fill=DIM)
-    s.text(CX + 44, ry + 8, "allow / deny", size=22, fill=TRUSTED, weight="600")
+    s.text(BX + 44, ry - 18, "every container request — ttRPC over vsock",
+           size=23, fill=INK, weight="600")
+    s.text(CX + 44, ry + 8, "allow / deny", size=24, fill=TRUSTED, weight="700")
 
-    s.text(64, H - 44,
+    s.text(64, H - 76,
            "The host decides what to deliver. The guest decides what to accept — "
            "against a document the hardware already measured.",
            size=22, fill=DIM)
+    s.text(64, H - 40,
+           "And the customer decides whether to trust any of it: the same "
+           "measurement, carried in a signed hardware report they can check "
+           "from outside the machine.",
+           size=22, fill=WARM)
+    return s.render()
+
+
+def build_simple():
+    """The high-level card: the two sides, the boundary between them, and the
+    one thing that happens at it. Names and boxes only."""
+    s = Svg()
+
+    s.text(64, 62, "Where the boundary is", size=38, weight="600")
+    s.text(64, 102,
+           "every call into the guest is answered against the measured document",
+           size=24, fill=DIM)
+
+    BOUND = 960
+    PY, PH = 190, 700
+    HX, HW = 90, 700
+    GX, GW = 1130, 700
+
+    s.box(HX, PY, HW, PH, stroke=UNTRUSTED, dash="6 8", rx=16, opacity=0.45)
+    s.text(HX + 20, PY - 42, "THE HOST", size=22, fill=UNTRUSTED, weight="700",
+           spacing=2)
+    s.text(HX + 20, PY - 14, "outside the boundary", size=20, fill=DIM)
+
+    s.box(GX, PY, GW, PH, stroke=TRUSTED, dash="6 8", rx=16, opacity=0.45)
+    s.text(GX + 20, PY - 42, "THE CVM", size=22, fill=TRUSTED, weight="700",
+           spacing=2)
+    s.text(GX + 20, PY - 14, "measured at launch", size=20, fill=DIM)
+
+    s.line(BOUND, PY - 66, BOUND, PY + PH + 40, stroke=TRUSTED, width=4,
+           opacity=0.6)
+    s.add('<text x="%d" y="%d" transform="rotate(-90 %d %d)" font-family="'
+          "'Segoe UI', Arial, sans-serif\" font-size=\"19\" fill=\"%s\" "
+          'text-anchor="middle" letter-spacing="4" opacity="0.8">%s</text>'
+          % (BOUND - 26, PY + 620, BOUND - 26, PY + 620, TRUSTED,
+             "HARDWARE BOUNDARY"))
+
+    def plain(x, y, w, h, title, sub, accent, fill=None, ts=32):
+        s.box(x, y, w, h, stroke=accent, fill=fill or "none", rx=10,
+              opacity=1 if fill else 0.9)
+        s.text(x + 26, y + (h / 2 + 10 if not sub else h / 2 - 4), title,
+               size=ts, weight="600")
+        if sub:
+            s.text(x + 26, y + h / 2 + 30, sub, size=21, fill=DIM)
+
+    x, w = HX + 40, HW - 80
+    for i, (t, sub) in enumerate((
+            ("kubelet", ""),
+            ("containerd", ""),
+            ("kata shim", ""),
+            ("cloud-hypervisor", "MSHV · SEV-SNP"))):
+        plain(x, PY + 46 + i * 158, w, 128, t, sub, UNTRUSTED)
+
+    x, w = GX + 40, GW - 80
+    plain(x, PY + 46, w, 128, "kata-agent", "pid 1 in the guest", TRUSTED)
+    plain(x, PY + 204, w, 128, "the measured document", "policy.rego", DOC,
+          fill="#0d2136", ts=30)
+    plain(x, PY + 520, w, 128, "the workload's containers", "", TRUSTED, ts=30)
+
+    # the agent answers against the document
+    s.line(x + 90, PY + 174, x + 90, PY + 204, stroke=DOC, marker="a-doc",
+           width=3)
+    s.line(x + 90, PY + 332, x + 90, PY + 520, stroke=TRUSTED, marker="a-ok",
+           width=3)
+    s.text(x + 116, PY + 420, "only what the document allows", size=21,
+           fill=TRUSTED)
+
+    # the one thing that crosses, and the answer that comes back
+    mid = (HX + HW + GX) / 2
+
+    def label(y, txt, size, fill, weight="normal", pad=18):
+        w = size * 0.56 * len(txt) + pad * 2
+        s.box(mid - w / 2, y - size - 6, w, size + 16, stroke=BG, fill=BG, rx=4,
+              width=1)
+        s.text(mid, y, txt, size=size, fill=fill, weight=weight, anchor="middle")
+
+    ay = PY + 330
+    s.line(HX + HW, ay, GX, ay, stroke=INK, width=4, marker="a-dim", dash="6 7")
+    label(ay - 22, "every container request", 24, INK, "600")
+    label(ay + 34, "ttRPC over vsock", 21, DIM)
+
+    by = PY + 440
+    s.line(GX, by, HX + HW, by, stroke=TRUSTED, width=4, marker="a-ok")
+    label(by - 20, "allow / deny", 24, TRUSTED, "700")
+
+    s.text(64, H - 44,
+           "The host asks. The guest answers — against a document it was "
+           "measured with, and the host cannot change.",
+           size=24, fill=DIM)
     return s.render()
 
 
@@ -279,3 +376,6 @@ if __name__ == "__main__":
         p = "%s\\%s.svg" % (a.out, name)
         open(p, "w", encoding="utf-8", newline="\n").write(build(det))
         print("wrote", p)
+    p = "%s\\stack-simple.svg" % a.out
+    open(p, "w", encoding="utf-8", newline="\n").write(build_simple())
+    print("wrote", p)

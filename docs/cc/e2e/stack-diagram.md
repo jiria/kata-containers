@@ -4,8 +4,9 @@
 
 | file | for |
 | --- | --- |
-| `stack-exec.svg` | the opening of the executive cut — few boxes, large type, readable in the seconds a title card gets |
-| `stack-detail.svg` | the same structure with the identifiers, for the doc and for engineers who ask |
+| `stack-simple.svg` | the high-level card — names and boxes only: the host stack, the guest, the boundary, and the one call that crosses it |
+| `stack-exec.svg` | the executive cut's opening — few boxes, large type, readable in the seconds a title card gets |
+| `stack-detail.svg` | the same structure as the exec card with the identifiers, for the doc and for engineers who ask |
 
 Regenerate rather than editing the SVG:
 
@@ -64,6 +65,19 @@ the `manifold-cc` branch or observed on the demo node.
 | SRM: two-phase commit, fragment store, SVN floor | `src/agent/security-reference-monitor/` |
 | COSE_Sign1, did:x509 issuer, svn >= the measured floor | `application/cose-x509+rego`; x5chain in COSE header 33; `RolledBackSvn { issuer, presented, min_required }` at `fragments.rs:597` |
 | every container request — ttRPC over vsock | `CreateContainerRequest`, `ExecProcessRequest`, … |
+
+### Provable from outside
+
+The last clause of the subtitle, and the closing line, say the customer can
+check the same measurement remotely. That rests on three things already cited
+above: the digest is stamped into `HOST_DATA` at launch, `HOST_DATA` comes back
+inside an SNP attestation report signed by the platform, and the initdata the
+guest is given carries `aa.toml` and `cdh.toml` — the attestation agent and the
+confidential data hub — in the same measured `[data]` section as the policy.
+
+The card deliberately stops at "a signed hardware report they can check from
+outside the machine". It does not claim anything about what a relying party
+then releases, because the demo does not show that.
 
 ### Deliberately not on the card
 
