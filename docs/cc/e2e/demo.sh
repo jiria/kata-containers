@@ -979,6 +979,11 @@ EOF
   else
     warn "did not find that digest in the journal — check 'journalctl -t kata'"
   fi
+  # The exec cut has no narration for this comparison — moment 3 goes from the
+  # digest in the report straight to what is running underneath — so in that cut
+  # it plays as a pod launch and a digest pair with nothing said about either.
+  # It stays in the full demo, where the prose on both sides of it is spoken.
+  if [[ "${DEMO_EXEC:-0}" != "1" ]]; then
   say <<'EOF'
 
   Now the point of the whole exercise. The workload here is the command the pod
@@ -1016,6 +1021,7 @@ EOF
   being told what to trust.
 EOF
   pause
+  fi   # end of the workload-change comparison, full demo only
   scene
 
   # Moved here from just after demo-a booted. A pod is only as confidential as
@@ -1180,8 +1186,6 @@ EOF
 
   verity_substitution_experiment
 
-  show "note where the verity device is NOT: the host has no dm devices at all" \
-    "sudo dmsetup ls 2>&1"
   say <<'EOF'
 
   The host built these layers, so it has the bytes and could read them at any

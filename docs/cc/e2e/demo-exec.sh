@@ -352,11 +352,12 @@ segment S07 "m3" "the pod spec, before anything is done to it" act:1 '' <<'VO'
 So who writes that document, and when?
 VO
 
-segment S08 "m3" "genpolicy rewriting the spec — the cc_init_data annotation appears" act:1 '' <<'VO'
+segment S08 "m3" "genpolicy rewriting the spec, then the shape of what it wrote" act:1 '' <<'VO'
 The customer does, before deploying. The Genpolicy tool derives a Rego policy
-from this exact pod spec and writes it back as one annotation. That's the
-measured document the guest enforces: what may run, what may be mounted, who may
-get a shell.
+from this exact pod spec and writes it back as one annotation. Look at the shape
+of it: every request the guest agent can be asked to serve starts denied — what
+may run, what may be mounted, who may get a shell — and the entries generated
+for this pod turn on only what this pod needs.
 VO
 
 segment S09 "m3" "the same digest in the hardware report at launch" act:1 '' <<'VO'
@@ -474,8 +475,8 @@ act_command() {
   # run at the first beat waiting for a cue nobody is going to send.
   [[ "${AUTO}" = "1" && -n "${CUE_DIR}" ]] && cue="DEMO_CUE_DIR=${CUE_DIR} "
   case "$1" in
-    act:frag) printf '%sDEMO_PAUSE=0 DEMO_NARRATE=0 DEMO_STEPS=0 DEMO_HEADINGS=0 bash %s/demo-fragment-sidecar.sh' "${cue}" "${HERE}" ;;
-    act:*)    printf '%sDEMO_PAUSE=0 DEMO_NARRATE=0 DEMO_STEPS=0 DEMO_HEADINGS=0 DEMO_ACTS=%s bash %s/demo.sh' "${cue}" "${1#act:}" "${HERE}" ;;
+    act:frag) printf '%sDEMO_EXEC=1 DEMO_PAUSE=0 DEMO_NARRATE=0 DEMO_STEPS=0 DEMO_HEADINGS=0 bash %s/demo-fragment-sidecar.sh' "${cue}" "${HERE}" ;;
+    act:*)    printf '%sDEMO_EXEC=1 DEMO_PAUSE=0 DEMO_NARRATE=0 DEMO_STEPS=0 DEMO_HEADINGS=0 DEMO_ACTS=%s bash %s/demo.sh' "${cue}" "${1#act:}" "${HERE}" ;;
   esac
 }
 
