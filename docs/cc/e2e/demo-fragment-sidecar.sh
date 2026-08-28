@@ -163,6 +163,22 @@ show() {
 
 NS="${E2E_NS:-coco-e2e}"
 POD=demo-frag-sidecar
+
+# Re-recording from the middle. S22 onward is steps 3-5, and those need nothing
+# steps 1-2 leave behind: step1.yaml is read only by step 1, and POD is reset to
+# FRAG_POD at the top of step 3, which wipes it anyway. Everything steps 3-5 do
+# read -- ca.pem, leaf.pem, fragment-issuers.toml, initdata.toml, the genpolicy
+# build and the registry -- is staged below, before step 1.
+#
+# Only 1 and 3 are offered. Step 2 injects into the pod step 1 started, and
+# steps 4-5 consume the fragment step 3 signs, so those are not entry points --
+# a switch that let you ask for one would be a switch that fails halfway.
+: "${FRAG_FROM:=1}"
+case "${FRAG_FROM}" in
+  1|3) ;;
+  *) printf 'FRAG_FROM must be 1 (the whole moment) or 3 (the fragment build onward, S22)\n' >&2
+     exit 2 ;;
+esac
 # Quiet, for the same reason as demo.sh: staging chatter would land on screen
 # with no command above it. Failures still print the whole log.
 _SETUP_LOG=$(mktemp)
@@ -472,6 +488,14 @@ agent_hvsock_flag() {
 }
 
 # ---------------------------------------------------------------------------
+# Set before the guard: step 3 switches POD to FRAG_POD, and steps 4-5 read the
+# initdata jsonpath, so both have to exist even when steps 1-2 are skipped.
+FRAG_POD=demo-frag-sidecar
+FRAG_INITDATA_JSONPATH='{.metadata.annotations.io\.katacontainers\.config\.hypervisor\.cc_init_data}'
+
+if [[ "${FRAG_FROM}" = 1 ]]; then
+# Deliberately not indented: the say blocks below are heredocs whose terminators
+# must sit at column 0, and indenting the bodies would indent the narration.
 step "1 — a container the measured policy contains"
 say <<'EOF'
 
@@ -487,8 +511,6 @@ pause
 # no fragments — which is exactly what act 1 left behind. Reuse it rather than
 # spending another CVM boot on an identical one. Steps 3-5 do need their own
 # pod, because those carry a measured issuer list act 1's pod does not have.
-FRAG_POD=demo-frag-sidecar
-FRAG_INITDATA_JSONPATH='{.metadata.annotations.io\.katacontainers\.config\.hypervisor\.cc_init_data}'
 if [[ -n "${E2E_BASE_POD:-}" ]] \
    && [[ "$(kubectl get pod "${E2E_BASE_POD}" -n "${NS}" -o jsonpath='{.status.phase}' 2>/dev/null)" = Running ]]; then
   POD="${E2E_BASE_POD}"
@@ -566,6 +588,7 @@ say <<'EOF'
   does not kill the pod, and it does not need the pod restarted to say no.
 EOF
 pause
+fi
 
 # ---------------------------------------------------------------------------
 # The refusal above is its own sentence of narration; the answer to it only

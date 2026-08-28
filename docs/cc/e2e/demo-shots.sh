@@ -74,10 +74,13 @@
 #   ./demo-shots.sh                 every moment, in order (~15 min)
 #   ./demo-shots.sh 1 2             only those moments
 #   DEMO_HOLD=4 ./demo-shots.sh     linger longer on each output
+#   FRAG_FROM=3 ./demo-shots.sh 3   re-record the fragment moment from S22 only
 #
 # Env:
 #   DEMO_HOLD=3     seconds an output stays up before the screen is wiped
 #   DEMO_GAP=1.5    seconds of blank screen between shots (the cut point)
+#   FRAG_FROM=1     1 for all of moment 3, or 3 to start at the fragment build
+#                   (S22) and keep the S19-S21 footage you already have
 #   SHOT_LIST=path  where to write the shot list (default ${WORK}/shots.tsv)
 set -uo pipefail
 
@@ -337,8 +340,12 @@ fi
 # demo with its own fixtures and its own cleanup, and it has to be able to fail
 # without taking the moments already recorded down with it.
 if want_moment 3; then
-  seg S19-S29
-  printf 'S19-S29\t--\tfragments: every beat of demo-fragment-sidecar.sh, one shot each\n' >> "${SHOT_LIST}"
+  # FRAG_FROM=3 skips steps 1-2, so the take starts at the fragment build. The
+  # label follows, because it is what the editor cuts against.
+  FRAG_SEG=S19-S29
+  [[ "${FRAG_FROM:-1}" = 3 ]] && FRAG_SEG=S22-S29
+  seg "${FRAG_SEG}"
+  printf '%s\t--\tfragments: every beat of demo-fragment-sidecar.sh, one shot each\n' "${FRAG_SEG}" >> "${SHOT_LIST}"
   printf '\033[H\033[2J'
   sleep "${DEMO_GAP}"
   # A child process, so its shots cannot be counted here. It keeps the rhythm
@@ -349,7 +356,7 @@ if want_moment 3; then
   # replay — and the fourth delivery only reads as a distinct failure if the
   # decoded leaf is on screen beside it, which is more explaining than the take
   # can afford. The walkthrough still runs all four.
-  DEMO_BEAT_PREFIX=F DEMO_RECEIPT_TAMPER=0 bash "${HERE}/demo-fragment-sidecar.sh" || \
+  DEMO_BEAT_PREFIX=F DEMO_RECEIPT_TAMPER=0 FRAG_FROM="${FRAG_FROM:-1}" bash "${HERE}/demo-fragment-sidecar.sh" || \
     warn "the fragment moment did not finish — the moments already recorded are unaffected"
   # Same reason as demo-a: the fragment pod has stopped being evidence, and the
   # inset is still in frame. demo-fragment-sidecar.sh leaves it deliberately —
