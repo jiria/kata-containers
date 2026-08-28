@@ -584,6 +584,28 @@ POD="${FRAG_POD}"
 # ${WORK}. Leaving act 1's pod up for all of that means the live pod inset spends
 # the whole fragment build showing the spec we have already finished with.
 wipe_pod
+say <<EOF
+
+  Note what the issuer is. Not a key fingerprint and not a name we made up — a
+  did:x509, which is a trust policy written as an identifier: version, hash
+  algorithm, the CA certificate's SHA-256 fingerprint, and the constraints the
+  signing leaf must satisfy.
+
+    ${ISSUER}
+
+  Nothing resolves that over a network; a confidential guest has no egress and
+  needs none. The chain travels inside the envelope, and the identifier is
+  checked against it. The measured initdata pins the CA fingerprint, the leaf's
+  common name and its code-signing EKU, and this build sets require_x509, so the
+  raw-key path is not reachable at all — a chain cannot be stripped to land on a
+  weaker check.
+EOF
+show "the anchor, as measured into this pod's initdata" \
+  "sed -n '/\\[\\[ca_anchor\\]\\]/,/^\$/p' ${WORK}/fragment-issuers.toml"
+show "and the chain that has to satisfy it" \
+  "openssl x509 -in ${WORK}/leaf.pem -noout -subject -issuer -ext extendedKeyUsage 2>/dev/null; echo; echo -n 'CA SHA-256: '; openssl x509 -in ${WORK}/ca.pem -outform DER 2>/dev/null | sha256sum | cut -d' ' -f1"
+pause
+
 say <<'EOF'
 
   Before anything is signed, the fragment's contents have to come from
@@ -681,26 +703,6 @@ say <<'EOF'
   is refused, and it is refused before it lands anywhere.
 EOF
 pause
-say <<EOF
-
-  Note what the issuer is. Not a key fingerprint and not a name we made up — a
-  did:x509, which is a trust policy written as an identifier: version, hash
-  algorithm, the CA certificate's SHA-256 fingerprint, and the constraints the
-  signing leaf must satisfy.
-
-    ${ISSUER}
-
-  Nothing resolves that over a network; a confidential guest has no egress and
-  needs none. The chain travels inside the envelope, and the identifier is
-  checked against it. The measured initdata pins the CA fingerprint, the leaf's
-  common name and its code-signing EKU, and this build sets require_x509, so the
-  raw-key path is not reachable at all — a chain cannot be stripped to land on a
-  weaker check.
-EOF
-show "the anchor, as measured into this pod's initdata" \
-  "sed -n '/\\[\\[ca_anchor\\]\\]/,/^\$/p' ${WORK}/fragment-issuers.toml"
-show "and the chain that has to satisfy it" \
-  "openssl x509 -in ${WORK}/leaf.pem -noout -subject -issuer -ext extendedKeyUsage 2>/dev/null; echo; echo -n 'CA SHA-256: '; openssl x509 -in ${WORK}/ca.pem -outform DER 2>/dev/null | sha256sum | cut -d' ' -f1"
 
 say <<EOF
 
