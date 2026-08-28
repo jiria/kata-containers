@@ -7,6 +7,7 @@
 | `stack-before.svg` | before deployment on its own — pod spec → genpolicy → the measured document → its digest |
 | `stack-launch.svg` | the launch path — the digest into `HOST_DATA`, and the guest re-deriving it |
 | `stack-enforce.svg` | inside the guest — a request from arrival to verdict |
+| `stack-fragment.svg` | extending the policy at runtime — signature, issuer, version floor |
 | `stack-simple.svg` | the high-level card — names and boxes only: the host stack, the guest, the boundary, and the one call that crosses it |
 | `stack-exec.svg` | the executive cut's opening — few boxes, large type, readable in the seconds a title card gets |
 | `stack-detail.svg` | the same structure as the exec card with the identifiers, for the doc and for engineers who ask |
@@ -101,6 +102,7 @@ above.
 | `stack-before` | the document is derived from the pod spec | every request starts denied · the host never contributes to the document, it only carries it |
 | `stack-launch` | the digest is stamped in at launch | the host cannot choose what the hardware records · the guest hashes what it was actually served, and a mismatch stops the VM |
 | `stack-enforce` | a request is answered against the document | the host decides what to ask for, not what the answer is · the document cannot be substituted |
+| `stack-fragment` | the policy is extended at runtime | the host can deliver a fragment but cannot make the guest accept one · only the signature is trusted, and the measured document decides whose signature counts |
 
 Two claims on `stack-enforce` that are not in the table above:
 
@@ -108,6 +110,14 @@ Two claims on `stack-enforce` that are not in the table above:
   denies by default, and the generated entries turn on only what the pod needs.
 - **nothing half-applied is left** — the SRM applies changes as two-phase
   transactions, `src/agent/security-reference-monitor/`.
+
+`stack-fragment` restates the fragment row of the table above: `COSE_Sign1`
+with media type `application/cose-x509+rego`, a did:x509 issuer derived from
+the x5chain in COSE header 33, and the SVN floor enforced as
+`RolledBackSvn { issuer, presented, min_required }` in `fragments.rs:597`. The
+issuer set and the floor both come from `fragment-issuers.toml`, which is part
+of the measured document — so accepting a fragment never changes what the
+hardware measured at launch, and the card says so.
 
 ## Consistency with the demo
 

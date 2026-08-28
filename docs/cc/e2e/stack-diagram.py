@@ -648,6 +648,94 @@ def build_enforce():
     return s.render()
 
 
+def build_fragment():
+    """Extending the measured policy at runtime, without redeploying."""
+    s = Svg()
+
+    s.text(64, 62, "Extending the policy", size=38, weight="600")
+    s.text(64, 102,
+           "a signed rule, from an issuer the measured document already named, "
+           "at or above the version floor it set",
+           size=24, fill=DIM)
+
+    ZY, ZH = 300, 420
+    BOUND = 515
+    s.text(94, ZY - 42, "FROM THE HOST", size=22, fill=UNTRUSTED, weight="700",
+           spacing=2)
+    s.text(94, ZY - 14, "it delivers, and that is all", size=20, fill=DIM)
+
+    s.box(540, ZY, 1310, ZH, stroke=TRUSTED, dash="6 8", rx=16, opacity=0.4)
+    s.text(564, ZY - 42, "INSIDE THE CVM", size=22, fill=TRUSTED, weight="700",
+           spacing=2)
+    s.text(564, ZY - 14, "where it is accepted, or is not", size=20, fill=DIM)
+
+    s.line(BOUND, ZY - 66, BOUND, ZY + ZH + 30, stroke=TRUSTED, width=4,
+           opacity=0.6)
+    s.add('<text x="%d" y="%d" transform="rotate(-90 %d %d)" font-family="'
+          "'Segoe UI', Arial, sans-serif\" font-size=\"16\" fill=\"%s\" "
+          'text-anchor="middle" letter-spacing="2" opacity="0.8">%s</text>'
+          % (BOUND + 6, ZY + ZH + 140, BOUND + 6, ZY + ZH + 140, TRUSTED,
+             "HARDWARE BOUNDARY"))
+
+    BY, BH, BW = ZY + 60, 300, 380
+    xs = [100, 570, 1015, 1460]
+
+    def card(x, title, lines, accent, fill=None, mono=(), ts=27):
+        s.box(x, BY, BW, BH, stroke=accent, fill=fill or "none", rx=10,
+              opacity=1 if fill else 0.9)
+        s.text(x + 26, BY + 56, title, size=ts, weight="600")
+        for i, ln in enumerate(lines):
+            s.text(x + 26, BY + 106 + 32 * i, ln, size=20, fill=DIM,
+                   mono=(i in mono))
+
+    card(xs[0], "the fragment",
+         ["a signed Rego rule, handed in",
+          "while the pod is running",
+          "",
+          "COSE_Sign1",
+          "application/cose-x509+rego"],
+         INK, mono={3, 4})
+
+    card(xs[1], "whose rule is it",
+         ["a did:x509 identity, derived",
+          "from the certificate chain",
+          "carried in the signature",
+          "",
+          "must be one the document named"],
+         DOC, fill="#0d2136")
+
+    card(xs[2], "is it new enough",
+         ["every fragment carries an SVN,",
+          "and the measured policy set",
+          "the floor it must clear",
+          "",
+          "below the floor → refused"],
+         WARM)
+
+    card(xs[3], "then it applies",
+         ["added in two phases, so a",
+          "refusal leaves nothing behind",
+          "",
+          "the pod was never restarted,",
+          "and the measurement is unchanged"],
+         TRUSTED, fill="#0d2a17")
+
+    for i, col in ((0, INK), (1, DOC), (2, WARM)):
+        s.line(xs[i] + BW + 12, BY + BH / 2, xs[i + 1] - 12, BY + BH / 2,
+               stroke=col, width=3,
+               marker={INK: "a-ink", DOC: "a-doc", WARM: "a-warm"}[col])
+
+    s.text(64, H - 76,
+           "The host can deliver a fragment. It cannot make the guest accept "
+           "one.",
+           size=23, fill=DIM)
+    s.text(64, H - 40,
+           "Nothing about a fragment is trusted except its signature — and the "
+           "measured document decides whose signature counts.",
+           size=23, fill=WARM)
+    return s.render()
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default=r"C:\Users\jiria\demo-exec")
@@ -667,4 +755,7 @@ if __name__ == "__main__":
     print("wrote", p)
     p = "%s\\stack-enforce.svg" % a.out
     open(p, "w", encoding="utf-8", newline="\n").write(build_enforce())
+    print("wrote", p)
+    p = "%s\\stack-fragment.svg" % a.out
+    open(p, "w", encoding="utf-8", newline="\n").write(build_fragment())
     print("wrote", p)
