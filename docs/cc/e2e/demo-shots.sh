@@ -146,6 +146,18 @@ show() {
   _shots_show "$@"
 }
 
+# start_demo_pod runs a command and holds on it like any other shot, but it does
+# it with _prompt rather than show, so it never reached the shot list -- the
+# apply was on screen with nothing in the record to cut against. Wrapped for the
+# same reason as show: the list has to be what the take actually filmed.
+eval "_shots_start_demo_pod() $(declare -f start_demo_pod | tail -n +2)"
+start_demo_pod() {
+  _SHOT_N=$((_SHOT_N + 1))
+  printf '%s\t%02d\t%s\n' "${_SEG}" "${_SHOT_N}" \
+    "apply the pod spec and wait for the CVM to boot ($1)" >> "${SHOT_LIST}"
+  _shots_start_demo_pod "$@"
+}
+
 want_moment() { [[ -z "${MOMENTS}" || ",${MOMENTS}," == *",$1,"* ]]; }
 
 MOMENTS="$(printf '%s' "${*:-}" | tr ' ' ',')"
