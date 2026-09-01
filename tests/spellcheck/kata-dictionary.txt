@@ -24,6 +24,7 @@ msrc
 bootc
 materialx
 ostree
+pathrs
 
 # Hardware & Architecture
 AMD
@@ -141,6 +142,9 @@ UNBINDABLE
 RAII
 Virt
 sysfs
+BYOI
+pullable
+SRPM
 
 # Confidential containers / PARMA hardening terms
 COSE

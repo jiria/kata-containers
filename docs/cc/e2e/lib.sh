@@ -44,6 +44,10 @@ set -uo pipefail
 # steps the hashes disagree and the guest refuses a pod nobody tampered with -- a real
 # denial with a misleading cause. A digest makes both parties name the same bytes.
 : "${E2E_BUSYBOX_IMAGE:=mcr.microsoft.com/azurelinux/busybox@sha256:e3ead6d406efe76dc1da586756c0e9142442f7320644a13d5cc0a55598a080fe}"
+# Remember whether the caller named a RuntimeClass before the defaults below fill
+# one in. On the aks platform discovery reads the cluster's actual RuntimeClasses
+# and would otherwise silently overwrite a deliberate choice.
+E2E_RUNTIMECLASS_EXPLICIT="${E2E_RUNTIMECLASS:+1}"
 case "${E2E_PLATFORM}" in
   qemu-coco-dev)
     # Standard_DC16as_cc_v5 is a SEV-SNP CC SKU. See README for the region/quota
@@ -89,8 +93,34 @@ case "${E2E_PLATFORM}" in
     : "${E2E_GUEST_IMAGE_NAME:=kata-containers.img}"
     : "${E2E_GUEST_IGVM_NAME:=kata-containers-igvm.img}"
     ;;
+  aks)
+    # A prebuilt node image on AKS. Nothing is provisioned or built here: the
+    # cluster and the guest stack already exist, so stages 01-04 are replaced by
+    # 00-adopt-node.sh, which inspects the node and records what it found.
+    #
+    # The layout mirrors clh-snp because that is what the Azure Linux node-builder
+    # produces and what the image carries — but every value below is a *default*
+    # that 00-adopt-node.sh overwrites with what the node actually has. Trusting
+    # these instead of probing is how a suite ends up asserting against a path
+    # that does not exist on the machine under test.
+    : "${E2E_RUNTIMECLASS:=kata-cc}"
+    : "${E2E_KATA_PREFIX:=/opt/confidential-containers}"
+    : "${E2E_GUEST_IMAGE_NAME:=kata-containers.img}"
+    : "${E2E_GUEST_IGVM_NAME:=kata-containers-igvm.img}"
+    # Not used to provision anything — AKS owns the node pool — but recorded and
+    # printed so a run says which SKU it was validated against. The v6 CC sizes
+    # are the current generation; only the 8- and 32-vCPU shapes exist (there is
+    # no DC16as_cc_v6), and unlike v5 they are offered in belgiumcentral. Check
+    # with `az vm list-skus -l <region>` before creating a pool: the CC SKUs are
+    # sparsely distributed and a missing one reports as a quota error.
+    : "${E2E_VM_SIZE:=Standard_DC8as_cc_v6}"
+    : "${E2E_VM_IMAGE:=n/a-aks-managed}"
+    : "${E2E_VM_SECURITY_TYPE:=n/a}"
+    : "${E2E_OS_DISK_GB:=0}"
+    : "${E2E_PKG:=dnf}"
+    ;;
   *)
-    echo "unsupported E2E_PLATFORM=${E2E_PLATFORM} (expected qemu-coco-dev or clh-snp)" >&2
+    echo "unsupported E2E_PLATFORM=${E2E_PLATFORM} (expected qemu-coco-dev, clh-snp or aks)" >&2
     exit 1
     ;;
 esac
@@ -265,6 +295,15 @@ ${stray}"; return 1
 # predicate drift apart silently, and the drift is invisible exactly when one of
 # them has been weakened.
 assert_local_guest_installed() {
+  # On AKS there is no local build to compare against: the image arrived
+  # prebuilt. The equivalent claim — same node, same image, and that image was
+  # verified to carry the strict agent at adoption time — lives in
+  # platform-aks.sh so there is still exactly one transcription of it.
+  if [[ "${E2E_PLATFORM}" = "aks" ]]; then
+    aks_assert_adopted_guest
+    return
+  fi
+
   local rec="${E2E_STATE_DIR}/guest-image-sha256"
   local img="${E2E_GUEST_IMAGE}"
   [[ -f "${rec}" ]] || die "no record of a locally built guest image — run 04-build-guest-stack.sh first"
@@ -309,6 +348,34 @@ assert_local_guest_installed() {
   done
   ok "guest pinned by dm-verity to the locally built image (${#cfgs[@]} config(s))"
   ok "testing guest built from $(cat "${E2E_STATE_DIR}/guest-image-commit" 2>/dev/null || echo unknown)"
+}
+
+# The `nodeName:` line that pins a workload to the node under test, or nothing
+# on the platforms where the cluster is single-node by construction.
+#
+# Every AKS manifest has to carry it, not just stage 05: the assertions there are
+# about one specific node's *image*, and a pod the scheduler placed elsewhere in
+# a multi-node pool would be measuring something this run has made no claim
+# about. Emitted through one helper so a new stage cannot quietly forget it.
+# Intended to sit on its own line inside a heredoc; expands to an empty line,
+# which YAML ignores, on other platforms.
+pod_pin() {
+  [[ "${E2E_PLATFORM}" = "aks" ]] || return 0
+  printf '  nodeName: %s' "${E2E_NODE}"
+}
+
+# Create a namespace and wait until it can actually hold pods. `kubectl create
+# ns` returns before the service-account controller has populated the namespace,
+# and a pod applied into that window is rejected outright with `error looking up
+# service account <ns>/default`. The gap is small enough to be invisible on a
+# warm cluster and reliable on a freshly built one, which makes it a flake that
+# shows up exactly when a run is least expected to fail.
+ensure_ns() {
+  local ns="$1"
+  kubectl get ns "${ns}" >/dev/null 2>&1 || kubectl create ns "${ns}" >/dev/null \
+    || die "could not create namespace ${ns}"
+  wait_for 180 "namespace ${ns} to have its default ServiceAccount" \
+    kubectl -n "${ns}" get serviceaccount default
 }
 
 # Wait until a shell predicate succeeds.  wait_for <timeout-s> <desc> <cmd...>
@@ -528,7 +595,7 @@ ensure_genpolicy_defaults() {
       [[ -f "${GP_RULES}" ]]    || die "missing ${GP_RULES} — run stage 03 first"
       [[ -f "${GP_SETTINGS}" ]] || die "missing ${GP_SETTINGS} — run stage 03 first"
       ;;
-    clh-snp)
+    clh-snp|aks)
       local src="${E2E_REPO_DIR}/src/tools/genpolicy" dst="${E2E_STATE_DIR}/genpolicy"
       mkdir -p "${dst}"
       # The staged copy is never edited now, so it can simply track the branch:
@@ -562,12 +629,28 @@ ensure_genpolicy_defaults() {
       #
       # The failure is deceptive: the workload's layers match perfectly and only
       # the sandbox layer is refused, which reads as a dm-verity defect rather
-      # than an image-name skew. This one really is environment, not branch, so
-      # it is exactly what a drop-in is for. Ask containerd what it will run
-      # rather than hardcoding a value that silently rots when k8s bumps pause.
-      local sandbox_image declared_pause dropin="${dropin_dir}/10-pause-image-drop-in.json"
-      sandbox_image="$(sudo containerd config dump 2>/dev/null \
-        | sed -n "s/^[[:space:]]*sandbox = '\(.*\)'[[:space:]]*$/\1/p" | head -1)"
+      # than an image-name skew. Ask containerd what it will actually run
+      # instead of hardcoding a value that silently rots when k8s bumps pause.
+      #
+      # Where containerd is asked from differs by platform: clh-snp runs the
+      # suite on the node itself, aks reaches the node through the inspector
+      # pod. Three spellings of "sandbox image" have to be accepted either way —
+      # containerd 2.x puts it under the CRI runtime plugin as `sandbox = '...'`,
+      # 1.x writes `sandbox_image = "..."`, and the `crictl info` fallback emits
+      # JSON with the field camelCased as "sandboxImage".
+      local sandbox_image declared_pause dump
+      local dropin="${dropin_dir}/10-pause-image-drop-in.json"
+      if [[ "${E2E_PLATFORM}" = "aks" ]]; then
+        dump="$(aks_containerd_config_dump)"
+      else
+        dump="$(sudo containerd config dump 2>/dev/null)"
+      fi
+      sandbox_image="$(sed -n \
+        -e "s/^[[:space:]]*sandbox = '\(.*\)'[[:space:]]*$/\1/p" \
+        -e 's/^[[:space:]]*sandbox_image[[:space:]]*=[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' \
+        -e 's/^[[:space:]]*"sandbox_image":[[:space:]]*"\([^"]*\)".*$/\1/p' \
+        -e 's/^[[:space:]]*"sandboxImage":[[:space:]]*"\([^"]*\)".*$/\1/p' \
+        <<<"${dump}" | head -1)"
       if [[ -n "${sandbox_image}" ]]; then
         declared_pause="$(sed -n 's|.*"pause_container_image": "\([^"]*\)".*|\1|p' \
           "${dst}/genpolicy-settings.json" | head -1)"
@@ -686,5 +769,14 @@ if [[ "${E2E_PLATFORM}" = "clh-snp" ]]; then
   # call and the stage would still report PASS. Fail loudly instead.
   command -v clh_bootstrap_node >/dev/null \
     || die "platform-clh-snp.sh did not load cleanly — clh_* helpers are missing.
+A common cause is CRLF line endings after editing the file on Windows."
+fi
+
+if [[ "${E2E_PLATFORM}" = "aks" ]]; then
+  # shellcheck source=platform-aks.sh
+  . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/platform-aks.sh"
+
+  command -v aks_assert_adopted_guest >/dev/null \
+    || die "platform-aks.sh did not load cleanly — aks_* helpers are missing.
 A common cause is CRLF line endings after editing the file on Windows."
 fi

@@ -95,16 +95,101 @@ Action and temporal properties:
 ## Run
 
 ```bash
+./check-all.sh        # the FR-15 gate: all three obligations, one exit code
+./check-all.sh --model   # TLC + mutation only (needs a JRE, no Rust toolchain)
+./check-all.sh --drift   # the Rust drift lint only (no JRE)
+```
+
+`check-all.sh` is what CI runs (`.github/workflows/formal-check.yaml`), as a **required**
+check (`tools/testing/gatekeeper/required-tests.yaml`). The workflow is deliberately not
+path-filtered: gatekeeper seeds every required job as `EXPECTED` and waits for it to report,
+so a filtered workflow that does not run would block rather than pass. It also could not be
+filtered on the monitor's own directory anyway — the drift lint reads `src/agent/src/rpc.rs`,
+which holds five of the six modelled quarantine call sites.
+
+FR-15 does not claim that a model *exists*; it claims that the model is checked, that the
+properties it checks are falsifiable, and that the model still describes the Rust code. Those
+are three separate
+obligations, discharged by three different tools, and binding them into one command is how
+they stop being reported green individually while a gap opens between them:
+
+| Obligation                          | Tool                      | Failure it catches                                  |
+| ----------------------------------- | ------------------------- | --------------------------------------------------- |
+| The model holds                     | `run-tlc.sh`              | a property is violated, or an action can never fire |
+| The properties bite                 | `mutation-test.py`        | a property is vacuous, or has no mutant at all      |
+| The model is still true of the code | `../tests/model_drift.rs` | the model and the Rust have drifted apart           |
+
+The individual tools can still be run directly:
+
+```bash
 ./run-tlc.sh          # fetches tla2tools.jar if needed, runs TLC
 ./mutation-test.py    # proves the properties above are not vacuous
 ```
 
+`run-tlc.sh` pins `tla2tools.jar` **by sha256**, not just by version tag. Once this check
+gates the security model in CI, the tool that certifies the model is itself a supply-chain
+input to the assurance argument. If neither `sha256sum` nor `shasum` is available the script
+**fails** rather than continuing: "could not verify" and "verified" must not take the same
+branch.
+
 Deadlock checking is disabled because the model legitimately terminates (every operation
 reaches a terminal state or the monitor quarantines), so a "deadlock" is an expected end
 state rather than a defect.
+
+### Action coverage
+
+TLC runs with `-coverage 1` and `run-tlc.sh` **fails** if any action generated zero states.
+An action that never fires is a guard that contradicts itself: every property is then checked
+over a smaller state space than the module claims. That is the same vacuity class
+`mutation-test.py` defends against, seen from the transition side rather than the property
+side, and it is how an earlier revision of `CommitFails` was wrong.
+
+The check is driven from the action names parsed out of `Next`, and it fails if any of them
+has no coverage row at all. Inspecting only the rows that happen to be present would make the
+gate self-defeating: were TLC's output format to change, or `-coverage` to be dropped, every
+filter would match nothing and the script would report that all actions fired while checking
+none of them — the same vacuity it exists to catch.
+
+An action that fires but produces no *distinct* state is reported as a **warning**, not a
+failure. `AbandonPrepared` is currently in this category: it is transition-equivalent to
+`Abort` restricted to `"prepared"`. It is kept deliberately — it mirrors a distinct code path
+(`reclaim_orphans`) and is worth the traceability — but it adds no proof obligation, and the
+warning exists so that nobody mistakes its presence for coverage of that path.
+
+### Mutation testing
 
 `mutation-test.py` breaks one implementation-faithful guard at a time and requires TLC to
 report a violation *of the property that mutation targets*. A surviving mutant — or one
 caught only by an unrelated property — means the targeted property is vacuous, which is the
 failure mode an earlier revision of this model actually had, where `TerminalExclusive`
 asserted only that a variable did not hold two values at once.
+
+It also asserts the mapping in **both** directions: every property listed in `SRM.cfg` must be
+the target of at least one mutant, and every mutant target must appear in `SRM.cfg`. A
+property added to the config without a mutant has never been shown to be falsifiable; a
+mutant targeting a property the config does not check can never be caught.
+
+## Drift between the model and the code
+
+A model is a claim about code, and it decays silently. `../tests/model_drift.rs` runs as an
+ordinary `cargo test` and cross-checks three things that the model asserts about the Rust and
+that no compiler would notice going stale:
+
+- every quarantine cause in `SRM.tla`'s `Causes` has a real call site in `lib.rs`/`rpc.rs`,
+  and vice versa;
+- every production `quarantine(` call site is claimed by exactly one modelled cause, and each
+  cause claims exactly one site — a bijection, not a count (test-only calls are excluded, so
+  adding a test cannot mask a new production path);
+- every property defined in `SRM.tla` is actually listed in `SRM.cfg`, so a property cannot
+  be written and then never checked.
+
+A cause is matched against the reason expression *at its call site*, not against the file as
+a whole. The difference matters: most sites build the reason inline, but the FR-9
+occurrence-divergence site binds `let reason = format!(...)` so it can both log and return
+the same text, and a whole-file search would go on passing if that text were left in the log
+line while the `quarantine()` call itself came to say something else. The lint follows that
+single binding hop, so the cause↔call-site mapping it advertises is the one it enforces.
+
+The lint reads the Rust sources as text rather than instrumenting them: the point is to fail
+when someone adds a seventh quarantine site without touching the model, which is precisely
+the case no type system catches.

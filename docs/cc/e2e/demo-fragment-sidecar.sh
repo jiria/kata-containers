@@ -256,7 +256,7 @@ LEDGER()  { ( cd "${E2E_REPO_DIR}" && cargo run -q --example mock-ledger \
 CTL="${E2E_REPO_DIR}/target/release/kata-agent-ctl"
 
 WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
-kubectl get ns "${NS}" >/dev/null 2>&1 || kubectl create ns "${NS}" >/dev/null
+ensure_ns "${NS}"
 
 # FR-1f: a transparency ledger keypair for step 5. Only the public half is
 # measured into initdata; the private half never leaves this directory, and a

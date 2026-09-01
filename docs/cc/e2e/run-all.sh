@@ -17,9 +17,26 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "${HERE}/lib.sh"
 
-ALL=(01-provision-vm 02-bootstrap-node 03-deploy-cluster
+ALL=(00-adopt-node
+     01-provision-vm 02-bootstrap-node 03-deploy-cluster
      04-build-guest-stack 05-smoke-test 06-policy-fragment-e2e
      07-fragment-bootpull 08-lifecycle-gates)
+
+# 00 and 01-04 are alternatives, not a sequence: 00 adopts a prebuilt image and
+# 01-04 build one. Running the wrong set is not a no-op — 04 on an AKS node would
+# try to install a second guest stack over the one under test — so pick by
+# platform rather than leaving it to the caller to remember.
+#
+# Narrow the list before arguments are matched against it, not after: an
+# explicitly named stage has to be refused for the same reason a defaulted one
+# does. `./run-all.sh 04` on AKS would otherwise overwrite the very image the
+# run exists to validate.
+if [[ "${E2E_PLATFORM}" = "aks" ]]; then
+  ALL=(00-adopt-node 05-smoke-test 06-policy-fragment-e2e
+       07-fragment-bootpull 08-lifecycle-gates)
+else
+  ALL=("${ALL[@]:1}")
+fi
 
 if [[ "$#" -gt 0 ]]; then
   SELECTED=()
@@ -28,7 +45,8 @@ if [[ "$#" -gt 0 ]]; then
     for s in "${ALL[@]}"; do
       case "${s}" in "${want}"|"${want}"-*) SELECTED+=("${s}"); found=1; break ;; esac
     done
-    [[ -n "${found}" ]] || die "unknown stage: ${want} (have: ${ALL[*]})"
+    [[ -n "${found}" ]] || die "stage ${want} is not available on platform ${E2E_PLATFORM}
+(have: ${ALL[*]})"
   done
 else
   SELECTED=("${ALL[@]}")

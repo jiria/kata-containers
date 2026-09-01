@@ -217,13 +217,14 @@ All settings live at the top of `lib.sh` and are environment-overridable.
 | `E2E_FAST` | `0` | Dev-loop mode. Reduces assurance — see below. |
 | `E2E_SKIP_BUILD` | `0` | Install the tarballs already in `build/` without rebuilding. |
 | `E2E_REGION` | `eastus` | See the region trap below. |
-| `E2E_VM_SIZE` | `Standard_DC16as_cc_v5` | Confidential-capable **host** SKU (nested virt). The node itself is a normal VM. |
+| `E2E_VM_SIZE` | `Standard_DC16as_cc_v5` (`aks`: `Standard_DC8as_cc_v6`) | Confidential-capable **host** SKU (nested virt). The node itself is a normal VM. |
 | `E2E_VM_SECURITY_TYPE` | `Standard` | See "The node is not a confidential VM" below. |
 | `E2E_BRANCH` | `manifold-cc` | Branch under test. Defaults with `E2E_REPO_URL` to where this branch lives. |
 | `E2E_REPO_URL` | `https://github.com/microsoft/kata-containers.git` | Fork the node clones. Override together with `E2E_BRANCH`. |
 | `E2E_REPO_DIR` | `~/kata-containers` | Checkout on the node. |
 | `E2E_STRICT_POLICY` | `yes` | Pulls in the security reference monitor. Set to `no` for a non-strict A/B leg — stage 04 asserts in whichever direction you ask for, so a non-strict build is verified too rather than silently accepted. Note that an operator `env.sh` must not `export` this unconditionally, or it will clobber a per-run override. |
 | `E2E_NIGHTLY_SHA` | *(required for stage 03)* | CI-nightly commit sha. |
+| `E2E_HANDLER_CONFIG` | *(auto)* | `aks` only. The `configuration.toml` the RuntimeClass's containerd handler resolves to. Stage 00c normally reads this from `ConfigPath`; set it when a handler declares none, because a handler whose config cannot be located cannot be tied to a payload and the stage refuses to guess. |
 | `E2E_REGISTRY` | `localhost:5000` | Registry for the policy fragment. Loopback starts a throwaway `registry:2`. Overridden when `E2E_ACR` resolves. |
 | `E2E_ACR` | *(empty)* | `auto` provisions/adopts an ACR so stage 07 exercises a real TLS pull; a name adopts that registry; empty stays on loopback, which now also works. |
 | `E2E_ACR_RG` / `_SKU` | `$E2E_RG` / `Standard` | Where and how `ensure_acr` creates the registry. Anonymous pull needs Standard or better; Basic rejects it. |
@@ -399,16 +400,16 @@ az vm list-usage --location westus --query "[?contains(localName,'DCACCV5')]" -o
 is derived in one `case` block at the top of `lib.sh`, so the stages themselves
 stay declarative.
 
-| | `qemu-coco-dev` (default) | `clh-snp` |
-| --- | --- | --- |
-| Hypervisor | QEMU + KVM | Cloud Hypervisor + MSHV |
-| Guest | ordinary VM, **not attested** | real SEV-SNP CVM |
-| Node OS | Ubuntu 24.04 | Azure Linux 3 |
-| Installed by | kata-deploy (Helm) | `make all-confpods` from `tools/osbuilder/node-builder/azure-linux` |
-| Prefix | `/opt/kata` | `/opt/confidential-containers` |
-| RuntimeClass | `kata-qemu-coco-dev-runtime-rs` | `kata-cc` |
-| genpolicy | ships in the kata-deploy image | **none** — built from the branch |
-| Verity pin | patched into `configuration-*.toml` | baked into the IGVM kernel cmdline |
+| | `qemu-coco-dev` (default) | `clh-snp` | `aks` |
+| --- | --- | --- | --- |
+| Hypervisor | QEMU + KVM | Cloud Hypervisor + MSHV | Cloud Hypervisor + MSHV |
+| Guest | ordinary VM, **not attested** | real SEV-SNP CVM | real SEV-SNP CVM |
+| Node OS | Ubuntu 24.04 | Azure Linux 3 | Azure Linux 3 (AKS node image) |
+| Installed by | kata-deploy (Helm) | `make all-confpods` from `tools/osbuilder/node-builder/azure-linux` | **already baked into the node image** |
+| Prefix | `/opt/kata` | `/opt/confidential-containers` | `/opt/confidential-containers` |
+| RuntimeClass | `kata-qemu-coco-dev-runtime-rs` | `kata-cc` | discovered on the cluster |
+| genpolicy | ships in the kata-deploy image | **none** — built from the branch | **none** — built from the branch |
+| Verity pin | patched into `configuration-*.toml` | baked into the IGVM kernel cmdline | baked into the IGVM kernel cmdline |
 
 The two answer different questions. `qemu-coco-dev` is fast and exercises the
 policy logic, the agent and the guest-pull path, which is most of what changes
@@ -428,6 +429,97 @@ Note that `AGENT_POLICY_FILE=allow-all.rego`, which the node-builder README
 passes, is deliberately **not** used here — it would make stages 05–08 vacuous.
 The default for a release build is `allow-set-policy.rego`, which is what these
 tests need.
+
+### `aks` — validating a prebuilt node image
+
+`E2E_PLATFORM=aks` does not build anything. It points the suite at a cluster
+whose nodes already run an image someone else produced, and asks whether that
+image was assembled correctly. Stage `00-adopt-node.sh` replaces stages 01–04:
+it discovers the node, finds the payload, checks the RuntimeClass wiring,
+inspects the shipped guest agent, and records a baseline — then marks 01–04 done
+so stage 05 onwards run unchanged.
+
+```bash
+export KUBECONFIG=~/.kube/aks.config
+export E2E_PLATFORM=aks
+export E2E_STATE_DIR=$HOME/.coco-e2e-aks   # keep it away from a build run's state
+export E2E_REPO_DIR=$HOME/kata-containers  # genpolicy is built from here
+./00-adopt-node.sh && ./05-smoke-test.sh
+```
+
+A node pool carrying an image built elsewhere is created with the BYOI custom
+headers. The SKU must be a confidential-container one (`_cc_`); the v6
+generation comes in 8- and 32-vCPU shapes only — there is no `DC16as_cc_v6` —
+and is offered in regions where no v5 CC SKU is, `belgiumcentral` among them.
+`az vm list-skus -l "$LOCATION"` before you create the pool: an absent SKU
+surfaces as a quota error rather than as "not offered here".
+
+```bash
+az aks create -g "$RG" -n "$CLUSTER" -l "$LOCATION" \
+  --node-count 1 --node-vm-size Standard_DC8as_cc_v6 \
+  --os-sku AzureLinux --workload-runtime KataVmIsolation \
+  --node-os-upgrade-channel None --generate-ssh-keys \
+  --aks-custom-headers \
+"AKSHTTPCustomFeatures=Microsoft.ContainerService/UseCustomizedOSImage,\
+OSImageSubscriptionID=<sub>,OSImageResourceGroup=<rg>,OSImageGallery=<gallery>,\
+OSImageName=AzureLinuxV3gen2,OSImageVersion=<version>,OSSKU=AzureLinux,\
+OSDistro=CustomizedImageKata"
+```
+
+Note that `--workload-runtime KataVmIsolation` provisions its own RuntimeClass,
+and on the images seen so far that class points at the node's *legacy* kata
+handler rather than the confidential one — which is the second failure below.
+Expect to create your own RuntimeClass over the right handler.
+
+Stage 00 exists because a wrong image still looks healthy. Three failures it is
+built to catch, all of which produce a *running pod* and no error anywhere:
+
+- **The agent is not the strict one.** An agent built without the security
+  reference monitor, or without `--features devicemapper`, boots fine. 00e
+  loop-mounts `kata-containers.img` on the node and greps the agent binary
+  rather than trusting the image label. Note that a shipped agent is stripped,
+  so the SRM shows up only as the panic-location paths
+  (`src/agent/security-reference-monitor/...`), not as symbol names.
+- **The RuntimeClass runs the wrong stack.** A node can carry two complete kata
+  installs — a legacy one under `/usr/share` and the confidential one under
+  `/opt/confidential-containers` — each with its own containerd handler,
+  `ConfigPath`, guest image and `enable_annotations` list. If the RuntimeClass
+  resolves to the legacy handler, `cc_init_data` is not in its allowlist, so the
+  generated policy is dropped **silently**: the pod comes up and `exec` is
+  allowed. 00c ties the handler's `ConfigPath` back to the payload prefix and
+  checks the allowlist, and prints the handler table so you can see which
+  handler you should have used.
+- **The layers do not arrive the way the policy describes them.** This suite
+  generates policy for the host-EROFS + dm-verity path, where layers are built
+  and hashed on the node and attached to the guest as verified block devices.
+  A handler on the `nydus` snapshotter pulls inside the guest instead, where no
+  host-side root hash exists; and an EROFS differ with `enable_dmverity = false`
+  or unpinned `mkfs_options` produces layers whose digests genpolicy cannot
+  predict. All three end the same way — every container refused, with the error
+  pointing at storages rather than at the configuration — so 00d reads the
+  node's containerd config and asserts the transport before anything is built.
+
+Two AKS-specific traps worth knowing. A RuntimeClass carries
+`scheduling.nodeSelector`, which the API server copies onto every pod using it;
+if the node lacks those labels the pod is rejected by kubelet with an opaque
+`Predicate NodeAffinity failed`, so 00a checks this for the class it is about to
+use — whether that class was discovered or supplied through `E2E_RUNTIMECLASS`.
+And on AKS those labels are system-managed —
+`aks-node-validating-webhook` refuses to let you add them by hand, so if the
+provisioned RuntimeClass is unusable the way forward is a new RuntimeClass with no
+nodeSelector over the correct handler.
+
+Every AKS pod is pinned to the adopted node with `nodeName`, through the shared
+`pod_pin` helper in `lib.sh` rather than per-stage, because the assertions are
+about one node's image and a multi-node pool would otherwise let the scheduler
+measure something this run made no claim about. For the same reason `run-all.sh`
+narrows its stage list by platform *before* matching arguments: `./run-all.sh 04`
+on AKS is refused rather than silently installing a second guest stack over the
+one under test.
+
+Building genpolicy needs `mkfs.erofs` >= 1.8 for `--mkfs-time`. Ubuntu 24.04
+ships 1.7.1, which fails with `unrecognized option '--mkfs-time'` partway
+through layer derivation; build erofs-utils from source into `/usr/local`.
 
 ### The node is not a confidential VM
 
