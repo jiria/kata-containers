@@ -115,10 +115,34 @@ export DEMO_ACTS=shots
 . "${HERE}/demo.sh"
 
 SHOT_LIST="${SHOT_LIST:-${WORK}/shots.tsv}"
-printf 'segment\tshot\twhat is on screen\n' > "${SHOT_LIST}"
+
+# The editor cuts against the clock, not against the shot list, so the list has
+# to carry one. Offsets are from the first frame of the take rather than wall
+# clock: the recorder is started by hand a moment before the script, and only
+# the offset survives that.
+_TAKE_T0="${EPOCHREALTIME/,/.}"
+{
+  printf '# take started %s\n' "$(date --iso-8601=seconds)"
+  printf 'segment\tshot\tstart\tend\twhat is on screen\n'
+} > "${SHOT_LIST}"
 
 _SHOT_N=0
 _SEG=""
+
+_elapsed() { awk -v a="${EPOCHREALTIME/,/.}" -v b="${_TAKE_T0}" 'BEGIN{printf "%.1f", a-b}'; }
+
+# Open a shot: claim the number and stamp the clock. The row is not written
+# until _shot_end, because its duration is the thing being recorded.
+_shot_begin() {
+  _SHOT_N=$((_SHOT_N + 1))
+  _SHOT_WHAT="$1"
+  _SHOT_START="$(_elapsed)"
+}
+
+_shot_end() {
+  printf '%s\t%02d\t%s\t%s\t%s\n' \
+    "${_SEG}" "${_SHOT_N}" "${_SHOT_START}" "$(_elapsed)" "${_SHOT_WHAT}" >> "${SHOT_LIST}"
+}
 
 # Name the segment the following shots belong to. Recorded rather than printed:
 # a segment banner would be on the footage the narration is spoken over.
@@ -130,20 +154,20 @@ seg() { _SEG="$1"; }
 # in the capture, or the cut has two grammars in it.
 shot() {
   local what="$1"; shift
-  _SHOT_N=$((_SHOT_N + 1))
-  printf '%s\t%02d\t%s\n' "${_SEG}" "${_SHOT_N}" "${what}" >> "${SHOT_LIST}"
+  _shot_begin "${what}"
   _prompt "$*"
   bash -c "$*" 2>&1 | bash "${_HL}"
   pause
+  _shot_end
 }
 
 # The sourced helpers call show() directly, which does not know about segments.
 # Wrapping it here keeps the shot list complete without touching demo.sh.
 eval "_shots_show() $(declare -f show | tail -n +2)"
 show() {
-  _SHOT_N=$((_SHOT_N + 1))
-  printf '%s\t%02d\t%s\n' "${_SEG}" "${_SHOT_N}" "$1" >> "${SHOT_LIST}"
+  _shot_begin "$1"
   _shots_show "$@"
+  _shot_end
 }
 
 # start_demo_pod runs a command and holds on it like any other shot, but it does
@@ -152,10 +176,9 @@ show() {
 # same reason as show: the list has to be what the take actually filmed.
 eval "_shots_start_demo_pod() $(declare -f start_demo_pod | tail -n +2)"
 start_demo_pod() {
-  _SHOT_N=$((_SHOT_N + 1))
-  printf '%s\t%02d\t%s\n' "${_SEG}" "${_SHOT_N}" \
-    "apply the pod spec and wait for the CVM to boot ($1)" >> "${SHOT_LIST}"
+  _shot_begin "apply the pod spec and wait for the CVM to boot ($1)"
   _shots_start_demo_pod "$@"
+  _shot_end
 }
 
 want_moment() { [[ -z "${MOMENTS}" || ",${MOMENTS}," == *",$1,"* ]]; }
@@ -357,7 +380,7 @@ if want_moment 3; then
   FRAG_SEG=S19-S29
   [[ "${FRAG_FROM:-1}" = 3 ]] && FRAG_SEG=S22-S29
   seg "${FRAG_SEG}"
-  printf '%s\t--\tfragments: every beat of demo-fragment-sidecar.sh, one shot each\n' "${FRAG_SEG}" >> "${SHOT_LIST}"
+  _FRAG_T0="$(_elapsed)"
   printf '\033[H\033[2J'
   sleep "${DEMO_GAP}"
   # A child process, so its shots cannot be counted here. It keeps the rhythm
@@ -370,6 +393,10 @@ if want_moment 3; then
   # can afford. The walkthrough still runs all four.
   DEMO_BEAT_PREFIX=F DEMO_RECEIPT_TAMPER=0 FRAG_FROM="${FRAG_FROM:-1}" bash "${HERE}/demo-fragment-sidecar.sh" || \
     warn "the fragment moment did not finish — the moments already recorded are unaffected"
+  # The child cannot count its own shots into this list, but it can be bounded:
+  # one row spanning the whole moment, written once it returns.
+  printf '%s\t--\t%s\t%s\tfragments: every beat of demo-fragment-sidecar.sh, one shot each\n' \
+    "${FRAG_SEG}" "${_FRAG_T0}" "$(_elapsed)" >> "${SHOT_LIST}"
   # Same reason as demo-a: the fragment pod has stopped being evidence, and the
   # inset is still in frame. demo-fragment-sidecar.sh leaves it deliberately —
   # run by hand, the pod is the thing you want to poke at afterwards — so the
