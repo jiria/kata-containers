@@ -42,6 +42,8 @@ use hypervisor::HYPERVISOR_REMOTE;
 use hypervisor::{dragonball::Dragonball, HYPERVISOR_DRAGONBALL};
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 use hypervisor::{firecracker::Firecracker, HYPERVISOR_FIRECRACKER};
+#[cfg(feature = "openvmm")]
+use hypervisor::{openvmm::OpenVmm, HYPERVISOR_NAME_OPENVMM};
 use hypervisor::{qemu::Qemu, HYPERVISOR_QEMU};
 use hypervisor::{
     utils::{get_hvsock_path, uses_native_ccw_bus},
@@ -54,6 +56,8 @@ use kata_sys_util::hooks::HookStates;
 use kata_sys_util::protection::{available_guest_protection, GuestProtection};
 use kata_sys_util::spec::load_oci_spec;
 use kata_types::capabilities::CapabilityBits;
+#[cfg(feature = "openvmm")]
+use kata_types::config::hypervisor::snp_igvm_enabled;
 use kata_types::config::hypervisor::Hypervisor as HypervisorConfig;
 use kata_types::config::hypervisor::{VIRTIO_BLK_CCW, VIRTIO_BLK_PCI};
 #[cfg(all(
@@ -638,6 +642,12 @@ impl VirtSandbox {
                 })))
             }
             GuestProtection::Snp(details) => {
+                #[cfg(feature = "openvmm")]
+                let is_openvmm_igvm = self.resource_manager.config().await.runtime.hypervisor_name
+                    == HYPERVISOR_NAME_OPENVMM
+                    && snp_igvm_enabled(hypervisor_config)?;
+                #[cfg(not(feature = "openvmm"))]
+                let is_openvmm_igvm = false;
                 let is_cloud_hypervisor = Arc::clone(&self.resource_manager.config().await)
                     .runtime
                     .hypervisor_name
@@ -645,7 +655,10 @@ impl VirtSandbox {
 
                 // Cloud Hypervisor can boot SNP guests from IGVM and does not
                 // require the external firmware used by QEMU.
-                if hypervisor_config.boot_info.firmware.is_empty() && !is_cloud_hypervisor {
+                if hypervisor_config.boot_info.firmware.is_empty()
+                    && !is_cloud_hypervisor
+                    && !is_openvmm_igvm
+                {
                     return Err(anyhow!("SEV-SNP protection requires a path to firmware"));
                 }
 
@@ -1334,6 +1347,8 @@ impl Persist for VirtSandbox {
                 HYPERVISOR_FIRECRACKER => Ok(Some(hypervisor_state)),
                 HYPERVISOR_QEMU => Ok(Some(hypervisor_state)),
                 HYPERVISOR_REMOTE => Ok(Some(hypervisor_state)),
+                #[cfg(feature = "openvmm")]
+                HYPERVISOR_NAME_OPENVMM => Ok(Some(hypervisor_state)),
                 _ => Err(anyhow!(
                     "Unsupported hypervisor {}",
                     hypervisor_state.hypervisor_type
@@ -1394,6 +1409,11 @@ impl Persist for VirtSandbox {
             }
             HYPERVISOR_REMOTE => {
                 let hypervisor = Arc::new(Remote::restore((), h).await?) as Arc<dyn Hypervisor>;
+                Ok(hypervisor)
+            }
+            #[cfg(feature = "openvmm")]
+            HYPERVISOR_NAME_OPENVMM => {
+                let hypervisor = Arc::new(OpenVmm::restore((), h).await?) as Arc<dyn Hypervisor>;
                 Ok(hypervisor)
             }
             _ => Err(anyhow!("Unsupported hypervisor {}", &h.hypervisor_type)),

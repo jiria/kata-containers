@@ -529,6 +529,7 @@ static_check_license_headers()
 			--exclude="VERSION" \
 			--exclude="kata_config_version" \
 			--exclude="tools/packaging/kernel/configs/*" \
+			--exclude="tools/osbuilder/openvmm-igvm/kernel.config" \
 			--exclude="virtcontainers/pkg/firecracker/*" \
 			--exclude="${ignore_clh_generated_code}*" \
 			--exclude="*.xml" \
@@ -548,6 +549,8 @@ static_check_license_headers()
 			--exclude="src/libs/protocols/protos/google/*.proto" \
 			--exclude="src/libs/protocols/protos/cri-api/api.proto" \
 			--exclude="src/mem-agent/example/protocols/protos/google/protobuf/*.proto" \
+			--exclude="src/runtime-rs/crates/hypervisor/src/openvmm/protos/*.proto" \
+			--exclude="src/runtime-rs/crates/hypervisor/src/openvmm/protos/google/protobuf/*.proto" \
 			--exclude="src/libs/*/test/texture/*" \
 			--exclude="*.dic" \
 			-EL ${extra_args} -E "\<${pattern}\>" \
