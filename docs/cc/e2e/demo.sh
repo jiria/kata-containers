@@ -76,9 +76,10 @@
 set -uo pipefail
 
 # This demo is about the confidential stack specifically, so the platform is not
-# an open question. lib.sh derives every path from E2E_PLATFORM at source time
-# and defaults to qemu-coco-dev, which would silently resolve /opt/kata paths
-# that do not exist here — a demo that prints "No such file" instead of evidence.
+# an open question. Pinned rather than inherited: lib.sh derives every path from
+# E2E_PLATFORM at source time, and a stray qemu-coco-dev in the environment
+# would silently resolve /opt/kata paths that do not exist here — a demo that
+# prints "No such file" instead of evidence.
 : "${E2E_PLATFORM:=openvmm-snp}"
 export E2E_PLATFORM
 
