@@ -273,17 +273,53 @@ LEDGER_PUB=$(grep  '^public_key_hex='  "${WORK}/ledger.txt" | cut -d= -f2)
 # C-ACI uses. A throwaway CA and one code-signing leaf, minted per run: nothing
 # here is reusable as a trust anchor anywhere else.
 need openssl
+# The guest checks every certificate in the chain against *its own* wall clock,
+# not the host's (security-reference-monitor/src/did_x509.rs, check_validity).
+# A confidential guest has no trusted time source, and on this stack its clock
+# runs behind the host's — so a chain minted "now" lands in the guest's future
+# and is refused with CertExpired, which check_validity also returns for
+# `now < notBefore`. Mint the window the way a real code-signing CA would:
+# backdated, and long enough that neither clock can fall outside it.
+CERT_NOT_BEFORE=$(date -u -d '-30 days' +%y%m%d%H%M%SZ)
+CERT_NOT_AFTER=$(date -u -d '+365 days' +%y%m%d%H%M%SZ)
+# `openssl req -x509` cannot backdate notBefore before OpenSSL 3.5, so issue
+# both certificates through `openssl ca`, which takes explicit dates.
+mkdir -p "${WORK}/ca-db"
+: > "${WORK}/ca-db/index.txt"
+echo 01 > "${WORK}/ca-db/serial"
+cat > "${WORK}/ca.cnf" <<EOF
+[ca]
+default_ca = CA_default
+[CA_default]
+dir            = ${WORK}/ca-db
+database       = \$dir/index.txt
+serial         = \$dir/serial
+new_certs_dir  = \$dir
+default_md     = sha256
+policy         = policy_any
+email_in_dn    = no
+unique_subject = no
+[policy_any]
+commonName = supplied
+[v3_ca]
+basicConstraints = critical,CA:TRUE
+[v3_leaf]
+extendedKeyUsage = codeSigning
+EOF
 ( umask 077
   openssl ecparam -name prime256v1 -genkey -noout -out "${WORK}/ca.key" 2>/dev/null
-  openssl req -x509 -new -key "${WORK}/ca.key" -sha256 -days 2 \
-      -subj "/CN=e2e-fragment-ca" -out "${WORK}/ca.pem" 2>/dev/null
+  openssl req -new -key "${WORK}/ca.key" -subj "/CN=e2e-fragment-ca" \
+      -out "${WORK}/ca.csr" 2>/dev/null
+  openssl ca -batch -config "${WORK}/ca.cnf" -selfsign -keyfile "${WORK}/ca.key" \
+      -in "${WORK}/ca.csr" -startdate "${CERT_NOT_BEFORE}" -enddate "${CERT_NOT_AFTER}" \
+      -extensions v3_ca -notext -out "${WORK}/ca.pem" 2>/dev/null
   openssl ecparam -name prime256v1 -genkey -noout -out "${WORK}/leaf.ec.key" 2>/dev/null
   # sign-fragment parses PKCS#8; `ecparam` emits SEC1.
   openssl pkcs8 -topk8 -nocrypt -in "${WORK}/leaf.ec.key" -out "${WORK}/leaf.key" 2>/dev/null
   openssl req -new -key "${WORK}/leaf.key" -subj "/CN=${ISSUER_CN}" -out "${WORK}/leaf.csr" 2>/dev/null
-  printf 'extendedKeyUsage = codeSigning\n' > "${WORK}/leaf.ext"
-  openssl x509 -req -in "${WORK}/leaf.csr" -CA "${WORK}/ca.pem" -CAkey "${WORK}/ca.key" \
-      -CAcreateserial -days 2 -sha256 -extfile "${WORK}/leaf.ext" -out "${WORK}/leaf.pem" 2>/dev/null
+  openssl ca -batch -config "${WORK}/ca.cnf" -cert "${WORK}/ca.pem" -keyfile "${WORK}/ca.key" \
+      -in "${WORK}/leaf.csr" -startdate "${CERT_NOT_BEFORE}" -enddate "${CERT_NOT_AFTER}" \
+      -extensions v3_leaf -notext -out "${WORK}/leaf.pem" 2>/dev/null
 ) || die "could not mint the demo certificate chain"
 CA_FP_HEX=$(openssl x509 -in "${WORK}/ca.pem" -outform DER 2>/dev/null | sha256sum | cut -d' ' -f1)
 [[ ${#CA_FP_HEX} -eq 64 ]] || die "could not fingerprint the demo CA"
@@ -505,12 +541,14 @@ if [[ "${FRAG_FROM}" = 1 ]]; then
 step "1 — a container the measured policy contains"
 say <<'EOF'
 
-  What follows is one continuous experiment on a single pod. It starts from a
-  container that pod's measured policy already contains, then asks for one it
-  has never seen — first with nothing to authorize it, and then with a signed
-  fragment that does. The pod is never restarted and its policy is never
-  regenerated, so the launch measurement is the same at the end as at the
-  start; only what the guest has been given permission to accept changes.
+  What follows is one experiment in two halves. It starts from a container the
+  pod's measured policy already contains, then asks for one it has never seen —
+  first with nothing to authorize it, and then with a signed fragment that does.
+  The first half runs against the pod launched here. The second half needs a
+  freshly launched one, because the fragment declaration is itself measured, so
+  a pod that never named the issuer cannot be talked into trusting one later.
+  What does not change across either half is the container list: neither pod's
+  measured policy ever contains the sidecar.
 EOF
 pause
 # Steps 1-2 need nothing more than a running pod whose measured policy declares
@@ -541,8 +579,8 @@ show "and this is every container that spec's measured policy admits" \
   "kubectl get pod ${POD} -n ${NS} -o jsonpath='${FRAG_INITDATA_JSONPATH}' | base64 -d | gunzip | python3 ${WORK}/policy-containers.py"
 say <<'EOF'
 
-  That policy is fixed. Nothing in the steps that follow regenerates it, and
-  nothing re-launches this pod — so whatever happens next is judged against
+  That policy is fixed for as long as this pod lives. Step 2 does not regenerate
+  it and does not re-launch the pod, so what happens next is judged against
   exactly this list. One workload container is permitted, and the sandbox's own
   pause container. Anything else has no entry here, and the only thing that can
   give it one is a signed fragment.
