@@ -30,6 +30,8 @@ set -uo pipefail
 #                  on Azure Linux 3 by tools/osbuilder/node-builder/azure-linux
 #                  and installed under /opt/confidential-containers. kata-deploy
 #                  is not involved at all on this path.
+#   openvmm-snp    OpenVMM + MSHV with real SEV-SNP, built from source on Azure
+#                  Linux 3 by tools/osbuilder/openvmm-igvm.
 #
 # The split matters because the two differ in more than a hypervisor name: the
 # install prefix, the shim binary, the containerd handler and the RuntimeClass
@@ -119,8 +121,20 @@ case "${E2E_PLATFORM}" in
     : "${E2E_OS_DISK_GB:=0}"
     : "${E2E_PKG:=dnf}"
     ;;
+  openvmm-snp)
+    : "${E2E_VM_SIZE:=Standard_DC32as_cc_v6}"
+    : "${E2E_VM_IMAGE:=MicrosoftCBLMariner:azure-linux-3:azure-linux-3-gen2:latest}"
+    : "${E2E_VM_SECURITY_TYPE:=Standard}"
+    : "${E2E_OS_DISK_GB:=256}"
+    : "${E2E_PKG:=dnf}"
+    : "${E2E_RUNTIMECLASS:=kata-cc}"
+    : "${E2E_KATA_PREFIX:=${HOME}/kata-openvmm}"
+    : "${E2E_GUEST_IMAGE_NAME:=kata-containers.img}"
+    : "${E2E_OPENVMM_VP_COUNT:=2}"
+    : "${E2E_GUEST_IGVM_NAME:=kata-aci-agent-dmverity-reserve-416b-${E2E_OPENVMM_VP_COUNT}vp.bin}"
+    ;;
   *)
-    echo "unsupported E2E_PLATFORM=${E2E_PLATFORM} (expected qemu-coco-dev, clh-snp or aks)" >&2
+    echo "unsupported E2E_PLATFORM=${E2E_PLATFORM} (expected qemu-coco-dev, clh-snp, aks, or openvmm-snp)" >&2
     exit 1
     ;;
 esac
@@ -141,6 +155,11 @@ E2E_GUEST_IGVM="${E2E_KATA_PREFIX}/share/kata-containers/${E2E_GUEST_IGVM_NAME:-
 # EROFS requires; the Microsoft fork (msft/v51.1.101) cannot parse VMDK at all.
 : "${E2E_CLH_TAG:=aa9678da67f6336c4a41add9095c9c917b800ea9}"
 : "${E2E_UVM_KERNEL_VERSION:=6.1.58.mshv8}"
+: "${E2E_OPENVMM_REPO:=https://github.com/nbojanic/openvmm.git}"
+: "${E2E_OPENVMM_REV:=645ac42f3e26c695392bbf1adb3afd00c0c9c48b}"
+: "${E2E_OPENVMM_DIR:=${HOME}/openvmm}"
+: "${E2E_OPENVMM_KERNEL_SRC:=${HOME}/src/openvmm-aci-kernel}"
+: "${E2E_OPENVMM_KERNEL_SRC_LOCAL:=}"
 # whoami returns DOMAIN\user on a Windows workstation, and cygwin/git-bash render
 # that as DOMAIN+user. Azure rejects both separators and upper case in an admin
 # name, so normalise here rather than failing deep inside az vm create.
@@ -322,7 +341,7 @@ assert_local_guest_installed() {
   # therefore the artefact that carries the pin, and asserting it is the one we
   # built is the same claim by a different route — a tampered rootfs fails verity
   # against a hash the IGVM measurement covers.
-  if [[ "${E2E_PLATFORM}" = "clh-snp" ]]; then
+  if [[ "${E2E_PLATFORM}" = "clh-snp" || "${E2E_PLATFORM}" = "openvmm-snp" ]]; then
     local igvm_rec="${E2E_STATE_DIR}/guest-igvm-sha256"
     [[ -s "${igvm_rec}" ]] || die "no recorded IGVM digest — re-run stage 04"
     [[ -f "${E2E_GUEST_IGVM}" ]] || die "missing ${E2E_GUEST_IGVM}"
@@ -581,7 +600,12 @@ ensure_branch_genpolicy() {
 #   qemu-coco-dev  kata-deploy lays down upstream's copies and stage 03 then
 #                  overwrites them with the branch's. Use those — re-deriving
 #                  them here would reintroduce upstream's settings and deny every
-#                  pod at CreateContainerRequest.
+#                  pod at CreateContainerRequest. They are staged into a
+#                  suite-owned directory rather than consumed in place, so a
+#                  drop-in can be carried beside them: this cluster pulls images
+#                  inside the guest, which the branch's defaults refuse. See the
+#                  drop-in written below for why that refusal is the right
+#                  default and what enabling it gives up.
 #   clh-snp        the confpods flow installs no genpolicy, no rules.rego and no
 #                  settings whatsoever (grep the node-builder scripts: genpolicy
 #                  is never mentioned). There is nothing to consume, so stage the
@@ -590,12 +614,53 @@ ensure_branch_genpolicy() {
 ensure_genpolicy_defaults() {
   case "${E2E_PLATFORM}" in
     qemu-coco-dev)
-      GP_RULES="${E2E_KATA_DEFAULTS}/rules.rego"
-      GP_SETTINGS="${E2E_KATA_DEFAULTS}/genpolicy-settings.json"
-      [[ -f "${GP_RULES}" ]]    || die "missing ${GP_RULES} — run stage 03 first"
-      [[ -f "${GP_SETTINGS}" ]] || die "missing ${GP_SETTINGS} — run stage 03 first"
+      local kd_rules="${E2E_KATA_DEFAULTS}/rules.rego"
+      local kd_settings="${E2E_KATA_DEFAULTS}/genpolicy-settings.json"
+      [[ -f "${kd_rules}" ]]    || die "missing ${kd_rules} — run stage 03 first"
+      [[ -f "${kd_settings}" ]] || die "missing ${kd_settings} — run stage 03 first"
+
+      # Stage into a suite-owned directory. $E2E_KATA_DEFAULTS is the runtime's
+      # install tree, and genpolicy reads every *.json in a genpolicy-settings.d/
+      # beside the settings file, so carrying our drop-in in place would mean
+      # writing suite state into what kata-deploy installed. Copy instead, from
+      # the branch's post-stage-03 files so the settings stay the branch's.
+      local dst="${E2E_STATE_DIR}/genpolicy"
+      mkdir -p "${dst}"
+      cmp -s "${kd_rules}" "${dst}/rules.rego" \
+        || install -m 0644 "${kd_rules}" "${dst}/rules.rego" \
+        || die "could not stage rules.rego into ${dst}"
+      cmp -s "${kd_settings}" "${dst}/genpolicy-settings.json" \
+        || install -m 0644 "${kd_settings}" "${dst}/genpolicy-settings.json" \
+        || die "could not stage genpolicy-settings.json into ${dst}"
+
+      GP_RULES="${dst}/rules.rego"
+      GP_SETTINGS="${dst}"
+
+      # Stage 03 deploys this cluster with PULL_TYPE=guest-pull and the nydus
+      # snapshotter, so a container's rootfs arrives as an `image_guest_pull`
+      # storage. All three bodies of `allow_image_guest_pull_source` are gated on
+      # `allow_guest_pull_images`, which ships false — the pause sentinel body
+      # included — so with the branch's defaults every CreateContainerRequest in
+      # the pod is denied, the sandbox first. The branch also declares host EROFS
+      # dm-verity layers this cluster never presents. Both have to be undone here.
+      #
+      # This stays a per-platform opt-in and does not move into the branch's
+      # defaults: guest pull is refused by default because an image_guest_pull
+      # storage carries no policy declaration, so it is exempt from the
+      # declared-vs-presented storage count and a host can mount undeclared
+      # content at the container root without failing a verity check. Content is
+      # verified in CDH, which reports nothing back, so the policy binds the image
+      # reference and not the bytes. require_pinned_image_digests is deliberately
+      # left at its default true — with no root hash to bind, the manifest digest
+      # is the only thing naming the content.
+      local dropin_dir="${dst}/genpolicy-settings.d"
+      mkdir -p "${dropin_dir}"
+      install -m 0644 \
+        "${E2E_REPO_DIR}/src/tools/genpolicy/drop-in-examples/10-guest-pull-drop-in.json" \
+        "${dropin_dir}/10-guest-pull-drop-in.json" \
+        || die "could not stage the guest-pull drop-in into ${dropin_dir}"
       ;;
-    clh-snp|aks)
+    clh-snp|aks|openvmm-snp)
       local src="${E2E_REPO_DIR}/src/tools/genpolicy" dst="${E2E_STATE_DIR}/genpolicy"
       mkdir -p "${dst}"
       # The staged copy is never edited now, so it can simply track the branch:
@@ -663,7 +728,16 @@ ensure_genpolicy_defaults() {
             || die "could not write ${dropin}"
         fi
       else
-        warn "could not read containerd's sandbox image; leaving pause_container_image alone"
+        # A drop-in from an earlier run would still be applied — genpolicy reads the
+        # whole directory — so a failed detection would silently keep overriding the
+        # pause image with a value this node may no longer use, which is the exact
+        # mismatch this block exists to prevent. Remove it and fall back to the
+        # branch's declared default, which is at least a value someone chose.
+        if [[ -e "${dropin}" ]]; then
+          rm -f "${dropin}" || die "could not remove stale ${dropin}"
+          warn "removed a stale pause-image drop-in from an earlier run"
+        fi
+        warn "could not read containerd's sandbox image; falling back to the declared pause_container_image"
       fi
       ;;
   esac
@@ -771,7 +845,6 @@ if [[ "${E2E_PLATFORM}" = "clh-snp" ]]; then
     || die "platform-clh-snp.sh did not load cleanly — clh_* helpers are missing.
 A common cause is CRLF line endings after editing the file on Windows."
 fi
-
 if [[ "${E2E_PLATFORM}" = "aks" ]]; then
   # shellcheck source=platform-aks.sh
   . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/platform-aks.sh"
@@ -779,4 +852,12 @@ if [[ "${E2E_PLATFORM}" = "aks" ]]; then
   command -v aks_assert_adopted_guest >/dev/null \
     || die "platform-aks.sh did not load cleanly — aks_* helpers are missing.
 A common cause is CRLF line endings after editing the file on Windows."
+fi
+
+if [[ "${E2E_PLATFORM}" = "openvmm-snp" ]]; then
+  # shellcheck source=platform-openvmm-snp.sh
+  . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/platform-openvmm-snp.sh"
+
+  command -v openvmm_bootstrap_node >/dev/null \
+    || die "platform-openvmm-snp.sh did not load cleanly — openvmm_* helpers are missing"
 fi

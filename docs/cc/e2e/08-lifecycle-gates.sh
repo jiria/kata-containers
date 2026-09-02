@@ -82,8 +82,9 @@ ensure_branch_genpolicy
 
 # genpolicy also needs a settings file. Only ensure_genpolicy_defaults() knows
 # which one is right for this platform -- and, on clh-snp, is the thing that
-# stages it out of the branch and builds the drop-in directory at all. This stage overrides GP_RULES with REF_RULES below on purpose, but
-# GP_SETTINGS must come from here or it is simply never set.
+# stages it out of the branch and builds the drop-in directory at all. This
+# stage overrides GP_RULES with REF_RULES below on purpose, but GP_SETTINGS
+# must come from here or it is simply never set.
 ensure_genpolicy_defaults
 
 # The rules come from the branch too, and for the same reason: /opt/kata carries
@@ -228,6 +229,14 @@ agent_addr() {
     # The shim names this per sandbox under /run/kata. Wait for it: the pod can
     # report Running a moment before the socket is observable to us.
     sock="/run/kata/${sb}/ch-vm.sock"
+    for _ in $(seq 1 20); do
+      sudo test -S "${sock}" && { echo "unix://${sock}"; return 0; }
+      sleep 1
+    done
+    return 1
+  fi
+  if [[ "${E2E_PLATFORM}" = "openvmm-snp" ]]; then
+    sock="/run/kata/${sb}/vsock.sock"
     for _ in $(seq 1 20); do
       sudo test -S "${sock}" && { echo "unix://${sock}"; return 0; }
       sleep 1
