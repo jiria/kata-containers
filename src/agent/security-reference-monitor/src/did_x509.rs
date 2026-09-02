@@ -370,6 +370,9 @@ fn verify_link(subject: &Certificate, issuer: &Certificate) -> Result<(), Fragme
 /// consistency**: every issuer must have been valid at the moment the certificate it signed
 /// expires, so a CA whose own window does not cover its leaf is still rejected. What is no
 /// longer rejected is a self-consistent chain that is uniformly in the past.
+///
+/// The one constraint this places on issuance is that **a CA must outlive the certificates
+/// it signs** — true of every real CA hierarchy, and the same constraint `didx509go` imposes.
 fn check_validity(
     cert: &Certificate,
     reference: core::time::Duration,
@@ -564,13 +567,27 @@ mod tests {
 
     const EKU_CODE_SIGNING: &str = "1.3.6.1.5.5.7.3.3";
 
+    /// How long a test leaf is valid for.
+    const LEAF_LIFETIME: Duration = Duration::from_secs(3600);
+
+    /// How long a test issuer (root or intermediate CA) is valid for.
+    ///
+    /// Deliberately much longer than `LEAF_LIFETIME`. Chain validity is path-validated
+    /// against the *leaf's* `notAfter` rather than the wall clock (see `check_validity`), so
+    /// an issuer must outlive the certificates it signs — which is true of every real CA. If
+    /// an issuer were minted with the same lifetime as its leaf, the two `from_now` calls
+    /// would land on different seconds whenever the mints straddled a UTCTime boundary, the
+    /// leaf would outlive its issuer by one second, and the chain would be rejected at
+    /// random.
+    const CA_LIFETIME: Duration = Duration::from_secs(10 * 365 * 24 * 3600);
+
     fn spki_of(sk: &SigningKey) -> SubjectPublicKeyInfoOwned {
         let der = sk.verifying_key().to_public_key_der().unwrap();
         SubjectPublicKeyInfoOwned::from_der(der.as_bytes()).unwrap()
     }
 
     fn mint_ca(cn: &str, sk: &SigningKey) -> Vec<u8> {
-        mint_ca_with_validity(cn, sk, Validity::from_now(Duration::from_secs(3600)).unwrap())
+        mint_ca_with_validity(cn, sk, Validity::from_now(CA_LIFETIME).unwrap())
     }
 
     /// Mint a root CA with an explicit validity window, so a test can build a chain that is
@@ -627,7 +644,7 @@ mod tests {
     ) -> Vec<u8> {
         let issuer = Name::from_str(&format!("CN={root_cn}")).unwrap();
         let subject = Name::from_str(&format!("CN={cn}")).unwrap();
-        let validity = Validity::from_now(Duration::from_secs(3600)).unwrap();
+        let validity = Validity::from_now(CA_LIFETIME).unwrap();
         let builder = CertificateBuilder::new(
             Profile::SubCA {
                 issuer,
@@ -695,7 +712,7 @@ mod tests {
             &leaf_sk,
             "test-ca",
             &ca_sk,
-            Validity::from_now(Duration::from_secs(3600)).unwrap(),
+            Validity::from_now(LEAF_LIFETIME).unwrap(),
         );
         let anchor = anchor_for(&ca, "did:x509:test:issuerX");
 
@@ -719,7 +736,7 @@ mod tests {
             &leaf_sk,
             "test-ca",
             &ca_sk,
-            Validity::from_now(Duration::from_secs(3600)).unwrap(),
+            Validity::from_now(LEAF_LIFETIME).unwrap(),
         );
         // Anchor trusts a different CA than the one in the chain.
         let anchor = anchor_for(&other_ca, "did:x509:test:issuerX");
@@ -745,7 +762,7 @@ mod tests {
             &leaf_sk,
             "test-ca",
             &ca_sk,
-            Validity::from_now(Duration::from_secs(3600)).unwrap(),
+            Validity::from_now(LEAF_LIFETIME).unwrap(),
         );
         let anchor = anchor_for(&ca, "did:x509:test:issuerX");
 
@@ -820,6 +837,40 @@ mod tests {
         assert!(verify_x509_cose(&anchors, &HashSet::new(), &cose).is_ok());
     }
 
+    /// TC-F1.10f: a leaf that outlives its CA is rejected.
+    ///
+    /// The mirror of TC-F1.10c, and the failure mode that matters in practice: because the
+    /// chain is path-validated against the leaf's `notAfter`, an issuer must still cover the
+    /// certificates it signs. Asserted explicitly rather than left to the incidental
+    /// lifetimes the other fixtures happen to use.
+    #[test]
+    fn tc_f1_10f_leaf_outliving_its_ca_rejected() {
+        let ca_sk = SigningKey::random(&mut OsRng);
+        let leaf_sk = SigningKey::random(&mut OsRng);
+        // CA valid for an hour; leaf valid for two, so the leaf's notAfter falls outside it.
+        let ca = mint_ca_with_validity(
+            "test-ca",
+            &ca_sk,
+            Validity::from_now(Duration::from_secs(3600)).unwrap(),
+        );
+        let leaf = mint_leaf(
+            "issuerX",
+            &leaf_sk,
+            "test-ca",
+            &ca_sk,
+            Validity::from_now(Duration::from_secs(7200)).unwrap(),
+        );
+        let anchor = anchor_for(&ca, "did:x509:test:issuerX");
+
+        let cose = cose_with_chain(&payload(), &leaf_sk, &[leaf, ca]);
+        let mut anchors = HashMap::new();
+        anchors.insert(anchor.did.clone(), anchor);
+        assert_eq!(
+            verify_x509_cose(&anchors, &HashSet::new(), &cose).unwrap_err(),
+            FragmentError::CertExpired
+        );
+    }
+
     /// TC-F1.11: a revoked leaf (fingerprint on the measured list) is rejected even with a
     /// valid chain and signature.
     #[test]
@@ -832,7 +883,7 @@ mod tests {
             &leaf_sk,
             "test-ca",
             &ca_sk,
-            Validity::from_now(Duration::from_secs(3600)).unwrap(),
+            Validity::from_now(LEAF_LIFETIME).unwrap(),
         );
         let anchor = anchor_for(&ca, "did:x509:test:issuerX");
 
@@ -864,7 +915,7 @@ mod tests {
             &leaf1_sk,
             "test-ca",
             &ca_sk,
-            Validity::from_now(Duration::from_secs(3600)).unwrap(),
+            Validity::from_now(LEAF_LIFETIME).unwrap(),
         );
         let cose1 = cose_with_chain(&payload(), &leaf1_sk, &[leaf1, ca.clone()]);
         assert!(verify_x509_cose(&anchors, &HashSet::new(), &cose1).is_ok());
@@ -876,7 +927,7 @@ mod tests {
             &leaf2_sk,
             "test-ca",
             &ca_sk,
-            Validity::from_now(Duration::from_secs(3600)).unwrap(),
+            Validity::from_now(LEAF_LIFETIME).unwrap(),
         );
         let cose2 = cose_with_chain(&payload(), &leaf2_sk, &[leaf2, ca]);
         assert!(verify_x509_cose(&anchors, &HashSet::new(), &cose2).is_ok());
@@ -894,7 +945,7 @@ mod tests {
             &leaf_sk,
             "test-ca",
             &ca_sk,
-            Validity::from_now(Duration::from_secs(3600)).unwrap(),
+            Validity::from_now(LEAF_LIFETIME).unwrap(),
         );
         // Anchor requires an EKU the leaf does not carry (server-auth instead of code-signing).
         let anchor = DidX509Anchor {
@@ -928,7 +979,7 @@ mod tests {
             &leaf_sk,
             "int-ca",
             &int_sk,
-            Validity::from_now(Duration::from_secs(3600)).unwrap(),
+            Validity::from_now(LEAF_LIFETIME).unwrap(),
         );
         // Trust anchored on the ROOT fingerprint; the intermediate is validated in between.
         let anchor = anchor_for(&root, "did:x509:test:issuerX");
@@ -953,14 +1004,14 @@ mod tests {
             &mid_sk,
             "root-ca",
             &root_sk,
-            Validity::from_now(Duration::from_secs(3600)).unwrap(),
+            Validity::from_now(LEAF_LIFETIME).unwrap(),
         );
         let subleaf = mint_leaf(
             "issuerX",
             &subleaf_sk,
             "mid",
             &mid_sk,
-            Validity::from_now(Duration::from_secs(3600)).unwrap(),
+            Validity::from_now(LEAF_LIFETIME).unwrap(),
         );
         let anchor = anchor_for(&root, "did:x509:test:issuerX");
         let mut anchors = HashMap::new();
@@ -988,7 +1039,7 @@ mod tests {
             &leaf_sk,
             "root-ca",
             &root_sk,
-            Validity::from_now(Duration::from_secs(3600)).unwrap(),
+            Validity::from_now(LEAF_LIFETIME).unwrap(),
         );
         let mut chain = vec![leaf, root.clone()];
         while chain.len() < total {
@@ -1058,7 +1109,7 @@ mod tests {
 
     fn mint_ca_p384(cn: &str, sk: &P384Sk) -> Vec<u8> {
         let subject = Name::from_str(&format!("CN={cn}")).unwrap();
-        let validity = Validity::from_now(Duration::from_secs(3600)).unwrap();
+        let validity = Validity::from_now(CA_LIFETIME).unwrap();
         CertificateBuilder::new(
             Profile::Root,
             SerialNumber::from(1u32),
@@ -1084,7 +1135,7 @@ mod tests {
                 enable_key_encipherment: false,
             },
             SerialNumber::from(2u32),
-            Validity::from_now(Duration::from_secs(3600)).unwrap(),
+            Validity::from_now(LEAF_LIFETIME).unwrap(),
             subject,
             spki_p384(leaf_sk),
             ca_sk,
@@ -1127,7 +1178,7 @@ mod tests {
     fn mint_ca_rsa(cn: &str, sk: &RsaPrivateKey) -> Vec<u8> {
         let signer = RsaPkcsSk::<_Sha256>::new(sk.clone());
         let subject = Name::from_str(&format!("CN={cn}")).unwrap();
-        let validity = Validity::from_now(Duration::from_secs(3600)).unwrap();
+        let validity = Validity::from_now(CA_LIFETIME).unwrap();
         CertificateBuilder::new(
             Profile::Root,
             SerialNumber::from(1u32),
@@ -1159,7 +1210,7 @@ mod tests {
                 enable_key_encipherment: false,
             },
             SerialNumber::from(2u32),
-            Validity::from_now(Duration::from_secs(3600)).unwrap(),
+            Validity::from_now(LEAF_LIFETIME).unwrap(),
             subject,
             spki_rsa(leaf_sk),
             &signer,
