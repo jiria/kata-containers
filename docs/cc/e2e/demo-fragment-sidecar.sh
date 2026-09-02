@@ -275,13 +275,17 @@ LEDGER_PUB=$(grep  '^public_key_hex='  "${WORK}/ledger.txt" | cut -d= -f2)
 need openssl
 # The guest checks every certificate in the chain against *its own* wall clock,
 # not the host's (security-reference-monitor/src/did_x509.rs, check_validity).
-# A confidential guest has no trusted time source, and on this stack its clock
-# runs behind the host's — so a chain minted "now" lands in the guest's future
-# and is refused with CertExpired, which check_validity also returns for
-# `now < notBefore`. Mint the window the way a real code-signing CA would:
-# backdated, and long enough that neither clock can fall outside it.
-CERT_NOT_BEFORE=$(date -u -d '-30 days' +%y%m%d%H%M%SZ)
-CERT_NOT_AFTER=$(date -u -d '+365 days' +%y%m%d%H%M%SZ)
+# A confidential guest has no trusted time source, and on this stack the guest
+# clock runs *behind* the host's by an unpredictable amount — bisecting the
+# window from the host on openvmm-snp bounds it to [2020-01-01, 2026-01-01)
+# against a host at 2026-09-02, i.e. at least eight months and possibly years
+# behind. A chain minted at host `now` therefore sits entirely in the guest's
+# future and every fragment is refused with CertExpired, which check_validity
+# also returns for `now < notBefore`. Until that is fixed (backlog RM-120) the
+# only safe window is a wide one — a year either side is measurably not enough —
+# so mint a decade either side rather than guessing at the skew.
+CERT_NOT_BEFORE=$(date -u -d '-3650 days' +%y%m%d%H%M%SZ)
+CERT_NOT_AFTER=$(date -u -d '+3650 days' +%y%m%d%H%M%SZ)
 # `openssl req -x509` cannot backdate notBefore before OpenSSL 3.5, so issue
 # both certificates through `openssl ca`, which takes explicit dates.
 mkdir -p "${WORK}/ca-db"
