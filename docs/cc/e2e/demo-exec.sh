@@ -270,12 +270,16 @@ fi
 # ------------------------------------------------------------- config lookup
 # Stage 04 records the config path it actually installed. Guessing the filename
 # is how this breaks when the runtime-rs and runtime-go configs diverge.
+#
+# No fallback guess: the previous one named a cloud-hypervisor config, which on
+# an OpenVMM node is a file that either does not exist or describes a different
+# VMM than the one under test. A demo that shows the wrong machine's config is
+# worse than one that stops.
 runtime_config_path() {
-  local rec="${HOME}/.coco-e2e/guest-config-paths"
-  if [[ -r "${rec}" ]]; then
-    awk 'NF{print $NF; exit}' "${rec}" && return 0
-  fi
-  printf '/opt/kata/share/defaults/kata-containers/configuration-clh-snp.toml'
+  local rec="${HOME}/.coco-e2e/guest-config-paths" p=""
+  [[ -r "${rec}" ]] && p="$(awk 'NF{print $NF; exit}' "${rec}")"
+  [[ -n "${p}" ]] || die "no runtime config recorded in ${rec} — run stage 04 first"
+  printf '%s' "${p}"
 }
 CFG="$(runtime_config_path)"
 
@@ -313,16 +317,18 @@ the workload.
 VO
 
 # ---- moment 1: what the workload actually runs in ---------------------------
-# Static by necessity: no cloud-hypervisor process exists until a pod creates a
-# UVM, so this moment shows the platform and moment 3 shows the running VM.
+# Static by necessity: no VMM process exists until a pod creates a UVM, so this
+# moment shows the platform and moment 3 shows the running VM.
 segment S02 "m1" "the hypervisor device and the in-kernel driver behind it" '' \
   "ls -l /dev/mshv; cat /sys/class/misc/mshv/dev" <<'VO'
-Here's what builds that VM. Cloud Hypervisor, through slash dev slash m-s-h-v —
+Here's what builds that VM. OpenVMM, through slash dev slash m-s-h-v —
 the kernel's interface to the Microsoft hypervisor running beneath this host.
 VO
 
-segment S03 "m1" "the runtime config: CLH as the VMM, IGVM-launched SEV-SNP guest" '' \
-  "grep -nE '^\[hypervisor\.clh\]|^path = ' ${CFG} | head -2; grep -nE '^(igvm|confidential_guest|sev_snp_guest)' ${CFG}" <<'VO'
+# The VMM section name is part of what this shot proves, so match whichever one
+# the recorded config actually carries rather than asserting a VMM by name.
+segment S03 "m1" "the runtime config: the VMM in use, IGVM-launched SEV-SNP guest" '' \
+  "grep -nE '^\[hypervisor\.|^path = ' ${CFG} | head -2; grep -nE '^(igvm|confidential_guest|sev_snp_guest)' ${CFG}" <<'VO'
 And it asks for an IGVM-launched SEV-SNP guest, so the memory boundary is
 enforced by the silicon rather than by a setting.
 VO
@@ -366,9 +372,9 @@ run unless its rules match that stamp, and attestation checks it's the one you
 approved.
 VO
 
-segment S10 "m3" "the pod Running: its EROFS layers with their hashes, and the CLH process" act:1 '' <<'VO'
+segment S10 "m3" "the pod Running: its EROFS layers with their hashes, and the VMM process" act:1 '' <<'VO'
 And here's the pod running under them: those layers, those hashes, and the
-Cloud Hypervisor process for its VM.
+OpenVMM process for its VM.
 VO
 
 segment S11 "m3" "the tampered pod applied, and the wait while its CVM boots under the substituted policy" none '' <<'VO'

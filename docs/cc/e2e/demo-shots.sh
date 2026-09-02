@@ -35,8 +35,8 @@
 # dropped — the pause between them stays, so the editor can still shorten the
 # typing without losing the fact that the outputs belong together. Two cases:
 #
-#   S09  the pod, the Cloud Hypervisor process serving its VM, and that
-#        process's handles on the hypervisor. A chain, threaded by the sandbox
+#   S09  the pod, the VMM process serving its VM, and that process's handles on
+#        the hypervisor. A chain, threaded by the sandbox
 #        id — three screens make it three unrelated facts.
 #   S10  the digest computed from the document, and the digest the host stamped
 #        into the report. A comparison, and only one screen can hold it.
@@ -196,16 +196,18 @@ sleep "${DEMO_GAP}"
 # ---------------------------------------------------------------- moment 1
 # S03, S04 — what the workload runs in.
 #
-# Static by necessity: no cloud-hypervisor process exists until a pod creates a
-# UVM, so this moment shows the platform and moment 2 shows the running VM.
+# Static by necessity: no VMM process exists until a pod creates a UVM, so this
+# moment shows the platform and moment 2 shows the running VM.
 if want_moment 1; then
   seg S03
   shot "the hypervisor device, and the in-kernel driver behind it" \
     "ls -l /dev/mshv; cat /sys/class/misc/mshv/dev"
 
   seg S04
-  shot "the runtime config: Cloud Hypervisor as the VMM, IGVM-launched SEV-SNP guest" \
-    "grep -nE '^\[hypervisor\.clh\]|^path = ' $(runtime_config_path) | head -2; grep -nE '^(igvm|confidential_guest|sev_snp_guest)' $(runtime_config_path)"
+  # Match whichever [hypervisor.*] section the recorded config carries: naming
+  # one VMM here shows an empty result on a node running the other.
+  shot "the runtime config: the VMM in use, IGVM-launched SEV-SNP guest" \
+    "grep -nE '^\[hypervisor\.|^path = ' $(runtime_config_path) | head -2; grep -nE '^(igvm|confidential_guest|sev_snp_guest)' $(runtime_config_path)"
 fi
 
 # ---------------------------------------------------------------- moment 2

@@ -38,7 +38,7 @@ set -euo pipefail
 
 # Same default as demo.sh, set before lib.sh derives paths from it: this script
 # is also run standalone, and lib.sh's own default is the qemu dev platform.
-: "${E2E_PLATFORM:=clh-snp}"
+: "${E2E_PLATFORM:=openvmm-snp}"
 export E2E_PLATFORM
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -463,22 +463,28 @@ sandbox_id() {
   echo "${sb}"
 }
 
-# Cloud Hypervisor has no host-visible CID: the guest is reached through a hybrid
-# vsock unix socket the shim creates per sandbox. QEMU gives a real CID instead.
+# Both confidential VMMs put the agent behind a per-sandbox unix socket and
+# differ only in its name: cloud-hypervisor's hybrid-vsock relay is ch-vm.sock,
+# OpenVMM's virtio-vsock relay is vsock.sock (runtime-rs get_agent_socket
+# returns hvsock://<run_dir>/vsock.sock). QEMU is the odd one out — it gives the
+# guest a real CID, so there is no socket to find.
+#
+# Probing for whichever appears rather than switching on E2E_PLATFORM: the
+# platform is only a default here, and a stale one used to send this down the
+# QEMU branch on a CVM, where it failed looking for a guest-cid that a relay
+# socket never has.
 agent_addr() {
   local sb=$1 sock cid
-  if [[ "${E2E_PLATFORM:-}" = "clh-snp" ]]; then
-    sock="/run/kata/${sb}/ch-vm.sock"
-    for _ in $(seq 1 20); do
+  for _ in $(seq 1 20); do
+    for sock in "/run/kata/${sb}/ch-vm.sock" "/run/kata/${sb}/vsock.sock"; do
       sudo test -S "${sock}" && { echo "unix://${sock}"; return 0; }
-      sleep 1
     done
-    return 1
-  fi
-  # shellcheck disable=SC2009  # the full argv is needed to sed guest-cid out of
-  cid=$(ps -ef | grep "[s]andbox-${sb}" | sed -n 's/.*guest-cid=\([0-9]*\).*/\1/p' | head -1)
-  [[ -n "${cid}" ]] || return 1
-  echo "vsock://${cid}:1024"
+    # shellcheck disable=SC2009  # the full argv is needed to sed guest-cid out of
+    cid=$(ps -ef | grep "[s]andbox-${sb}" | sed -n 's/.*guest-cid=\([0-9]*\).*/\1/p' | head -1)
+    [[ -n "${cid}" ]] && { echo "vsock://${cid}:1024"; return 0; }
+    sleep 1
+  done
+  return 1
 }
 
 # A unix:// address is a hybrid vsock socket, not a plain domain socket, and

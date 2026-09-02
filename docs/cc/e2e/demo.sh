@@ -79,7 +79,7 @@ set -uo pipefail
 # an open question. lib.sh derives every path from E2E_PLATFORM at source time
 # and defaults to qemu-coco-dev, which would silently resolve /opt/kata paths
 # that do not exist here — a demo that prints "No such file" instead of evidence.
-: "${E2E_PLATFORM:=clh-snp}"
+: "${E2E_PLATFORM:=openvmm-snp}"
 export E2E_PLATFORM
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
@@ -451,9 +451,31 @@ ensure_policy_toolchain() {
 }
 
 # Tie the pod that just booted to the CVM underneath it. The link is the sandbox
-# id: it appears in the shim's -id and again in the path of the API socket that
-# Cloud Hypervisor was launched with, so the chain from pod to partition is
-# something the audience can follow rather than something we assert.
+# id: it appears in the shim's -id and again in the per-sandbox run directory the
+# VMM was launched against, so the chain from pod to partition is something the
+# audience can follow rather than something we assert.
+# The VMM is whatever the recorded runtime config points at, so derive it rather
+# than naming one. This demo has now run on both cloud-hypervisor and OpenVMM,
+# and a hard-coded name does not fail loudly on the other — it counts zero
+# processes and finds no pid, which reads on screen as "there is no VM here".
+vmm_binary_name() {
+  local p
+  p=$(awk -F'"' '/^path = /{print $2; exit}' "$(runtime_config_path)" 2>/dev/null)
+  [[ -n "${p}" ]] || return 1
+  basename "${p}"
+}
+
+# The VMM process for one sandbox: every VMM keeps its per-sandbox state under
+# /run/kata/<sid>/, but the socket's name is VMM-specific (ch-api.sock,
+# openvmm.sock), so match the directory and confirm the process by its exe.
+vmm_pid_for_sandbox() {
+  local sid="$1" name="$2" p
+  for p in $(pgrep -f "/run/kata/${sid}/" 2>/dev/null); do
+    [[ "$(sudo readlink -f "/proc/${p}/exe" 2>/dev/null)" == *"/${name}" ]] && { printf '%s' "${p}"; return 0; }
+  done
+  return 1
+}
+
 show_sandbox_backing() {
   local name="$1"
 
@@ -463,27 +485,30 @@ show_sandbox_backing() {
     warn "could not resolve the sandbox id for ${name} — skipping the hypervisor linkage"
     return 0
   fi
+
+  local vmm
+  vmm=$(vmm_binary_name) || { warn "no VMM path in $(runtime_config_path) — skipping the hypervisor linkage"; return 0; }
+
   # Deliberately paired with crictl: a node often has more than one confidential
   # sandbox alive, and a bare process list then raises "why are there two?".
   # Listing the kata pods beside the process count answers it on screen.
   #
   # Counted through /proc/*/exe rather than a ps|grep, which counts the shell
   # running the pattern as well and reports one process too many.
-  show "one Cloud Hypervisor process per confidential sandbox — and each one is a pod" \
-    "sudo crictl pods --state Ready 2>/dev/null | awk 'NR==1 || \$NF==\"${E2E_RUNTIMECLASS}\"'; echo; echo \"cloud-hypervisor processes: \$(sudo ls -l /proc/*/exe 2>/dev/null | grep -c cloud-hypervisor)\""
+  show "one ${vmm} process per confidential sandbox — and each one is a pod" \
+    "sudo crictl pods --state Ready 2>/dev/null | awk 'NR==1 || \$NF==\"${E2E_RUNTIMECLASS}\"'; echo; echo \"${vmm} processes: \$(sudo ls -l /proc/*/exe 2>/dev/null | grep -c '/${vmm}\$')\""
   show "and the sandbox id is what ties this pod's shim to this pod's VM" \
     "ps -eo pid,args | grep '[${sid:0:1}]${sid:1:11}' | cut -c1-130"
 
-  local clh
-  clh=$(pgrep -f "/run/kata/${sid}/ch-api.sock" | head -n 1)
-  if [[ -z "${clh}" ]]; then
-    warn "no Cloud Hypervisor process found for sandbox ${sid} — skipping the MSHV check"
+  local vmmpid
+  if ! vmmpid=$(vmm_pid_for_sandbox "${sid}" "${vmm}"); then
+    warn "no ${vmm} process found for sandbox ${sid} — skipping the MSHV check"
     return 0
   fi
   # The fd table is the honest answer to "which hypervisor is this really?" —
   # a partition handle and a vCPU handle can only have come from /dev/mshv.
   show "that VM is driven by MSHV — a partition and a vCPU, and no KVM descriptor anywhere" \
-    "sudo ls -l /proc/${clh}/fd | awk '/mshv|kvm/{print \$NF}' | sort -u"
+    "sudo ls -l /proc/${vmmpid}/fd | awk '/mshv|kvm/{print \$NF}' | sort -u"
   scene
 }
 
@@ -847,7 +872,7 @@ act0() {
   step "act 0 — this is a confidential host, and the guest is a real CVM"
   say <<'EOF'
 
-  The stack underneath is Cloud Hypervisor on MSHV. That path is not new work in
+  The stack underneath is OpenVMM on MSHV. That path is not new work in
   itself — it existed, and had been suspended; rebasing it onto current Kata and
   getting it running again is what this branch did. It is the reason everything
   that follows happens on a confidential machine rather than under nested virt.
@@ -880,8 +905,8 @@ EOF
     "kubectl get runtimeclass ${E2E_RUNTIMECLASS}"
   show "containerd resolves that handler to a shim of its own, and to one config file" \
     "grep -n -A12 'runtimes.${E2E_RUNTIMECLASS}\]' /etc/containerd/config.toml | grep -E 'runtimes\.${E2E_RUNTIMECLASS}\]|runtime_type|snapshotter|ConfigPath'"
-  show "that is this file — and the VMM it tells that shim to drive is Cloud Hypervisor" \
-    "grep -nE '^\[hypervisor\.clh\]|^path = ' ${cfg} | head -2"
+  show "that is this file — and the VMM it tells that shim to drive" \
+    "grep -nE '^\[hypervisor\.|^path = ' ${cfg} | head -2"
   show "and the same config asks that VMM for an IGVM-launched SEV-SNP guest" \
     "grep -nE '^(igvm|confidential_guest|sev_snp_guest)' ${cfg}"
   # The SNP support lines come from the driver beat above — the same three lines
@@ -910,7 +935,7 @@ EOF
          │                            ║             │
       kata shim ── ttRPC over vsock ──╫──▶   allow / deny
          │                            ║             ▲
-      Cloud Hypervisor on MSHV        ║             │
+      OpenVMM on MSHV                 ║             │
          └─ launches the CVM;         ║        the measured policy
             cannot see inside it      ║
 EOF
@@ -1075,7 +1100,7 @@ EOF
 
   So much for the document. What is actually running under it: the layers this
   pod's measured policy admits, with the root hashes it names for them, and the
-  Cloud Hypervisor process serving the VM they are mounted in.
+  OpenVMM process serving the VM they are mounted in.
 EOF
   show "the layers demo-a's measured policy admits, by the root hash it names for each" \
     "grep -oE 'X-kata\\.dmverity\\.roothash=[a-f0-9]{64}' ${WORK}/a.toml | cut -d= -f2 | sort -u | nl -w4 -s '  layer  ' | sed 's/\\([0-9a-f]\\{16\\}\\)[0-9a-f]*/\\1.../'"
