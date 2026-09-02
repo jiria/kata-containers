@@ -349,14 +349,34 @@ fn verify_link(subject: &Certificate, issuer: &Certificate) -> Result<(), Fragme
         .map_err(|_| FragmentError::InvalidCertChain)
 }
 
-/// Reject a certificate whose validity window does not include the current time.
-fn check_validity(cert: &Certificate) -> Result<(), FragmentError> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| FragmentError::CertExpired)?;
+/// Path-validate a certificate's validity window against `reference` rather than against the
+/// guest's wall clock.
+///
+/// A confidential guest has **no trusted time source**. `SystemTime::now()` inside the guest
+/// is supplied from outside the TCB, and on `openvmm-snp` it was measured running between
+/// eight months and six years behind the host — far enough that a chain minted at host `now`
+/// lands entirely in the guest's *future* and every fragment is refused. Enforcing a window
+/// against that clock therefore fails closed on correctly issued certificates, while an
+/// adversary who wants an *expired* certificate honoured simply skews the clock. It costs
+/// availability and buys no security, so it is not done here.
+///
+/// This mirrors the parity anchor. `didx509go` calls
+/// `x509.VerifyOptions{ ..., CurrentTime: chain[0].NotAfter }` — the leaf's own expiry, never
+/// `time.Now()` — because trust rests on the **CA fingerprint pinned in the `did:x509` string**
+/// and measured into initdata, which is time-independent by construction. The window is not
+/// what makes a fragment trustworthy; the measured anchor is.
+///
+/// Passing the leaf's `notAfter` as `reference` still enforces the chain's **internal
+/// consistency**: every issuer must have been valid at the moment the certificate it signed
+/// expires, so a CA whose own window does not cover its leaf is still rejected. What is no
+/// longer rejected is a self-consistent chain that is uniformly in the past.
+fn check_validity(
+    cert: &Certificate,
+    reference: core::time::Duration,
+) -> Result<(), FragmentError> {
     let nb = cert.tbs_certificate.validity.not_before.to_unix_duration();
     let na = cert.tbs_certificate.validity.not_after.to_unix_duration();
-    if now < nb || now > na {
+    if reference < nb || reference > na {
         return Err(FragmentError::CertExpired);
     }
     Ok(())
@@ -485,9 +505,12 @@ pub fn verify_x509_cose(
             continue;
         };
 
-        // Path-validate leaf(0) → … → CA(ca_idx): each cert signed by the next, all in date.
+        // Path-validate leaf(0) → … → CA(ca_idx): each cert signed by the next, and each
+        // issuer valid at the leaf's own expiry (see `check_validity` — the guest's wall
+        // clock is not trusted, so it is not consulted).
+        let reference = certs[0].tbs_certificate.validity.not_after.to_unix_duration();
         for i in 0..=ca_idx {
-            check_validity(&certs[i])?;
+            check_validity(&certs[i], reference)?;
             if i < ca_idx {
                 verify_link(&certs[i], &certs[i + 1])?;
             }
@@ -547,8 +570,13 @@ mod tests {
     }
 
     fn mint_ca(cn: &str, sk: &SigningKey) -> Vec<u8> {
+        mint_ca_with_validity(cn, sk, Validity::from_now(Duration::from_secs(3600)).unwrap())
+    }
+
+    /// Mint a root CA with an explicit validity window, so a test can build a chain that is
+    /// self-consistent but wholly in the past.
+    fn mint_ca_with_validity(cn: &str, sk: &SigningKey, validity: Validity) -> Vec<u8> {
         let subject = Name::from_str(&format!("CN={cn}")).unwrap();
-        let validity = Validity::from_now(Duration::from_secs(3600)).unwrap();
         let builder = CertificateBuilder::new(
             Profile::Root,
             SerialNumber::from(1u32),
@@ -731,13 +759,19 @@ mod tests {
         );
     }
 
-    /// TC-F1.10c: an expired leaf is rejected.
+    /// TC-F1.10c: a CA that was not valid at its leaf's expiry is rejected.
+    ///
+    /// Chain validity is path-validated against the leaf's own `notAfter`, not the guest's
+    /// wall clock (see `check_validity`), so this asserts the *internal consistency* of the
+    /// chain: a leaf whose window sits in the past under a CA minted now is a chain no CA
+    /// ever legitimately issued.
     #[test]
-    fn tc_f1_10c_expired_leaf_rejected() {
+    fn tc_f1_10c_ca_not_valid_at_leaf_expiry_rejected() {
         let ca_sk = SigningKey::random(&mut OsRng);
         let leaf_sk = SigningKey::random(&mut OsRng);
         let ca = mint_ca("test-ca", &ca_sk);
-        // Validity window entirely in the past.
+        // Leaf window entirely in the past; the CA's window is "now", so it does not contain
+        // the leaf's notAfter.
         let past = Validity {
             not_before: Time::try_from(std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_000))
                 .unwrap(),
@@ -754,6 +788,36 @@ mod tests {
             verify_x509_cose(&anchors, &HashSet::new(), &cose).unwrap_err(),
             FragmentError::CertExpired
         );
+    }
+
+    /// TC-F1.10d: a self-consistent chain that is wholly in the past is **accepted**, because
+    /// the guest's wall clock is never consulted.
+    ///
+    /// This is the behaviour that matches the C-ACI/hcsshim parity anchor, where
+    /// `didx509go` verifies with `CurrentTime: chain[0].NotAfter`. It is deliberate: the
+    /// guest has no trusted time source, so a window enforced against host-supplied time
+    /// refuses correctly issued fragments (observed on `openvmm-snp`, backlog RM-120) while
+    /// an adversary can skew the clock to revive an expired certificate anyway. Trust comes
+    /// from the measured CA fingerprint, which does not expire.
+    #[test]
+    fn tc_f1_10d_uniformly_past_chain_accepted() {
+        let ca_sk = SigningKey::random(&mut OsRng);
+        let leaf_sk = SigningKey::random(&mut OsRng);
+        // Both certs share a window that ended long ago: 2001-09-09 → 2001-09-10.
+        let past = Validity {
+            not_before: Time::try_from(std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_000))
+                .unwrap(),
+            not_after: Time::try_from(std::time::UNIX_EPOCH + Duration::from_secs(1_000_100_000))
+                .unwrap(),
+        };
+        let ca = mint_ca_with_validity("test-ca", &ca_sk, past);
+        let leaf = mint_leaf("issuerX", &leaf_sk, "test-ca", &ca_sk, past);
+        let anchor = anchor_for(&ca, "did:x509:test:issuerX");
+
+        let cose = cose_with_chain(&payload(), &leaf_sk, &[leaf, ca]);
+        let mut anchors = HashMap::new();
+        anchors.insert(anchor.did.clone(), anchor);
+        assert!(verify_x509_cose(&anchors, &HashSet::new(), &cose).is_ok());
     }
 
     /// TC-F1.11: a revoked leaf (fingerprint on the measured list) is rejected even with a
